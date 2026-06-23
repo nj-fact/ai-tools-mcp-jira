@@ -93,18 +93,27 @@ def fetch_agent_report(
     issue_key: str,
     site_url: str,
     comment_limit: int = 5,
+    changelog_limit: int = 0,
     write_scope: str | None = None,
 ) -> dict[str, Any]:
     issue = client.get_issue(issue_key, fields=AGENT_REPORT_FIELDS)
     comments = client.list_comments(issue_key, limit=comment_limit)
     transitions = client.get_transitions(issue_key)
-    return build_agent_report(
+    report = build_agent_report(
         site_url=site_url,
         issue=issue,
         comments=comments,
         transitions=transitions,
         write_scope=write_scope,
     )
+    if changelog_limit > 0:
+        report["changelog"] = [
+            _changelog_summary(entry)
+            for entry in (
+                client.get_changelog(issue_key, limit=changelog_limit).get("values") or []
+            )
+        ]
+    return report
 
 
 def agent_plan_comment_body(
@@ -165,4 +174,21 @@ def _transition_summary(transition: dict[str, Any]) -> dict[str, Any]:
             "id": target.get("id"),
             "name": target.get("name"),
         },
+    }
+
+
+def _changelog_summary(entry: dict[str, Any]) -> dict[str, Any]:
+    author = entry.get("author") or {}
+    return {
+        "id": entry.get("id"),
+        "created": entry.get("created"),
+        "author": _user_summary(author),
+        "items": [
+            {
+                "field": item.get("field"),
+                "from": item.get("fromString"),
+                "to": item.get("toString"),
+            }
+            for item in entry.get("items") or []
+        ],
     }

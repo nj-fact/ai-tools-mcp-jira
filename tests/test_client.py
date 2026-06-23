@@ -7,6 +7,7 @@ from jira_agent.client import (
     JiraClient,
     create_issue_payload,
     edit_issue_payload,
+    issue_link_payload,
     text_to_adf,
 )
 from jira_agent.config import JiraConfig
@@ -294,6 +295,30 @@ def test_assign_issue_can_unassign_with_null_account_id() -> None:
     assert seen["json"] == '{"accountId":null}'
 
 
+def test_search_assignable_users_uses_issue_or_project_scope() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[{"accountId": "a1"}])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.search_assignable_users("Norman", issue_key="FC-107", limit=5) == [
+        {"accountId": "a1"}
+    ]
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/user/assignable/search?"
+        "query=Norman&maxResults=5&issueKey=FC-107"
+    )
+
+
 def test_edit_issue_posts_edit_payload() -> None:
     seen: dict[str, object] = {}
 
@@ -339,6 +364,100 @@ def test_edit_issue_payload_converts_description_to_adf() -> None:
             }
         }
     }
+
+
+def test_issue_link_payload_supports_optional_comment() -> None:
+    assert issue_link_payload(
+        outward_issue_key="FC-107",
+        inward_issue_key="FC-101",
+        link_type="Relates",
+        comment="Related work",
+    ) == {
+        "type": {"name": "Relates"},
+        "outwardIssue": {"key": "FC-107"},
+        "inwardIssue": {"key": "FC-101"},
+        "comment": {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Related work"}],
+                    }
+                ],
+            }
+        },
+    }
+
+
+def test_link_issues_posts_issue_link_payload() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = request.read().decode()
+        return httpx.Response(201)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.link_issues(outward_issue_key="FC-107", inward_issue_key="FC-101") == {}
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issueLink"
+    assert seen["json"] == (
+        '{"type":{"name":"Relates"},"outwardIssue":{"key":"FC-107"},"inwardIssue":{"key":"FC-101"}}'
+    )
+
+
+def test_get_changelog_uses_paginated_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"values": []})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_changelog("FC-107", start_at=2, limit=3) == {"values": []}
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/issue/FC-107/changelog?startAt=2&maxResults=3"
+    )
+
+
+def test_add_attachment_posts_multipart_without_json_content_type(tmp_path) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["token"] = request.headers.get("X-Atlassian-Token", "")
+        seen["content_type"] = request.headers.get("Content-Type", "")
+        return httpx.Response(200, json=[{"id": "1", "filename": "note.txt"}])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.add_attachment("FC-107", file_path) == [{"id": "1", "filename": "note.txt"}]
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-107/attachments"
+    assert seen["token"] == "no-check"
+    assert seen["content_type"].startswith("multipart/form-data; boundary=")
 
 
 def test_text_to_adf_preserves_blank_lines() -> None:

@@ -22,9 +22,14 @@ EXPECTED_TOOLS = {
     "jira_agent_report",
     "jira_edit_issue",
     "jira_agent_plan_comment",
+    "jira_user_search",
+    "jira_assign_user",
     "jira_list_comments",
     "jira_add_comment",
     "jira_list_transitions",
+    "jira_link_issue",
+    "jira_attach_file",
+    "jira_changelog",
     "jira_transition_issue",
 }
 

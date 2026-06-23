@@ -8,11 +8,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from jira_agent.audit import audit_write
 from jira_agent.client import (
     JiraApiError,
     JiraClient,
     create_issue_payload,
     edit_issue_payload,
+    issue_link_payload,
     select_transition,
 )
 from jira_agent.config import load_config
@@ -174,6 +176,17 @@ def _print_agent_report(report: dict[str, Any]) -> None:
     else:
         console.print("No transitions returned.")
 
+    changelog = report.get("changelog") or []
+    if changelog:
+        console.print("\n[bold]Changelog[/bold]")
+        for entry in changelog:
+            author = entry.get("author") or {}
+            item_text = "; ".join(
+                f"{item.get('field')}: {item.get('from')} -> {item.get('to')}"
+                for item in entry.get("items") or []
+            )
+            console.print(f"- {entry.get('created')} by {author.get('displayName')}: {item_text}")
+
 
 def _mcp_config_payload() -> dict[str, Any]:
     return {
@@ -185,6 +198,31 @@ def _mcp_config_payload() -> dict[str, Any]:
             }
         }
     }
+
+
+def _print_users_table(users: list[dict[str, Any]]) -> None:
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Display Name")
+    table.add_column("Email")
+    table.add_column("Account ID")
+    table.add_column("Active", no_wrap=True)
+    for user in users:
+        table.add_row(
+            str(user.get("displayName") or ""),
+            str(user.get("emailAddress") or ""),
+            str(user.get("accountId") or ""),
+            str(user.get("active")),
+        )
+    console.print(table)
+
+
+def _read_audit_records(path: str, limit: int) -> list[dict[str, Any]]:
+    audit_path = Path(path)
+    if not audit_path.exists():
+        return []
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines[-limit:] if line.strip()]
+    return records
 
 
 @app.command()
@@ -208,6 +246,47 @@ def myself(
     console.print(f"{data.get('displayName')} <{data.get('emailAddress', 'email hidden')}>")
     console.print(f"accountId: {data.get('accountId')}")
     console.print(f"timeZone: {data.get('timeZone')}")
+
+
+@app.command("user-search")
+def user_search(
+    query: Annotated[str, typer.Argument(help="Name or email query.")],
+    key: Annotated[
+        str | None,
+        typer.Option("--issue", help="Optional issue key for assignable-user search."),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option("--project", help="Optional project key for assignable-user search."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=100, help="Maximum users to return."),
+    ] = 20,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Search assignable Jira users."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    project_key = project or (None if issue_key else config.test_project_key)
+    with JiraClient(config) as client:
+        try:
+            users = client.search_assignable_users(
+                query,
+                issue_key=issue_key,
+                project_key=project_key,
+                limit=limit,
+            )
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _print_json(users)
+        return
+    _print_users_table(users)
 
 
 @app.command()
@@ -309,6 +388,13 @@ def add_comment(
         try:
             ensure_issue_write_allowed(client.config, client, key)
             data = client.add_comment(key, body)
+            audit_write(
+                client.config,
+                action="add_comment",
+                issue_key=key,
+                payload={"body": body},
+                result={"id": data.get("id")},
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -591,6 +677,13 @@ def create_test_issue(
                 summary=summary,
                 description=description,
             )
+            audit_write(
+                config,
+                action="create_issue",
+                issue_key=data.get("key"),
+                payload=payload,
+                result=data,
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -639,6 +732,10 @@ def agent_report(
         int,
         typer.Option("--comments", min=0, max=100, help="Maximum comments to include."),
     ] = 5,
+    changelog_limit: Annotated[
+        int,
+        typer.Option("--changelog", min=0, max=100, help="Maximum changelog entries to include."),
+    ] = 0,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print machine-readable JSON."),
@@ -660,6 +757,7 @@ def agent_report(
                 issue_key=issue_key,
                 site_url=config.site_url,
                 comment_limit=comments_limit,
+                changelog_limit=changelog_limit,
                 write_scope=config.test_issue_key,
             )
         except JiraApiError as exc:
@@ -733,6 +831,13 @@ def agent_plan_comment(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.add_comment(issue_key, body)
+            audit_write(
+                config,
+                action="agent_plan_comment",
+                issue_key=issue_key,
+                payload={"body": body},
+                result={"id": data.get("id")},
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -803,6 +908,13 @@ def edit_issue(
                 summary=summary,
                 description=description,
                 labels=_csv_list(labels),
+            )
+            audit_write(
+                config,
+                action="edit_issue",
+                issue_key=issue_key,
+                payload=payload,
+                result=data,
             )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
@@ -876,6 +988,17 @@ def smoke_write(
             ensure_issue_write_allowed(config, client, issue_key)
             added_comment = client.add_comment(issue_key, comment)
             client.assign_issue(issue_key, str(me["accountId"]))
+            audit_write(
+                config,
+                action="smoke_write",
+                issue_key=issue_key,
+                payload={
+                    "comment": comment,
+                    "accountId": str(me["accountId"]),
+                    "transition": selected,
+                },
+                result={"comment_id": added_comment.get("id")},
+            )
             console.print(f"added comment: {added_comment.get('id')}")
             console.print("assigned issue to authenticated user")
             if selected:
@@ -937,6 +1060,13 @@ def assign(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.assign_issue(issue_key, target_account_id)
+            audit_write(
+                config,
+                action="assign_issue",
+                issue_key=issue_key,
+                payload={"accountId": target_account_id},
+                result=data,
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -947,6 +1077,257 @@ def assign(
         return
 
     console.print(f"Assigned {issue_key} to {target_account_id or 'Unassigned'}.")
+
+
+@app.command("assign-user")
+def assign_user(
+    query: Annotated[str, typer.Argument(help="Name or email query for assignable user.")],
+    key: Annotated[
+        str | None,
+        typer.Option("--issue", help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually assign the issue in Jira."),
+    ] = False,
+) -> None:
+    """Assign an issue by searching an assignable user."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+
+    with JiraClient(config) as client:
+        try:
+            users = client.search_assignable_users(query, issue_key=issue_key, limit=10)
+            active_users = [user for user in users if user.get("active")]
+            if len(active_users) != 1:
+                _print_users_table(active_users)
+                error_console.print(
+                    "[red]Expected exactly one active assignable user, "
+                    f"got {len(active_users)}.[/red]"
+                )
+                raise typer.Exit(1)
+            user = active_users[0]
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would assign issue")
+                console.print(f"issue: {issue_key}")
+                console.print(f"user: {user.get('displayName')} ({user.get('accountId')})")
+                console.print("Pass --execute to write it to Jira.")
+                return
+
+            ensure_issue_write_allowed(config, client, issue_key)
+            data = client.assign_issue(issue_key, str(user["accountId"]))
+            audit_write(
+                config,
+                action="assign_user",
+                issue_key=issue_key,
+                payload={"query": query, "accountId": user.get("accountId")},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Assigned {issue_key} to {user.get('displayName')}.")
+
+
+@app.command("link-issue")
+def link_issue(
+    outward_key: Annotated[str, typer.Argument(help="Outward issue key.")],
+    inward_key: Annotated[str, typer.Argument(help="Inward issue key.")],
+    link_type: Annotated[
+        str,
+        typer.Option("--type", help="Jira issue link type name."),
+    ] = "Relates",
+    comment: Annotated[
+        str | None,
+        typer.Option("--comment", help="Optional comment on the outward issue."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually create the issue link in Jira."),
+    ] = False,
+) -> None:
+    """Link two Jira issues. Defaults to dry-run."""
+    config = _config()
+    payload = issue_link_payload(
+        outward_issue_key=outward_key,
+        inward_issue_key=inward_key,
+        link_type=link_type,
+        comment=comment,
+    )
+    with JiraClient(config) as client:
+        try:
+            outward_safety = ensure_issue_write_allowed(config, client, outward_key)
+            inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would create issue link")
+                console.print(f"outward safety: {outward_safety}")
+                console.print(f"inward safety: {inward_safety}")
+                _print_json(payload)
+                console.print("Pass --execute to write it to Jira.")
+                return
+
+            data = client.link_issues(
+                outward_issue_key=outward_key,
+                inward_issue_key=inward_key,
+                link_type=link_type,
+                comment=comment,
+            )
+            audit_write(
+                config,
+                action="link_issue",
+                issue_key=outward_key,
+                payload=payload,
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Linked {outward_key} to {inward_key} with {link_type}.")
+
+
+@app.command("attach")
+def attach(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    file_path: Annotated[
+        Path | None,
+        typer.Option("--file", exists=True, dir_okay=False, readable=True, help="File to attach."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually upload the attachment to Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Attach a file to a Jira issue. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if file_path is None:
+        error_console.print("[red]--file is required.[/red]")
+        raise typer.Exit(2)
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would attach file")
+                console.print(f"issue: {issue_key}")
+                console.print(f"file: {file_path}")
+                console.print(f"safety: {safety}")
+                console.print("Pass --execute to upload it to Jira.")
+                return
+
+            data = client.add_attachment(issue_key, file_path)
+            audit_write(
+                config,
+                action="attach",
+                issue_key=issue_key,
+                payload={"file": str(file_path), "size": file_path.stat().st_size},
+                result={"attachments": data},
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _print_json(data)
+        return
+    for attachment in data:
+        console.print(f"Attached {attachment.get('filename')} ({attachment.get('id')}).")
+
+
+@app.command()
+def changelog(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=100, help="Maximum changelog entries to return."),
+    ] = 10,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Show recent changelog entries for an issue."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    with JiraClient(config) as client:
+        try:
+            data = client.get_changelog(issue_key, limit=limit)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _print_json(data)
+        return
+    for entry in data.get("values") or []:
+        author = entry.get("author") or {}
+        console.print(f"{entry.get('created')} by {author.get('displayName')}")
+        for item in entry.get("items") or []:
+            console.print(
+                f"  - {item.get('field')}: {item.get('fromString')} -> {item.get('toString')}"
+            )
+
+
+@app.command("audit-log")
+def audit_log(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=100, help="Maximum audit records to show."),
+    ] = 20,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print machine-readable JSON."),
+    ] = False,
+) -> None:
+    """Show local write audit records."""
+    config = _config()
+    records = _read_audit_records(config.audit_log_path, limit)
+    if json_output:
+        _print_json(records)
+        return
+    if not records:
+        console.print("No audit records.")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Timestamp")
+    table.add_column("Action")
+    table.add_column("Issue")
+    for record in records:
+        table.add_row(
+            str(record.get("timestamp")),
+            str(record.get("action")),
+            str(record.get("issue_key")),
+        )
+    console.print(table)
 
 
 @app.command()
@@ -1023,6 +1404,13 @@ def transition(
 
             ensure_issue_write_allowed(client.config, client, key)
             data = client.transition_issue(key, str(selected["id"]))
+            audit_write(
+                client.config,
+                action="transition_issue",
+                issue_key=key,
+                payload={"transition": selected},
+                result=data,
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:

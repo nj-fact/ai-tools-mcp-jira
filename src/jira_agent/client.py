@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -31,7 +32,6 @@ class JiraClient:
             timeout=config.timeout_seconds,
             headers={
                 "Accept": "application/json",
-                "Content-Type": "application/json",
                 "User-Agent": "jira-agent/0.1",
             },
         )
@@ -151,6 +151,24 @@ class JiraClient:
             json={"accountId": account_id},
         )
 
+    def search_assignable_users(
+        self,
+        query: str,
+        *,
+        issue_key: str | None = None,
+        project_key: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "query": query,
+            "maxResults": limit,
+        }
+        if issue_key:
+            params["issueKey"] = issue_key
+        if project_key:
+            params["project"] = project_key
+        return self._request("GET", "/user/assignable/search", params=params)
+
     def edit_issue(
         self,
         issue_key: str,
@@ -167,6 +185,71 @@ class JiraClient:
                 description=description,
                 labels=labels,
             ),
+        )
+
+    def link_issues(
+        self,
+        *,
+        outward_issue_key: str,
+        inward_issue_key: str,
+        link_type: str = "Relates",
+        comment: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/issueLink",
+            json=issue_link_payload(
+                outward_issue_key=outward_issue_key,
+                inward_issue_key=inward_issue_key,
+                link_type=link_type,
+                comment=comment,
+            ),
+        )
+
+    def add_attachment(self, issue_key: str, file_path: str | Path) -> list[dict[str, Any]]:
+        path = Path(file_path)
+        with path.open("rb") as handle:
+            try:
+                response = self._client.request(
+                    "POST",
+                    f"/issue/{issue_key}/attachments",
+                    headers={"X-Atlassian-Token": "no-check"},
+                    files={"file": (path.name, handle)},
+                )
+            except httpx.HTTPError as exc:
+                raise JiraApiError(
+                    f"Jira request failed before receiving a response: {exc}"
+                ) from exc
+
+        if response.status_code >= 400:
+            raise self._api_error(response)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise JiraApiError(
+                "Jira returned a non-JSON response",
+                status_code=response.status_code,
+                details=response.text[:500],
+            ) from exc
+        if not isinstance(data, list):
+            raise JiraApiError(
+                "Jira returned an unexpected attachment payload",
+                status_code=response.status_code,
+                details=data,
+            )
+        return data
+
+    def get_changelog(
+        self,
+        issue_key: str,
+        *,
+        start_at: int = 0,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/issue/{issue_key}/changelog",
+            params={"startAt": start_at, "maxResults": limit},
         )
 
     def _request(
@@ -197,7 +280,7 @@ class JiraClient:
                 details=response.text[:500],
             ) from exc
 
-        if not isinstance(data, dict):
+        if not isinstance(data, dict | list):
             raise JiraApiError(
                 "Jira returned an unexpected JSON payload",
                 status_code=response.status_code,
@@ -273,6 +356,23 @@ def edit_issue_payload(
     if not fields:
         raise ValueError("At least one editable field must be provided")
     return {"fields": fields}
+
+
+def issue_link_payload(
+    *,
+    outward_issue_key: str,
+    inward_issue_key: str,
+    link_type: str = "Relates",
+    comment: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": {"name": link_type},
+        "outwardIssue": {"key": outward_issue_key},
+        "inwardIssue": {"key": inward_issue_key},
+    }
+    if comment:
+        payload["comment"] = {"body": text_to_adf(comment)}
+    return payload
 
 
 def select_transition(

@@ -24,6 +24,7 @@ class JiraConfig(BaseModel):
         default_factory=lambda: ["FC"], alias="JIRA_WRITE_PROJECT_KEYS"
     )
     write_issue_keys: list[str] = Field(default_factory=list, alias="JIRA_WRITE_ISSUE_KEYS")
+    audit_log_path: str = Field(default=".jira-agent/audit.jsonl", alias="JIRA_AUDIT_LOG_PATH")
 
     @field_validator("site_url")
     @classmethod

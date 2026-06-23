@@ -98,6 +98,61 @@ def test_build_agent_report_normalizes_issue_context() -> None:
     assert report["write_scope"] == "FC-107"
 
 
+def test_build_agent_report_can_include_changelog_via_fetch_mock() -> None:
+    class FakeClient:
+        def get_issue(self, _issue_key: str, *, fields: list[str]) -> dict[str, object]:
+            return {
+                "key": "FC-107",
+                "fields": {
+                    "summary": "Test",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "project": {"key": "FC", "name": "First Cloud"},
+                },
+            }
+
+        def list_comments(self, _issue_key: str, *, limit: int) -> dict[str, object]:
+            return {"comments": [], "total": 0}
+
+        def get_transitions(self, _issue_key: str) -> dict[str, object]:
+            return {"transitions": []}
+
+        def get_changelog(self, _issue_key: str, *, limit: int) -> dict[str, object]:
+            return {
+                "values": [
+                    {
+                        "id": "1",
+                        "created": "2026-06-23T15:00:00.000+0200",
+                        "author": {"displayName": "Norman Janert"},
+                        "items": [{"field": "labels", "fromString": "", "toString": "jira-agent"}],
+                    }
+                ]
+            }
+
+    from jira_agent.reporting import fetch_agent_report
+
+    report = fetch_agent_report(
+        FakeClient(),
+        issue_key="FC-107",
+        site_url="https://example.atlassian.net",
+        changelog_limit=1,
+    )
+
+    assert report["changelog"] == [
+        {
+            "id": "1",
+            "created": "2026-06-23T15:00:00.000+0200",
+            "author": {
+                "accountId": None,
+                "displayName": "Norman Janert",
+                "emailAddress": None,
+                "active": None,
+            },
+            "items": [{"field": "labels", "from": "", "to": "jira-agent"}],
+        }
+    ]
+
+
 def test_agent_plan_comment_body_contains_context_and_options() -> None:
     body = agent_plan_comment_body(
         {

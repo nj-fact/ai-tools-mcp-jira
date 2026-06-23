@@ -4,11 +4,13 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from jira_agent.audit import audit_write
 from jira_agent.client import (
     JiraApiError,
     JiraClient,
     create_issue_payload,
     edit_issue_payload,
+    issue_link_payload,
     select_transition,
 )
 from jira_agent.config import load_config
@@ -181,14 +183,22 @@ def jira_create_test_issue(
     try:
         with JiraClient(config) as client:
             ensure_project_write_allowed(config, config.test_project_key)
+            issue_result = client.create_issue(
+                project_key=config.test_project_key,
+                issue_type_name=config.test_issue_type,
+                summary=summary,
+                description=description,
+            )
+            audit_write(
+                config,
+                action="create_issue",
+                issue_key=issue_result.get("key"),
+                payload=payload,
+                result=issue_result,
+            )
             return {
                 "ok": True,
-                "issue": client.create_issue(
-                    project_key=config.test_project_key,
-                    issue_type_name=config.test_issue_type,
-                    summary=summary,
-                    description=description,
-                ),
+                "issue": issue_result,
             }
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
@@ -243,7 +253,14 @@ def jira_assign_issue(
                 }
 
             ensure_issue_write_allowed(config, client, issue_key)
-            client.assign_issue(issue_key, target_account_id)
+            result = client.assign_issue(issue_key, target_account_id)
+            audit_write(
+                config,
+                action="assign_issue",
+                issue_key=issue_key,
+                payload={"accountId": target_account_id},
+                result=result,
+            )
             return {
                 "ok": True,
                 "issue": issue_key,
@@ -259,6 +276,7 @@ def jira_assign_issue(
 def jira_agent_report(
     key: str | None = None,
     comments_limit: int = 5,
+    changelog_limit: int = 0,
 ) -> dict[str, Any]:
     """Return compact issue context for agents."""
     config = load_config()
@@ -278,6 +296,7 @@ def jira_agent_report(
                     issue_key=issue_key,
                     site_url=config.site_url,
                     comment_limit=comments_limit,
+                    changelog_limit=changelog_limit,
                     write_scope=config.test_issue_key,
                 ),
             }
@@ -322,6 +341,13 @@ def jira_edit_issue(
                 }
 
             client.edit_issue(issue_key, summary=summary, description=description, labels=labels)
+            audit_write(
+                config,
+                action="edit_issue",
+                issue_key=issue_key,
+                payload=payload,
+                result={},
+            )
             return {"ok": True, "issue": issue_key}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
@@ -373,7 +399,15 @@ def jira_agent_plan_comment(
                 }
 
             ensure_issue_write_allowed(config, client, issue_key)
-            return {"ok": True, "comment": client.add_comment(issue_key, body)}
+            comment_result = client.add_comment(issue_key, body)
+            audit_write(
+                config,
+                action="agent_plan_comment",
+                issue_key=issue_key,
+                payload={"body": body},
+                result={"id": comment_result.get("id")},
+            )
+            return {"ok": True, "comment": comment_result}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -394,6 +428,84 @@ def jira_list_comments(key: str, limit: int = 20, start_at: int = 0) -> dict[str
 
 
 @mcp.tool
+def jira_user_search(
+    query: str,
+    key: str | None = None,
+    project: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Search assignable Jira users."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    project_key = project or (None if issue_key else config.test_project_key)
+    try:
+        with JiraClient(config) as client:
+            return {
+                "ok": True,
+                "users": client.search_assignable_users(
+                    query,
+                    issue_key=issue_key,
+                    project_key=project_key,
+                    limit=limit,
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_assign_user(
+    query: str,
+    key: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Assign an issue by searching exactly one active assignable user."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    try:
+        with JiraClient(config) as client:
+            users = client.search_assignable_users(query, issue_key=issue_key, limit=10)
+            active_users = [user for user in users if user.get("active")]
+            if len(active_users) != 1:
+                return {
+                    "ok": False,
+                    "message": (
+                        f"Expected exactly one active assignable user, got {len(active_users)}."
+                    ),
+                    "users": active_users,
+                }
+            user = active_users[0]
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "user": user,
+                    "message": "Pass execute=true to assign this issue in Jira.",
+                }
+
+            ensure_issue_write_allowed(config, client, issue_key)
+            result = client.assign_issue(issue_key, str(user["accountId"]))
+            audit_write(
+                config,
+                action="assign_user",
+                issue_key=issue_key,
+                payload={"query": query, "accountId": user.get("accountId")},
+                result=result,
+            )
+            return {"ok": True, "issue": issue_key, "user": user}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
 def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, Any]:
     """Add a comment to one Jira issue. Defaults to dry-run unless execute is true."""
     if not execute:
@@ -408,7 +520,15 @@ def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, An
     try:
         with _client() as client:
             ensure_issue_write_allowed(client.config, client, key)
-            return {"ok": True, "comment": client.add_comment(key, body)}
+            comment_result = client.add_comment(key, body)
+            audit_write(
+                client.config,
+                action="add_comment",
+                issue_key=key,
+                payload={"body": body},
+                result={"id": comment_result.get("id")},
+            )
+            return {"ok": True, "comment": comment_result}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -421,6 +541,115 @@ def jira_list_transitions(key: str) -> dict[str, Any]:
     try:
         with _client() as client:
             return {"ok": True, "transitions": client.get_transitions(key)}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_link_issue(
+    outward_key: str,
+    inward_key: str,
+    link_type: str = "Relates",
+    comment: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Link two Jira issues. Defaults to dry-run."""
+    config = load_config()
+    payload = issue_link_payload(
+        outward_issue_key=outward_key,
+        inward_issue_key=inward_key,
+        link_type=link_type,
+        comment=comment,
+    )
+    try:
+        with JiraClient(config) as client:
+            outward_safety = ensure_issue_write_allowed(config, client, outward_key)
+            inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "payload": payload,
+                    "outward_safety": outward_safety,
+                    "inward_safety": inward_safety,
+                    "message": "Pass execute=true to create this issue link in Jira.",
+                }
+
+            result = client.link_issues(
+                outward_issue_key=outward_key,
+                inward_issue_key=inward_key,
+                link_type=link_type,
+                comment=comment,
+            )
+            audit_write(
+                config,
+                action="link_issue",
+                issue_key=outward_key,
+                payload=payload,
+                result=result,
+            )
+            return {"ok": True, "outward_key": outward_key, "inward_key": inward_key}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_attach_file(
+    file_path: str,
+    key: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Attach a local file to a Jira issue. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "file_path": file_path,
+                    "safety": safety,
+                    "message": "Pass execute=true to upload this attachment to Jira.",
+                }
+
+            result = client.add_attachment(issue_key, file_path)
+            audit_write(
+                config,
+                action="attach",
+                issue_key=issue_key,
+                payload={"file": file_path},
+                result={"attachments": result},
+            )
+            return {"ok": True, "attachments": result}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_changelog(key: str | None = None, limit: int = 10) -> dict[str, Any]:
+    """Return recent changelog entries for an issue."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    try:
+        with JiraClient(config) as client:
+            return {"ok": True, "changelog": client.get_changelog(issue_key, limit=limit)}
     except JiraApiError as exc:
         return _error(exc)
 
@@ -454,6 +683,13 @@ def jira_transition_issue(
 
             ensure_issue_write_allowed(client.config, client, key)
             client.transition_issue(key, str(selected["id"]))
+            audit_write(
+                client.config,
+                action="transition_issue",
+                issue_key=key,
+                payload={"transition": selected},
+                result={},
+            )
             return {"ok": True, "issue": key, "transition": selected}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
