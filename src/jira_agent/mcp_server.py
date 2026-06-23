@@ -1,0 +1,305 @@
+from __future__ import annotations
+
+from typing import Any
+
+from fastmcp import FastMCP
+
+from jira_agent.client import JiraApiError, JiraClient, create_issue_payload, select_transition
+from jira_agent.config import load_config
+from jira_agent.reporting import fetch_agent_report
+
+mcp = FastMCP("jira-agent")
+
+DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated"]
+
+
+def _client() -> JiraClient:
+    return JiraClient(load_config())
+
+
+def _fields_or_default(fields: list[str] | None) -> list[str]:
+    return fields or DEFAULT_FIELDS
+
+
+def _error(exc: JiraApiError) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status_code": exc.status_code,
+        "message": str(exc),
+        "details": exc.details,
+    }
+
+
+@mcp.tool
+def jira_myself() -> dict[str, Any]:
+    """Return the authenticated Jira user."""
+    try:
+        with _client() as client:
+            return {"ok": True, "user": client.myself()}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_get_issue(key: str, fields: list[str] | None = None) -> dict[str, Any]:
+    """Fetch one Jira issue by key."""
+    try:
+        with _client() as client:
+            return {"ok": True, "issue": client.get_issue(key, fields=_fields_or_default(fields))}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_search_issues(
+    jql: str,
+    limit: int = 20,
+    fields: list[str] | None = None,
+    next_page_token: str | None = None,
+) -> dict[str, Any]:
+    """Search Jira issues with JQL."""
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "result": client.search_issues(
+                    jql,
+                    limit=limit,
+                    fields=_fields_or_default(fields),
+                    next_page_token=next_page_token,
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_recent_issues(days: int = 30, limit: int = 20) -> dict[str, Any]:
+    """Fetch recently updated Jira issues with a bounded JQL query."""
+    jql = f"updated >= -{days}d ORDER BY updated DESC"
+    return jira_search_issues(jql, limit=limit)
+
+
+@mcp.tool
+def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
+    """Fetch issues from the configured test scope. Defaults to the FC queue/project."""
+    try:
+        config = load_config()
+        with JiraClient(config) as client:
+            return {
+                "ok": True,
+                "test_jql": config.test_jql,
+                "result": client.search_issues(
+                    config.test_jql,
+                    limit=limit,
+                    fields=DEFAULT_FIELDS,
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_create_test_issue(
+    summary: str,
+    description: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Create an issue in the configured test project. Defaults to dry-run."""
+    config = load_config()
+    payload = create_issue_payload(
+        project_key=config.test_project_key,
+        issue_type_name=config.test_issue_type,
+        summary=summary,
+        description=description,
+    )
+    if not execute:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "payload": payload,
+            "message": "Pass execute=true to create this issue in Jira.",
+        }
+
+    try:
+        with JiraClient(config) as client:
+            return {
+                "ok": True,
+                "issue": client.create_issue(
+                    project_key=config.test_project_key,
+                    issue_type_name=config.test_issue_type,
+                    summary=summary,
+                    description=description,
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_get_test_issue() -> dict[str, Any]:
+    """Fetch the configured integration-test issue."""
+    config = load_config()
+    if not config.test_issue_key:
+        return {"ok": False, "message": "JIRA_TEST_ISSUE_KEY is not configured."}
+    try:
+        with JiraClient(config) as client:
+            return {
+                "ok": True,
+                "issue": client.get_issue(config.test_issue_key, fields=DEFAULT_FIELDS),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_assign_issue(
+    key: str | None = None,
+    account_id: str | None = None,
+    unassigned: bool = False,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Assign a Jira issue. Defaults to the configured test issue and dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    try:
+        with JiraClient(config) as client:
+            me = client.myself()
+            target_account_id = None if unassigned else account_id or str(me["accountId"])
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "target_account_id": target_account_id,
+                    "target_user": None if unassigned else me.get("displayName"),
+                    "message": "Pass execute=true to assign this issue in Jira.",
+                }
+
+            client.assign_issue(issue_key, target_account_id)
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "target_account_id": target_account_id,
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_agent_report(
+    key: str | None = None,
+    comments_limit: int = 5,
+) -> dict[str, Any]:
+    """Return compact issue context for agents."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    try:
+        with JiraClient(config) as client:
+            return {
+                "ok": True,
+                "report": fetch_agent_report(
+                    client,
+                    issue_key=issue_key,
+                    site_url=config.site_url,
+                    comment_limit=comments_limit,
+                    write_scope=config.test_issue_key,
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_list_comments(key: str, limit: int = 20, start_at: int = 0) -> dict[str, Any]:
+    """List comments for one Jira issue."""
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "comments": client.list_comments(key, start_at=start_at, limit=limit),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, Any]:
+    """Add a comment to one Jira issue. Defaults to dry-run unless execute is true."""
+    if not execute:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "issue": key,
+            "body": body,
+            "message": "Pass execute=true to write this comment to Jira.",
+        }
+
+    try:
+        with _client() as client:
+            return {"ok": True, "comment": client.add_comment(key, body)}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_list_transitions(key: str) -> dict[str, Any]:
+    """List available transitions for one Jira issue."""
+    try:
+        with _client() as client:
+            return {"ok": True, "transitions": client.get_transitions(key)}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_transition_issue(
+    key: str,
+    transition_name_or_id: str,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Transition one Jira issue by transition name or ID. Defaults to dry-run."""
+    try:
+        with _client() as client:
+            transitions = client.get_transitions(key)
+            selected = select_transition(transitions, transition_name_or_id)
+            if selected is None:
+                return {
+                    "ok": False,
+                    "message": f"No transition found for: {transition_name_or_id}",
+                    "transitions": transitions,
+                }
+
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    "transition": selected,
+                    "message": "Pass execute=true to transition this issue in Jira.",
+                }
+
+            client.transition_issue(key, str(selected["id"]))
+            return {"ok": True, "issue": key, "transition": selected}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+def main() -> None:
+    mcp.run(transport="stdio", show_banner=False)
+
+
+if __name__ == "__main__":
+    main()
