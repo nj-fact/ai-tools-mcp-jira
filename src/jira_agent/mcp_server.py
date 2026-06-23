@@ -4,9 +4,21 @@ from typing import Any
 
 from fastmcp import FastMCP
 
-from jira_agent.client import JiraApiError, JiraClient, create_issue_payload, select_transition
+from jira_agent.client import (
+    JiraApiError,
+    JiraClient,
+    create_issue_payload,
+    edit_issue_payload,
+    select_transition,
+)
 from jira_agent.config import load_config
-from jira_agent.reporting import fetch_agent_report
+from jira_agent.reporting import agent_plan_comment_body, fetch_agent_report
+from jira_agent.safety import (
+    JiraWriteSafetyError,
+    ensure_issue_write_allowed,
+    ensure_project_write_allowed,
+    write_scope_summary,
+)
 
 mcp = FastMCP("jira-agent")
 
@@ -28,6 +40,26 @@ def _error(exc: JiraApiError) -> dict[str, Any]:
         "message": str(exc),
         "details": exc.details,
     }
+
+
+def _safety_error(exc: JiraWriteSafetyError) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "message": str(exc),
+        "error_type": "write_safety",
+    }
+
+
+def _run_jql(jql: str, limit: int = 20) -> dict[str, Any]:
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "jql": jql,
+                "result": client.search_issues(jql, limit=limit, fields=DEFAULT_FIELDS),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
 
 
 @mcp.tool
@@ -81,6 +113,31 @@ def jira_recent_issues(days: int = 30, limit: int = 20) -> dict[str, Any]:
 
 
 @mcp.tool
+def jira_mine(project: str | None = None, limit: int = 20) -> dict[str, Any]:
+    """Fetch unresolved issues assigned to the authenticated user."""
+    clauses = ["assignee = currentUser()", "resolution = Unresolved"]
+    if project:
+        clauses.insert(0, f"project = {project}")
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
+
+
+@mcp.tool
+def jira_fc_open(limit: int = 20) -> dict[str, Any]:
+    """Fetch open FC issues."""
+    return _run_jql("project = FC AND statusCategory != Done ORDER BY updated DESC", limit=limit)
+
+
+@mcp.tool
+def jira_by_status(status: str, project: str | None = None, limit: int = 20) -> dict[str, Any]:
+    """Fetch issues by status."""
+    escaped_status = status.replace('"', '\\"')
+    clauses = [f'status = "{escaped_status}"']
+    if project:
+        clauses.insert(0, f"project = {project}")
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
+
+
+@mcp.tool
 def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
     """Fetch issues from the configured test scope. Defaults to the FC queue/project."""
     try:
@@ -123,6 +180,7 @@ def jira_create_test_issue(
 
     try:
         with JiraClient(config) as client:
+            ensure_project_write_allowed(config, config.test_project_key)
             return {
                 "ok": True,
                 "issue": client.create_issue(
@@ -132,6 +190,8 @@ def jira_create_test_issue(
                     description=description,
                 ),
             }
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 
@@ -182,12 +242,15 @@ def jira_assign_issue(
                     "message": "Pass execute=true to assign this issue in Jira.",
                 }
 
+            ensure_issue_write_allowed(config, client, issue_key)
             client.assign_issue(issue_key, target_account_id)
             return {
                 "ok": True,
                 "issue": issue_key,
                 "target_account_id": target_account_id,
             }
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 
@@ -223,6 +286,101 @@ def jira_agent_report(
 
 
 @mcp.tool
+def jira_edit_issue(
+    key: str | None = None,
+    summary: str | None = None,
+    description: str | None = None,
+    labels: list[str] | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Edit summary, description, or labels. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    try:
+        payload = edit_issue_payload(summary=summary, description=description, labels=labels)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "payload": payload,
+                    "safety": safety,
+                    "write_scope": write_scope_summary(config),
+                    "message": "Pass execute=true to edit this issue in Jira.",
+                }
+
+            client.edit_issue(issue_key, summary=summary, description=description, labels=labels)
+            return {"ok": True, "issue": issue_key}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_agent_plan_comment(
+    key: str | None = None,
+    plan: str = "Review the issue context and proceed with the next verified action.",
+    next_step: str | None = None,
+    risk: str | None = None,
+    result: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Prepare or add a standardized agent plan comment. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    try:
+        with JiraClient(config) as client:
+            report = fetch_agent_report(
+                client,
+                issue_key=issue_key,
+                site_url=config.site_url,
+                comment_limit=1,
+                write_scope=config.test_issue_key,
+            )
+            body = agent_plan_comment_body(
+                report,
+                plan=plan,
+                next_step=next_step,
+                risk=risk,
+                result=result,
+            )
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "body": body,
+                    "message": "Pass execute=true to add this comment in Jira.",
+                }
+
+            ensure_issue_write_allowed(config, client, issue_key)
+            return {"ok": True, "comment": client.add_comment(issue_key, body)}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
 def jira_list_comments(key: str, limit: int = 20, start_at: int = 0) -> dict[str, Any]:
     """List comments for one Jira issue."""
     try:
@@ -249,7 +407,10 @@ def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, An
 
     try:
         with _client() as client:
+            ensure_issue_write_allowed(client.config, client, key)
             return {"ok": True, "comment": client.add_comment(key, body)}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 
@@ -291,8 +452,11 @@ def jira_transition_issue(
                     "message": "Pass execute=true to transition this issue in Jira.",
                 }
 
+            ensure_issue_write_allowed(client.config, client, key)
             client.transition_issue(key, str(selected["id"]))
             return {"ok": True, "issue": key, "transition": selected}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 

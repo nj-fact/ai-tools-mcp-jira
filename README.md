@@ -14,6 +14,8 @@ JIRA_TEST_JQL=project = FC AND updated >= -365d ORDER BY updated DESC
 JIRA_TEST_PROJECT_KEY=FC
 JIRA_TEST_ISSUE_TYPE=Task
 JIRA_TEST_ISSUE_KEY=FC-123
+JIRA_WRITE_PROJECT_KEYS=FC
+JIRA_WRITE_ISSUE_KEYS=
 ```
 
 Install and run:
@@ -21,12 +23,18 @@ Install and run:
 ```bash
 uv sync
 uv run jira-agent myself
+uv run jira-agent mcp-config
 uv run jira-agent test-scope --limit 5
+uv run jira-agent mine --project FC --limit 5
+uv run jira-agent fc-open --limit 5
+uv run jira-agent by-status Open --project FC --limit 5
 uv run jira-agent create-meta --project FC
 uv run jira-agent create-test-issue "jira-agent smoke test" --description "Dry-run by default."
 uv run jira-agent test-issue
 uv run jira-agent agent-report
 uv run jira-agent agent-report FC-107 --json
+uv run jira-agent agent-plan-comment --next-step "Run implementation checks."
+uv run jira-agent edit-issue --labels jira-agent,test
 uv run jira-agent smoke-write
 uv run jira-agent assign
 uv run jira-agent assign --execute
@@ -46,15 +54,20 @@ uv run python scripts/smoke_mcp.py
 - Fetch one issue with `issue`
 - Search issues with JQL using Jira Cloud REST API v3 enhanced search
 - Fetch recently updated issues with `recent`
+- Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
 - Run read-only smoke checks inside the configured FC test scope with `test-scope`
 - Inspect create metadata and create dry-run/real test issues in the configured FC project
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`
+- Prepare standardized agent comments with `agent-plan-comment`
+- Edit summary, description, and labels with `edit-issue`
 - Run bundled write smoke checks against the configured test issue
 - List and add comments
 - List and execute issue transitions
 
 Write actions default to dry-run. Pass `--execute` to actually modify Jira.
+Write actions are blocked unless the issue belongs to `JIRA_WRITE_PROJECT_KEYS`
+or the issue key is listed in `JIRA_WRITE_ISSUE_KEYS`.
 
 ## MCP Server
 
@@ -80,11 +93,16 @@ Available MCP tools:
 - `jira_get_issue`
 - `jira_search_issues`
 - `jira_recent_issues`
+- `jira_mine`
+- `jira_fc_open`
+- `jira_by_status`
 - `jira_test_scope_issues`
 - `jira_create_test_issue`
 - `jira_get_test_issue`
 - `jira_assign_issue`
 - `jira_agent_report`
+- `jira_edit_issue`
+- `jira_agent_plan_comment`
 - `jira_list_comments`
 - `jira_add_comment`
 - `jira_list_transitions`

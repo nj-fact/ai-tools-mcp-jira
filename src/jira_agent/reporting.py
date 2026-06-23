@@ -107,6 +107,33 @@ def fetch_agent_report(
     )
 
 
+def agent_plan_comment_body(
+    report: dict[str, Any],
+    *,
+    plan: str,
+    next_step: str | None = None,
+    risk: str | None = None,
+    result: str | None = None,
+) -> str:
+    status = (report.get("status") or {}).get("name") or "Unknown"
+    assignee = (report.get("assignee") or {}).get("displayName") or "Unassigned"
+    lines = [
+        f"Agent plan update for {report.get('key')}",
+        f"Summary: {report.get('summary')}",
+        f"Status: {status}",
+        f"Assignee: {assignee}",
+        "",
+        f"Plan: {plan}",
+    ]
+    if next_step:
+        lines.append(f"Next step: {next_step}")
+    if risk:
+        lines.append(f"Risk: {risk}")
+    if result:
+        lines.append(f"Result: {result}")
+    return "\n".join(lines)
+
+
 def _user_summary(user: dict[str, Any]) -> dict[str, Any] | None:
     if not user:
         return None

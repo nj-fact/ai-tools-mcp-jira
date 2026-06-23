@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr, field_validator
@@ -19,6 +20,10 @@ class JiraConfig(BaseModel):
     test_project_key: str = Field(default="FC", alias="JIRA_TEST_PROJECT_KEY")
     test_issue_type: str = Field(default="Task", alias="JIRA_TEST_ISSUE_TYPE")
     test_issue_key: str | None = Field(default=None, alias="JIRA_TEST_ISSUE_KEY")
+    write_project_keys: list[str] = Field(
+        default_factory=lambda: ["FC"], alias="JIRA_WRITE_PROJECT_KEYS"
+    )
+    write_issue_keys: list[str] = Field(default_factory=list, alias="JIRA_WRITE_ISSUE_KEYS")
 
     @field_validator("site_url")
     @classmethod
@@ -68,6 +73,17 @@ class JiraConfig(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+    @field_validator("write_project_keys", "write_issue_keys", mode="before")
+    @classmethod
+    def parse_csv_list(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        raise TypeError("Expected comma-separated string or list")
 
 
 def load_config(env_file: str | Path = ".env") -> JiraConfig:

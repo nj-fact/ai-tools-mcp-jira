@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from jira_agent.reporting import adf_to_text, build_agent_report, issue_url
+from jira_agent.reporting import adf_to_text, agent_plan_comment_body, build_agent_report, issue_url
 
 
 def test_issue_url_uses_browse_url() -> None:
@@ -96,3 +96,26 @@ def test_build_agent_report_normalizes_issue_context() -> None:
         {"id": "4", "name": "Start", "to": {"id": None, "name": "Doing"}}
     ]
     assert report["write_scope"] == "FC-107"
+
+
+def test_agent_plan_comment_body_contains_context_and_options() -> None:
+    body = agent_plan_comment_body(
+        {
+            "key": "FC-107",
+            "summary": "Test subject",
+            "status": {"name": "Open"},
+            "assignee": {"displayName": "Norman Janert"},
+        },
+        plan="Check implementation.",
+        next_step="Run tests.",
+        risk="None.",
+        result="Pending.",
+    )
+
+    assert "Agent plan update for FC-107" in body
+    assert "Summary: Test subject" in body
+    assert "Status: Open" in body
+    assert "Plan: Check implementation." in body
+    assert "Next step: Run tests." in body
+    assert "Risk: None." in body
+    assert "Result: Pending." in body

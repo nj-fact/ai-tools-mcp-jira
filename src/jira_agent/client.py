@@ -151,6 +151,24 @@ class JiraClient:
             json={"accountId": account_id},
         )
 
+    def edit_issue(
+        self,
+        issue_key: str,
+        *,
+        summary: str | None = None,
+        description: str | None = None,
+        labels: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/issue/{issue_key}",
+            json=edit_issue_payload(
+                summary=summary,
+                description=description,
+                labels=labels,
+            ),
+        )
+
     def _request(
         self,
         method: str,
@@ -236,6 +254,24 @@ def create_issue_payload(
     }
     if description:
         fields["description"] = text_to_adf(description)
+    return {"fields": fields}
+
+
+def edit_issue_payload(
+    *,
+    summary: str | None = None,
+    description: str | None = None,
+    labels: list[str] | None = None,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if summary is not None:
+        fields["summary"] = summary
+    if description is not None:
+        fields["description"] = text_to_adf(description)
+    if labels is not None:
+        fields["labels"] = labels
+    if not fields:
+        raise ValueError("At least one editable field must be provided")
     return {"fields": fields}
 
 

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import httpx
 
-from jira_agent.client import JiraApiError, JiraClient, create_issue_payload, text_to_adf
+from jira_agent.client import (
+    JiraApiError,
+    JiraClient,
+    create_issue_payload,
+    edit_issue_payload,
+    text_to_adf,
+)
 from jira_agent.config import JiraConfig
 
 
@@ -286,6 +292,53 @@ def test_assign_issue_can_unassign_with_null_account_id() -> None:
 
     assert client.assign_issue("FC-107", None) == {}
     assert seen["json"] == '{"accountId":null}'
+
+
+def test_edit_issue_posts_edit_payload() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.edit_issue("FC-107", summary="Updated", labels=["jira-agent"]) == {}
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-107"
+    assert seen["json"] == '{"fields":{"summary":"Updated","labels":["jira-agent"]}}'
+
+
+def test_edit_issue_payload_requires_at_least_one_field() -> None:
+    try:
+        edit_issue_payload()
+    except ValueError as exc:
+        assert str(exc) == "At least one editable field must be provided"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_converts_description_to_adf() -> None:
+    assert edit_issue_payload(description="Hello") == {
+        "fields": {
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Hello"}],
+                    }
+                ],
+            }
+        }
+    }
 
 
 def test_text_to_adf_preserves_blank_lines() -> None:
