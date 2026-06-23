@@ -37,6 +37,7 @@ uv run jira-agent comments ABC-123 --limit 5
 uv run jira-agent transitions ABC-123
 uv run jira-agent add-comment ABC-123 "Investigated by local agent." --execute
 uv run jira-agent transition ABC-123 "In Progress" --execute
+uv run python scripts/smoke_mcp.py
 ```
 
 ## Current Scope
@@ -68,7 +69,8 @@ Example MCP server command for local clients:
 ```json
 {
   "command": "uv",
-  "args": ["run", "--directory", "/Users/norman/Fact/jira", "jira-agent-mcp"]
+  "args": ["run", "jira-agent-mcp"],
+  "cwd": "/Users/norman/Fact/jira"
 }
 ```
 
@@ -87,3 +89,12 @@ Available MCP tools:
 - `jira_add_comment`
 - `jira_list_transitions`
 - `jira_transition_issue`
+
+Run an end-to-end MCP smoke test:
+
+```bash
+uv run python scripts/smoke_mcp.py
+uv run python scripts/smoke_mcp.py --issue FC-107
+```
+
+The smoke test starts `jira-agent-mcp` over stdio, verifies the expected tool list, and calls `jira_agent_report`.
