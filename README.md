@@ -45,6 +45,8 @@ uv run jira-agent edit-issue --labels jira-agent,test
 uv run jira-agent assign-user Norman
 uv run jira-agent link-issue FC-107 FC-101 --type Relates
 uv run jira-agent attach --file ./some-report.txt
+uv run jira-agent delete-attachment FC-107 --attachment-id 12345
+uv run jira-agent embed-diagram FC-107 --file ./architecture.png --delete-filename old.svg
 uv run jira-agent changelog --limit 5
 uv run jira-agent audit-log --limit 10
 uv run jira-agent smoke-write
@@ -80,6 +82,8 @@ uv run python scripts/smoke_mcp.py
 - Search assignable users with `user-search` and assign by query with `assign-user`
 - Link issues with `link-issue`
 - Attach local files with `attach`
+- Delete issue attachments with `delete-attachment`
+- Upload PNG diagrams and embed them in descriptions with `embed-diagram`
 - Inspect issue history with `changelog` or `agent-report --changelog`
 - Inspect local write audit records with `audit-log`
 - Run bundled write smoke checks against the configured test issue
@@ -136,6 +140,8 @@ Available MCP tools:
 - `jira_list_transitions`
 - `jira_link_issue`
 - `jira_attach_file`
+- `jira_delete_attachment`
+- `jira_embed_diagram`
 - `jira_changelog`
 - `jira_transition_issue`
 

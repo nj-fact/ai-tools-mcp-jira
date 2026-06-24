@@ -11,6 +11,8 @@ from jira_agent.client import (
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    png_dimensions,
+    replace_diagram_with_media,
     select_transition,
 )
 from jira_agent.config import load_config
@@ -839,6 +841,147 @@ def jira_attach_file(
                 result={"attachments": result},
             )
             return {"ok": True, "attachments": result}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_delete_attachment(
+    attachment_id: str,
+    key: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Delete one attachment from an allowed Jira issue. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            attachment = next(
+                (item for item in attachments if str(item.get("id")) == attachment_id),
+                None,
+            )
+            if attachment is None:
+                return {
+                    "ok": False,
+                    "message": f"Attachment {attachment_id} is not present on {issue_key}.",
+                }
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "attachment": attachment,
+                    "safety": safety,
+                    "message": "Pass execute=true to delete this attachment from Jira.",
+                }
+            result = client.delete_attachment(attachment_id)
+            audit_write(
+                config,
+                action="delete_attachment",
+                issue_key=issue_key,
+                payload={
+                    "attachment_id": attachment_id,
+                    "filename": attachment.get("filename"),
+                },
+                result=result,
+            )
+            return {"ok": True, "issue": issue_key, "deleted_attachment_id": attachment_id}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_embed_diagram(
+    file_path: str,
+    key: str | None = None,
+    alt: str = "Architecture diagram",
+    delete_filenames: list[str] | None = None,
+    delete_attachment_ids: list[str] | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    try:
+        width, height = png_dimensions(file_path)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+
+    delete_names = set(delete_filenames or [])
+    delete_ids = set(delete_attachment_ids or [])
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            for attachment in attachments:
+                if attachment.get("filename") in delete_names:
+                    delete_ids.add(str(attachment.get("id")))
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "file_path": file_path,
+                    "dimensions": {"width": width, "height": height},
+                    "delete_attachment_ids": sorted(delete_ids),
+                    "safety": safety,
+                    "message": "Pass execute=true to upload and embed this diagram.",
+                }
+            uploaded = client.add_attachment(issue_key, file_path)
+            attachment = uploaded[0]
+            attachment_id = str(attachment.get("id"))
+            media_id = client.attachment_media_id(attachment_id)
+            description = replace_diagram_with_media(
+                issue.get("fields", {}).get("description")
+                or {"type": "doc", "version": 1, "content": []},
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+            )
+            result = client.edit_issue_adf_description(issue_key, description)
+            deleted: list[str] = []
+            for item_id in sorted(delete_ids - {attachment_id}):
+                client.delete_attachment(item_id)
+                deleted.append(item_id)
+            audit_write(
+                config,
+                action="embed_diagram",
+                issue_key=issue_key,
+                payload={
+                    "file": file_path,
+                    "attachment_id": attachment_id,
+                    "media_id": media_id,
+                    "deleted_attachment_ids": deleted,
+                    "dimensions": {"width": width, "height": height},
+                },
+                result=result,
+            )
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "attachment": attachment,
+                "media_id": media_id,
+                "deleted_attachment_ids": deleted,
+            }
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

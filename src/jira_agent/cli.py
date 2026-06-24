@@ -15,6 +15,8 @@ from jira_agent.client import (
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    png_dimensions,
+    replace_diagram_with_media,
     select_transition,
 )
 from jira_agent.config import load_config
@@ -1539,6 +1541,187 @@ def attach(
         return
     for attachment in data:
         console.print(f"Attached {attachment.get('filename')} ({attachment.get('id')}).")
+
+
+@app.command("delete-attachment")
+def delete_attachment(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    attachment_id: Annotated[
+        str | None,
+        typer.Option("--attachment-id", help="Attachment id to delete."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually delete the attachment from Jira."),
+    ] = False,
+) -> None:
+    """Delete one attachment from an allowed Jira issue. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if not attachment_id:
+        error_console.print("[red]--attachment-id is required.[/red]")
+        raise typer.Exit(2)
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            attachment = next(
+                (item for item in attachments if str(item.get("id")) == attachment_id),
+                None,
+            )
+            if attachment is None:
+                error_console.print(
+                    f"[red]Attachment {attachment_id} is not present on {issue_key}.[/red]"
+                )
+                raise typer.Exit(2)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would delete attachment")
+                console.print(f"issue: {issue_key}")
+                console.print(f"attachment: {attachment.get('filename')} ({attachment_id})")
+                console.print(f"safety: {safety}")
+                console.print("Pass --execute to delete it from Jira.")
+                return
+
+            data = client.delete_attachment(attachment_id)
+            audit_write(
+                config,
+                action="delete_attachment",
+                issue_key=issue_key,
+                payload={"attachment_id": attachment_id, "filename": attachment.get("filename")},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Deleted attachment {attachment_id} from {issue_key}.")
+
+
+@app.command("embed-diagram")
+def embed_diagram(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    file_path: Annotated[
+        Path | None,
+        typer.Option("--file", exists=True, dir_okay=False, readable=True, help="PNG file."),
+    ] = None,
+    alt: Annotated[
+        str,
+        typer.Option("--alt", help="Alt text for the embedded diagram."),
+    ] = "Architecture diagram",
+    delete_filename: Annotated[
+        str | None,
+        typer.Option(
+            "--delete-filename",
+            help="Comma-separated existing attachment filenames to remove.",
+        ),
+    ] = None,
+    delete_attachment_id: Annotated[
+        str | None,
+        typer.Option(
+            "--delete-attachment-id",
+            help="Comma-separated existing attachment ids to remove.",
+        ),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Upload, embed, and clean up in Jira."),
+    ] = False,
+) -> None:
+    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if file_path is None:
+        error_console.print("[red]--file is required.[/red]")
+        raise typer.Exit(2)
+    try:
+        width, height = png_dimensions(file_path)
+    except ValueError as exc:
+        error_console.print(f"[red]Diagram error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    delete_names = set(_csv_list(delete_filename) or [])
+    delete_ids = set(_csv_list(delete_attachment_id) or [])
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            for attachment in attachments:
+                if attachment.get("filename") in delete_names:
+                    delete_ids.add(str(attachment.get("id")))
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would embed diagram")
+                console.print(f"issue: {issue_key}")
+                console.print(f"file: {file_path}")
+                console.print(f"dimensions: {width}x{height}")
+                console.print(f"delete attachment ids: {sorted(delete_ids) or 'none'}")
+                console.print(f"safety: {safety}")
+                console.print("Pass --execute to upload and embed it in Jira.")
+                return
+
+            uploaded = client.add_attachment(issue_key, file_path)
+            attachment = uploaded[0]
+            attachment_id = str(attachment.get("id"))
+            media_id = client.attachment_media_id(attachment_id)
+            existing_description = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            description = replace_diagram_with_media(
+                existing_description,
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+            )
+            result = client.edit_issue_adf_description(issue_key, description)
+            deleted: list[str] = []
+            for item_id in sorted(delete_ids - {attachment_id}):
+                client.delete_attachment(item_id)
+                deleted.append(item_id)
+            audit_write(
+                config,
+                action="embed_diagram",
+                issue_key=issue_key,
+                payload={
+                    "file": str(file_path),
+                    "attachment_id": attachment_id,
+                    "media_id": media_id,
+                    "deleted_attachment_ids": deleted,
+                    "dimensions": {"width": width, "height": height},
+                },
+                result=result,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(
+        f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
+        f"deleted {len(deleted)} old attachment(s)."
+    )
 
 
 @app.command()

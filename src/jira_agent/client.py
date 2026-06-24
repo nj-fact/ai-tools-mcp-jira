@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import struct
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -187,6 +189,17 @@ class JiraClient:
             ),
         )
 
+    def edit_issue_adf_description(
+        self,
+        issue_key: str,
+        description: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/issue/{issue_key}",
+            json={"fields": {"description": description}},
+        )
+
     def link_issues(
         self,
         *,
@@ -238,6 +251,30 @@ class JiraClient:
                 details=data,
             )
         return data
+
+    def delete_attachment(self, attachment_id: str) -> dict[str, Any]:
+        return self._request("DELETE", f"/attachment/{attachment_id}")
+
+    def attachment_media_id(self, attachment_id: str) -> str:
+        try:
+            response = self._client.get(
+                f"/attachment/content/{attachment_id}",
+                follow_redirects=False,
+            )
+        except httpx.HTTPError as exc:
+            raise JiraApiError(f"Jira request failed before receiving a response: {exc}") from exc
+
+        if response.status_code >= 400:
+            raise self._api_error(response)
+        location = response.headers.get("location") or ""
+        match = re.search(r"/file/([^/]+)/binary", location)
+        if not match:
+            raise JiraApiError(
+                "Jira attachment redirect did not expose a media id",
+                status_code=response.status_code,
+                details={"location": location},
+            )
+        return match.group(1)
 
     def get_changelog(
         self,
@@ -304,22 +341,283 @@ class JiraClient:
 
 
 def text_to_adf(text: str) -> dict[str, Any]:
-    paragraphs = []
-    for paragraph in text.splitlines() or [""]:
-        if paragraph:
-            paragraphs.append(
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": paragraph}],
-                }
-            )
-        else:
-            paragraphs.append({"type": "paragraph"})
-
     return {
         "type": "doc",
         "version": 1,
-        "content": paragraphs,
+        "content": _markdown_blocks_to_adf(text),
+    }
+
+
+def png_dimensions(path: str | Path) -> tuple[int, int]:
+    with Path(path).open("rb") as handle:
+        header = handle.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError(f"{path} is not a PNG file")
+    return struct.unpack(">II", header[16:24])
+
+
+def media_single_adf(
+    *,
+    media_id: str,
+    alt: str,
+    width: int,
+    height: int,
+    collection: str = "",
+) -> dict[str, Any]:
+    return {
+        "type": "mediaSingle",
+        "attrs": {"layout": "center"},
+        "content": [
+            {
+                "type": "media",
+                "attrs": {
+                    "id": media_id,
+                    "type": "file",
+                    "collection": collection,
+                    "alt": alt,
+                    "width": width,
+                    "height": height,
+                },
+            }
+        ],
+    }
+
+
+def replace_diagram_with_media(
+    adf: dict[str, Any],
+    *,
+    media_id: str,
+    alt: str,
+    width: int,
+    height: int,
+) -> dict[str, Any]:
+    replacement = media_single_adf(media_id=media_id, alt=alt, width=width, height=height)
+    content = list(adf.get("content") or [])
+    new_content: list[dict[str, Any]] = []
+    replaced = False
+
+    for block in content:
+        if not replaced and block.get("type") == "codeBlock":
+            language = (block.get("attrs") or {}).get("language")
+            if language == "mermaid":
+                new_content.append(
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
+                    }
+                )
+                new_content.append(replacement)
+                replaced = True
+                continue
+        if not replaced and block.get("type") == "mediaSingle":
+            new_content.append(replacement)
+            replaced = True
+            continue
+        new_content.append(block)
+
+    if not replaced:
+        new_content.extend(
+            [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
+                },
+                replacement,
+            ]
+        )
+
+    return {**adf, "content": new_content}
+
+
+def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
+    lines = text.splitlines() or [""]
+    blocks: list[dict[str, Any]] = []
+    index = 0
+    task_index = 1
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if not stripped:
+            blocks.append({"type": "paragraph"})
+            index += 1
+            continue
+
+        code_match = re.match(r"^```([A-Za-z0-9_-]+)?\s*$", stripped)
+        if code_match:
+            language = code_match.group(1)
+            code_lines: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].strip() != "```":
+                code_lines.append(lines[index])
+                index += 1
+            if index < len(lines):
+                index += 1
+            block: dict[str, Any] = {
+                "type": "codeBlock",
+                "content": [{"type": "text", "text": "\n".join(code_lines)}],
+            }
+            if language:
+                block["attrs"] = {"language": language}
+            blocks.append(block)
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading_match:
+            blocks.append(
+                {
+                    "type": "heading",
+                    "attrs": {"level": min(len(heading_match.group(1)), 6)},
+                    "content": _inline_text_to_adf(heading_match.group(2)),
+                }
+            )
+            index += 1
+            continue
+
+        if _is_table_start(lines, index):
+            table, index = _table_to_adf(lines, index)
+            blocks.append(table)
+            continue
+
+        task_match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", line)
+        if task_match:
+            items: list[dict[str, Any]] = []
+            while index < len(lines):
+                item_match = re.match(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$", lines[index])
+                if not item_match:
+                    break
+                state = "DONE" if item_match.group(1).lower() == "x" else "TODO"
+                items.append(
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": f"task-{task_index}", "state": state},
+                        "content": _inline_text_to_adf(item_match.group(2)),
+                    }
+                )
+                task_index += 1
+                index += 1
+            blocks.append(
+                {
+                    "type": "taskList",
+                    "attrs": {"localId": f"task-list-{task_index - len(items)}"},
+                    "content": items,
+                }
+            )
+            continue
+
+        if re.match(r"^\s*[-*]\s+", line):
+            items: list[dict[str, Any]] = []
+            while index < len(lines):
+                item_match = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[index])
+                if not item_match:
+                    break
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": _inline_text_to_adf(item_match.group(1)),
+                            }
+                        ],
+                    }
+                )
+                index += 1
+            blocks.append({"type": "bulletList", "content": items})
+            continue
+
+        blocks.append({"type": "paragraph", "content": _inline_text_to_adf(line)})
+        index += 1
+
+    return blocks
+
+
+def _inline_text_to_adf(text: str) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    cursor = 0
+    for match in re.finditer(r"(`([^`]+)`|\*\*(.+?)\*\*)", text):
+        if match.start() > cursor:
+            parts.append({"type": "text", "text": text[cursor : match.start()]})
+        if match.group(2) is not None:
+            parts.append(
+                {
+                    "type": "text",
+                    "text": match.group(2),
+                    "marks": [{"type": "code"}],
+                }
+            )
+        else:
+            parts.append(
+                {
+                    "type": "text",
+                    "text": match.group(3),
+                    "marks": [{"type": "strong"}],
+                }
+            )
+        cursor = match.end()
+    if cursor < len(text):
+        parts.append({"type": "text", "text": text[cursor:]})
+    return parts or [{"type": "text", "text": ""}]
+
+
+def _is_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    return (
+        _is_table_row(lines[index])
+        and _is_table_row(lines[index + 1])
+        and _is_table_separator(lines[index + 1])
+    )
+
+
+def _is_table_row(line: str) -> bool:
+    return line.strip().startswith("|") and line.strip().endswith("|")
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _table_cells(line)
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _table_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _table_to_adf(lines: list[str], index: int) -> tuple[dict[str, Any], int]:
+    header = _table_cells(lines[index])
+    rows: list[dict[str, Any]] = [_table_row_to_adf(header, header=True)]
+    index += 2
+
+    while index < len(lines) and _is_table_row(lines[index]):
+        rows.append(_table_row_to_adf(_table_cells(lines[index]), header=False))
+        index += 1
+
+    table = {
+        "type": "table",
+        "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+        "content": rows,
+    }
+    return table, index
+
+
+def _table_row_to_adf(cells: list[str], *, header: bool) -> dict[str, Any]:
+    cell_type = "tableHeader" if header else "tableCell"
+    return {
+        "type": "tableRow",
+        "content": [
+            {
+                "type": cell_type,
+                "attrs": {},
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": _inline_text_to_adf(cell),
+                    }
+                ],
+            }
+            for cell in cells
+        ],
     }
 
 
