@@ -36,6 +36,11 @@ uv run jira-agent test-issue
 uv run jira-agent agent-report
 uv run jira-agent agent-report FC-107 --changelog 5 --json
 uv run jira-agent agent-plan-comment --next-step "Run implementation checks."
+uv run jira-agent human-brief --file ./human-brief.md
+uv run jira-agent factory-contract --file ./factory-contract.md --mode comment
+uv run jira-agent factory-contract --file ./factory-contract.md --mode attachment
+uv run jira-agent drift-reconcile-comment --summary "Jira description drift detected."
+uv run jira-agent drift-labels --add needs-review --remove resolved
 uv run jira-agent edit-issue --labels jira-agent,test
 uv run jira-agent assign-user Norman
 uv run jira-agent link-issue FC-107 FC-101 --type Relates
@@ -67,6 +72,10 @@ uv run python scripts/smoke_mcp.py
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`
 - Prepare standardized agent comments with `agent-plan-comment`
+- Write Human Briefs into Jira descriptions with `human-brief`
+- Store Factory Contracts as comments or attachments with `factory-contract`
+- Post Drift Reconcile comments with `drift-reconcile-comment`
+- Set or remove `drift-*` labels with `drift-labels`
 - Edit summary, description, and labels with `edit-issue`
 - Search assignable users with `user-search` and assign by query with `assign-user`
 - Link issues with `link-issue`
@@ -116,6 +125,10 @@ Available MCP tools:
 - `jira_agent_report`
 - `jira_edit_issue`
 - `jira_agent_plan_comment`
+- `jira_write_human_brief`
+- `jira_store_factory_contract`
+- `jira_post_drift_reconcile_comment`
+- `jira_update_drift_labels`
 - `jira_user_search`
 - `jira_assign_user`
 - `jira_list_comments`

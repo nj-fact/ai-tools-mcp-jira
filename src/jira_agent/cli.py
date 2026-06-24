@@ -24,6 +24,12 @@ from jira_agent.safety import (
     ensure_issue_write_allowed,
     ensure_project_write_allowed,
 )
+from jira_agent.workflows import (
+    drift_reconcile_comment_body,
+    factory_contract_comment_body,
+    read_text_source,
+    update_drift_labels,
+)
 
 app = typer.Typer(
     help="Small local Jira API tool for agent workflows.",
@@ -844,6 +850,285 @@ def agent_plan_comment(
             _exit_api_error(exc)
 
     console.print(f"Added agent plan comment {data.get('id')} to {issue_key}.")
+
+
+@app.command("human-brief")
+def human_brief(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    text: Annotated[
+        str | None,
+        typer.Option("--text", help="Brief text to write into the Jira description."),
+    ] = None,
+    file_path: Annotated[
+        Path | None,
+        typer.Option("--file", exists=True, dir_okay=False, readable=True, help="Brief file."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually update the Jira description."),
+    ] = False,
+) -> None:
+    """Write a Human Brief into the Jira description. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    try:
+        body = read_text_source(text, file_path)
+        payload = edit_issue_payload(description=body)
+    except ValueError as exc:
+        error_console.print(f"[red]Human brief error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would write Human Brief")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                _print_json(payload)
+                console.print("Pass --execute to write it to Jira.")
+                return
+
+            data = client.edit_issue(issue_key, description=body)
+            audit_write(
+                config,
+                action="human_brief",
+                issue_key=issue_key,
+                payload=payload,
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Wrote Human Brief into {issue_key}.")
+
+
+@app.command("factory-contract")
+def factory_contract(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    text: Annotated[
+        str | None,
+        typer.Option("--text", help="Factory Contract text."),
+    ] = None,
+    file_path: Annotated[
+        Path | None,
+        typer.Option("--file", exists=True, dir_okay=False, readable=True, help="Contract file."),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="Storage mode: comment or attachment."),
+    ] = "comment",
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually write to Jira."),
+    ] = False,
+) -> None:
+    """Store a Factory Contract as a comment or attachment. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if mode not in {"comment", "attachment"}:
+        error_console.print("[red]--mode must be comment or attachment.[/red]")
+        raise typer.Exit(2)
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if mode == "attachment":
+                if file_path is None:
+                    error_console.print("[red]--file is required for attachment mode.[/red]")
+                    raise typer.Exit(2)
+                if not execute:
+                    console.print("[yellow]Dry run:[/yellow] would attach Factory Contract")
+                    console.print(f"issue: {issue_key}")
+                    console.print(f"file: {file_path}")
+                    console.print(f"safety: {safety}")
+                    console.print("Pass --execute to upload it to Jira.")
+                    return
+                result = client.add_attachment(issue_key, file_path)
+                audit_write(
+                    config,
+                    action="factory_contract_attachment",
+                    issue_key=issue_key,
+                    payload={"file": str(file_path)},
+                    result={"attachments": result},
+                )
+                console.print(f"Attached Factory Contract to {issue_key}.")
+                return
+
+            contract = read_text_source(text, file_path)
+            body = factory_contract_comment_body(
+                contract,
+                source_name=file_path.name if file_path else None,
+            )
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would add Factory Contract comment")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                console.print(body)
+                console.print("Pass --execute to write it to Jira.")
+                return
+            result = client.add_comment(issue_key, body)
+            audit_write(
+                config,
+                action="factory_contract_comment",
+                issue_key=issue_key,
+                payload={"body": body},
+                result={"id": result.get("id")},
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+        except ValueError as exc:
+            error_console.print(f"[red]Factory Contract error:[/red] {exc}")
+            raise typer.Exit(2) from exc
+
+    console.print(f"Added Factory Contract comment to {issue_key}.")
+
+
+@app.command("drift-reconcile-comment")
+def drift_reconcile_comment(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    summary: Annotated[str, typer.Option("--summary", help="Drift summary.")] = "",
+    decision: Annotated[
+        str | None,
+        typer.Option("--decision", help="Optional reconcile decision."),
+    ] = None,
+    details: Annotated[
+        str | None,
+        typer.Option("--details", help="Optional detail text."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually add the comment in Jira."),
+    ] = False,
+) -> None:
+    """Post a Drift Reconcile comment. Defaults to dry-run."""
+    if not summary.strip():
+        error_console.print("[red]--summary is required.[/red]")
+        raise typer.Exit(2)
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    body = drift_reconcile_comment_body(summary=summary, decision=decision, details=details)
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would add Drift Reconcile comment")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                console.print(body)
+                console.print("Pass --execute to write it to Jira.")
+                return
+            result = client.add_comment(issue_key, body)
+            audit_write(
+                config,
+                action="drift_reconcile_comment",
+                issue_key=issue_key,
+                payload={"body": body},
+                result={"id": result.get("id")},
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Added Drift Reconcile comment to {issue_key}.")
+
+
+@app.command("drift-labels")
+def drift_labels(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    add: Annotated[
+        str | None,
+        typer.Option("--add", help="Comma-separated drift labels to add."),
+    ] = None,
+    remove: Annotated[
+        str | None,
+        typer.Option("--remove", help="Comma-separated drift labels to remove."),
+    ] = None,
+    clear: Annotated[
+        bool,
+        typer.Option("--clear", help="Remove all existing drift-* labels."),
+    ] = False,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually update labels in Jira."),
+    ] = False,
+) -> None:
+    """Set or remove drift-* labels. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["labels"])
+            existing = (issue.get("fields") or {}).get("labels") or []
+            labels = update_drift_labels(
+                existing,
+                add=_csv_list(add),
+                remove=_csv_list(remove),
+                clear=clear,
+            )
+            payload = edit_issue_payload(labels=labels)
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would update drift labels")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                _print_json({"before": existing, "after": labels, "payload": payload})
+                console.print("Pass --execute to write it to Jira.")
+                return
+            result = client.edit_issue(issue_key, labels=labels)
+            audit_write(
+                config,
+                action="drift_labels",
+                issue_key=issue_key,
+                payload={"before": existing, "after": labels},
+                result=result,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+        except ValueError as exc:
+            error_console.print(f"[red]Drift label error:[/red] {exc}")
+            raise typer.Exit(2) from exc
+
+    console.print(f"Updated drift labels on {issue_key}.")
 
 
 @app.command("edit-issue")
