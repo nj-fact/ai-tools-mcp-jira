@@ -134,6 +134,9 @@ class JiraClient:
         issue_type_name: str,
         summary: str,
         description: str | None = None,
+        labels: list[str] | None = None,
+        parent_key: str | None = None,
+        priority: str | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -143,6 +146,9 @@ class JiraClient:
                 issue_type_name=issue_type_name,
                 summary=summary,
                 description=description,
+                labels=labels,
+                parent_key=parent_key,
+                priority=priority,
             ),
         )
 
@@ -178,6 +184,8 @@ class JiraClient:
         summary: str | None = None,
         description: str | None = None,
         labels: list[str] | None = None,
+        parent_key: str | None = None,
+        priority: str | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "PUT",
@@ -186,6 +194,8 @@ class JiraClient:
                 summary=summary,
                 description=description,
                 labels=labels,
+                parent_key=parent_key,
+                priority=priority,
             ),
         )
 
@@ -393,40 +403,43 @@ def replace_diagram_with_media(
 ) -> dict[str, Any]:
     replacement = media_single_adf(media_id=media_id, alt=alt, width=width, height=height)
     content = list(adf.get("content") or [])
-    new_content: list[dict[str, Any]] = []
-    replaced = False
+    mermaid_index = next(
+        (
+            index
+            for index, block in enumerate(content)
+            if block.get("type") == "codeBlock"
+            and (block.get("attrs") or {}).get("language") == "mermaid"
+        ),
+        None,
+    )
 
-    for block in content:
-        if not replaced and block.get("type") == "codeBlock":
-            language = (block.get("attrs") or {}).get("language")
-            if language == "mermaid":
-                new_content.append(
+    if mermaid_index is not None:
+        content[mermaid_index : mermaid_index + 1] = [
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
+            },
+            replacement,
+        ]
+    else:
+        media_index = next(
+            (index for index, block in enumerate(content) if block.get("type") == "mediaSingle"),
+            None,
+        )
+        if media_index is not None:
+            content[media_index] = replacement
+        else:
+            content.extend(
+                [
                     {
                         "type": "paragraph",
                         "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
-                    }
-                )
-                new_content.append(replacement)
-                replaced = True
-                continue
-        if not replaced and block.get("type") == "mediaSingle":
-            new_content.append(replacement)
-            replaced = True
-            continue
-        new_content.append(block)
+                    },
+                    replacement,
+                ]
+            )
 
-    if not replaced:
-        new_content.extend(
-            [
-                {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
-                },
-                replacement,
-            ]
-        )
-
-    return {**adf, "content": new_content}
+    return {**adf, "content": content}
 
 
 def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
@@ -441,6 +454,11 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
 
         if not stripped:
             blocks.append({"type": "paragraph"})
+            index += 1
+            continue
+
+        if re.fullmatch(r"-{3,}", stripped):
+            blocks.append({"type": "rule"})
             index += 1
             continue
 
@@ -488,15 +506,20 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
                 if not item_match:
                     break
                 state = "DONE" if item_match.group(1).lower() == "x" else "TODO"
+                item_text, index = _consume_list_item(lines, index, item_match.group(2))
                 items.append(
                     {
                         "type": "taskItem",
                         "attrs": {"localId": f"task-{task_index}", "state": state},
-                        "content": _inline_text_to_adf(item_match.group(2)),
+                        "content": _inline_text_to_adf(item_text),
                     }
                 )
                 task_index += 1
-                index += 1
+                index = _skip_blank_lines_before_item(
+                    lines,
+                    index,
+                    r"^\s*[-*]\s+\[([ xX])\]\s+",
+                )
             blocks.append(
                 {
                     "type": "taskList",
@@ -506,29 +529,80 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
             )
             continue
 
-        if re.match(r"^\s*[-*]\s+", line):
+        bullet_match = re.match(r"^\s*[-*]\s+(?!\[[ xX]\]\s)(.+?)\s*$", line)
+        if bullet_match:
             items: list[dict[str, Any]] = []
             while index < len(lines):
-                item_match = re.match(r"^\s*[-*]\s+(.+?)\s*$", lines[index])
+                item_match = re.match(
+                    r"^\s*[-*]\s+(?!\[[ xX]\]\s)(.+?)\s*$",
+                    lines[index],
+                )
                 if not item_match:
                     break
+                item_text, index = _consume_list_item(lines, index, item_match.group(1))
                 items.append(
                     {
                         "type": "listItem",
                         "content": [
                             {
                                 "type": "paragraph",
-                                "content": _inline_text_to_adf(item_match.group(1)),
+                                "content": _inline_text_to_adf(item_text),
                             }
                         ],
                     }
                 )
-                index += 1
+                index = _skip_blank_lines_before_item(
+                    lines,
+                    index,
+                    r"^\s*[-*]\s+(?!\[[ xX]\]\s)",
+                )
             blocks.append({"type": "bulletList", "content": items})
             continue
 
-        blocks.append({"type": "paragraph", "content": _inline_text_to_adf(line)})
+        ordered_match = re.match(r"^\s*(\d+)[.)]\s+(.+?)\s*$", line)
+        if ordered_match:
+            order = int(ordered_match.group(1))
+            items = []
+            while index < len(lines):
+                item_match = re.match(r"^\s*(\d+)[.)]\s+(.+?)\s*$", lines[index])
+                if not item_match:
+                    break
+                item_text, index = _consume_list_item(lines, index, item_match.group(2))
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {
+                                "type": "paragraph",
+                                "content": _inline_text_to_adf(item_text),
+                            }
+                        ],
+                    }
+                )
+                index = _skip_blank_lines_before_item(lines, index, r"^\s*\d+[.)]\s+")
+            blocks.append(
+                {
+                    "type": "orderedList",
+                    "attrs": {"order": order},
+                    "content": items,
+                }
+            )
+            continue
+
+        paragraph_lines = [stripped]
         index += 1
+        while index < len(lines) and not _is_block_start(lines, index):
+            candidate = lines[index].strip()
+            if re.match(r"^\*\*[^*]+:\*\*", candidate):
+                break
+            paragraph_lines.append(candidate)
+            index += 1
+        blocks.append(
+            {
+                "type": "paragraph",
+                "content": _inline_text_to_adf(" ".join(paragraph_lines)),
+            }
+        )
 
     return blocks
 
@@ -536,29 +610,90 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
 def _inline_text_to_adf(text: str) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     cursor = 0
-    for match in re.finditer(r"(`([^`]+)`|\*\*(.+?)\*\*)", text):
+    pattern = re.compile(
+        r"`(?P<code>[^`]+)`"
+        r"|\*\*(?P<strong>.+?)\*\*"
+        r"|\[(?P<link_text>[^\]]+)\]\((?P<href>(?:https?://|mailto:)[^)\s]+)\)"
+    )
+    for match in pattern.finditer(text):
         if match.start() > cursor:
             parts.append({"type": "text", "text": text[cursor : match.start()]})
-        if match.group(2) is not None:
+        if match.group("code") is not None:
             parts.append(
                 {
                     "type": "text",
-                    "text": match.group(2),
+                    "text": match.group("code"),
                     "marks": [{"type": "code"}],
+                }
+            )
+        elif match.group("strong") is not None:
+            parts.append(
+                {
+                    "type": "text",
+                    "text": match.group("strong"),
+                    "marks": [{"type": "strong"}],
                 }
             )
         else:
             parts.append(
                 {
                     "type": "text",
-                    "text": match.group(3),
-                    "marks": [{"type": "strong"}],
+                    "text": match.group("link_text"),
+                    "marks": [
+                        {
+                            "type": "link",
+                            "attrs": {"href": match.group("href")},
+                        }
+                    ],
                 }
             )
         cursor = match.end()
     if cursor < len(text):
         parts.append({"type": "text", "text": text[cursor:]})
     return parts or [{"type": "text", "text": ""}]
+
+
+def _consume_list_item(lines: list[str], index: int, first_line: str) -> tuple[str, int]:
+    parts = [first_line.strip()]
+    index += 1
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped or _is_block_start(lines, index):
+            break
+        if not re.match(r"^\s{2,}\S", line):
+            break
+        parts.append(stripped)
+        index += 1
+    return " ".join(parts), index
+
+
+def _skip_blank_lines_before_item(
+    lines: list[str],
+    index: int,
+    item_pattern: str,
+) -> int:
+    candidate = index
+    while candidate < len(lines) and not lines[candidate].strip():
+        candidate += 1
+    if candidate > index and candidate < len(lines):
+        if re.match(item_pattern, lines[candidate]):
+            return candidate
+    return index
+
+
+def _is_block_start(lines: list[str], index: int) -> bool:
+    line = lines[index]
+    stripped = line.strip()
+    return bool(
+        not stripped
+        or re.fullmatch(r"-{3,}", stripped)
+        or re.match(r"^```", stripped)
+        or re.match(r"^#{1,6}\s+", line)
+        or _is_table_start(lines, index)
+        or re.match(r"^\s*[-*]\s+", line)
+        or re.match(r"^\s*\d+[.)]\s+", line)
+    )
 
 
 def _is_table_start(lines: list[str], index: int) -> bool:
@@ -627,6 +762,9 @@ def create_issue_payload(
     issue_type_name: str,
     summary: str,
     description: str | None = None,
+    labels: list[str] | None = None,
+    parent_key: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "project": {"key": project_key},
@@ -635,6 +773,12 @@ def create_issue_payload(
     }
     if description:
         fields["description"] = text_to_adf(description)
+    if labels is not None:
+        fields["labels"] = labels
+    if parent_key:
+        fields["parent"] = {"key": parent_key}
+    if priority:
+        fields["priority"] = {"name": priority}
     return {"fields": fields}
 
 
@@ -643,6 +787,8 @@ def edit_issue_payload(
     summary: str | None = None,
     description: str | None = None,
     labels: list[str] | None = None,
+    parent_key: str | None = None,
+    priority: str | None = None,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if summary is not None:
@@ -651,6 +797,10 @@ def edit_issue_payload(
         fields["description"] = text_to_adf(description)
     if labels is not None:
         fields["labels"] = labels
+    if parent_key is not None:
+        fields["parent"] = {"key": parent_key}
+    if priority is not None:
+        fields["priority"] = {"name": priority}
     if not fields:
         raise ValueError("At least one editable field must be provided")
     return {"fields": fields}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -200,8 +201,8 @@ def _mcp_config_payload() -> dict[str, Any]:
     return {
         "mcpServers": {
             "jira-agent": {
-                "command": "uv",
-                "args": ["run", "jira-agent-mcp"],
+                "command": sys.executable,
+                "args": ["-m", "jira_agent.mcp_server"],
                 "cwd": str(Path.cwd()),
             }
         }
@@ -704,6 +705,108 @@ def create_test_issue(
     console.print(f"Created Jira test issue {data.get('key')} ({data.get('id')}).")
 
 
+@app.command("create-issue")
+def create_issue(
+    summary: Annotated[str, typer.Argument(help="Issue summary.")],
+    issue_type: Annotated[str, typer.Option("--issue-type", help="Jira issue type name.")],
+    project_key: Annotated[
+        str | None,
+        typer.Option("--project", help="Jira project key. Defaults to JIRA_TEST_PROJECT_KEY."),
+    ] = None,
+    description: Annotated[
+        str | None,
+        typer.Option("--description", help="Markdown description text."),
+    ] = None,
+    description_file: Annotated[
+        Path | None,
+        typer.Option("--description-file", help="UTF-8 Markdown description file."),
+    ] = None,
+    description_section: Annotated[
+        str | None,
+        typer.Option(
+            "--description-section",
+            help="Optional heading whose body is selected from the description source.",
+        ),
+    ] = None,
+    labels: Annotated[
+        str | None,
+        typer.Option("--labels", help="Comma-separated labels."),
+    ] = None,
+    parent: Annotated[
+        str | None,
+        typer.Option("--parent", help="Optional parent issue key."),
+    ] = None,
+    priority: Annotated[
+        str | None,
+        typer.Option("--priority", help="Optional Jira priority name."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually create the issue in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
+    config = _config()
+    project = project_key or config.test_project_key
+    try:
+        body = (
+            read_text_source(description, description_file, section=description_section)
+            if description or description_file
+            else None
+        )
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Description error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    payload = create_issue_payload(
+        project_key=project,
+        issue_type_name=issue_type,
+        summary=summary,
+        description=body,
+        labels=_csv_list(labels),
+        parent_key=parent,
+        priority=priority,
+    )
+    if not execute:
+        console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
+        _print_json(payload)
+        console.print("Pass --execute to create it in Jira.")
+        return
+
+    with JiraClient(config) as client:
+        try:
+            ensure_project_write_allowed(config, project)
+            data = client.create_issue(
+                project_key=project,
+                issue_type_name=issue_type,
+                summary=summary,
+                description=body,
+                labels=_csv_list(labels),
+                parent_key=parent,
+                priority=priority,
+            )
+            audit_write(
+                config,
+                action="create_issue",
+                issue_key=data.get("key"),
+                payload=payload,
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _print_json(data)
+        return
+    console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
+
+
 @app.command("test-issue")
 def test_issue(
     json_output: Annotated[
@@ -1145,11 +1248,30 @@ def edit_issue(
     ] = None,
     description: Annotated[
         str | None,
-        typer.Option("--description", help="New issue description."),
+        typer.Option("--description", help="New Markdown issue description."),
+    ] = None,
+    description_file: Annotated[
+        Path | None,
+        typer.Option("--description-file", help="UTF-8 Markdown description file."),
+    ] = None,
+    description_section: Annotated[
+        str | None,
+        typer.Option(
+            "--description-section",
+            help="Optional heading whose body is selected from the description source.",
+        ),
     ] = None,
     labels: Annotated[
         str | None,
         typer.Option("--labels", help="Comma-separated labels to set."),
+    ] = None,
+    parent: Annotated[
+        str | None,
+        typer.Option("--parent", help="New parent issue key."),
+    ] = None,
+    priority: Annotated[
+        str | None,
+        typer.Option("--priority", help="New Jira priority name."),
     ] = None,
     execute: Annotated[
         bool,
@@ -1160,7 +1282,7 @@ def edit_issue(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Edit summary, description, or labels. Defaults to dry-run."""
+    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1170,12 +1292,19 @@ def edit_issue(
         raise typer.Exit(2)
 
     try:
+        body = (
+            read_text_source(description, description_file, section=description_section)
+            if description or description_file
+            else None
+        )
         payload = edit_issue_payload(
             summary=summary,
-            description=description,
+            description=body,
             labels=_csv_list(labels),
+            parent_key=parent,
+            priority=priority,
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         error_console.print(f"[red]Edit error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
@@ -1193,8 +1322,10 @@ def edit_issue(
             data = client.edit_issue(
                 issue_key,
                 summary=summary,
-                description=description,
+                description=body,
                 labels=_csv_list(labels),
+                parent_key=parent,
+                priority=priority,
             )
             audit_write(
                 config,

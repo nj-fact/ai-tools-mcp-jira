@@ -62,6 +62,32 @@ uv run jira-agent transition ABC-123 "In Progress" --execute
 uv run python scripts/smoke_mcp.py
 ```
 
+Without `uv`, use a local virtual environment. The generated MCP configuration uses that
+environment's Python executable and therefore does not depend on `uv` being on the client PATH:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\jira-agent.exe myself
+.venv\Scripts\jira-agent.exe mcp-config
+.venv\Scripts\python.exe scripts\smoke_mcp.py
+```
+
+Create commands are dry-run by default. They accept Markdown text or a UTF-8 Markdown file; use
+`--description-section` to file one heading body from a larger preparation document:
+
+```powershell
+.venv\Scripts\jira-agent.exe create-issue `
+  "Establish the immutable external-evidence foundation" `
+  --project FC `
+  --issue-type Task `
+  --description-file C:\path\to\story-draft.md `
+  --description-section "Exact proposed Jira description" `
+  --labels FA101,MVP,risk-high `
+  --parent FC-123 `
+  --priority High
+```
+
 ## Current Scope
 
 - Read current Jira user with `myself`
@@ -71,6 +97,8 @@ uv run python scripts/smoke_mcp.py
 - Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
 - Run read-only smoke checks inside the configured FC test scope with `test-scope`
 - Inspect create metadata and create dry-run/real test issues in the configured FC project
+- Create arbitrary allowed issue types with labels, parent, priority, and Markdown-to-ADF
+  descriptions; optionally select one Markdown section from a preparation file
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`
 - Prepare standardized agent comments with `agent-plan-comment`
@@ -84,6 +112,8 @@ uv run python scripts/smoke_mcp.py
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
+- Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
+  inline code, emphasis, and HTTP links as native Jira ADF
 - Inspect issue history with `changelog` or `agent-report --changelog`
 - Inspect local write audit records with `audit-log`
 - Run bundled write smoke checks against the configured test issue
@@ -107,9 +137,9 @@ Example MCP server command for local clients:
 
 ```json
 {
-  "command": "uv",
-  "args": ["run", "jira-agent-mcp"],
-  "cwd": "/Users/norman/Fact/jira"
+  "command": "C:\\path\\to\\mcp-jira\\.venv\\Scripts\\python.exe",
+  "args": ["-m", "jira_agent.mcp_server"],
+  "cwd": "C:\\path\\to\\mcp-jira"
 }
 ```
 
@@ -123,6 +153,7 @@ Available MCP tools:
 - `jira_fc_open`
 - `jira_by_status`
 - `jira_test_scope_issues`
+- `jira_create_issue`
 - `jira_create_test_issue`
 - `jira_get_test_issue`
 - `jira_assign_issue`

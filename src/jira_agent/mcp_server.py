@@ -26,6 +26,7 @@ from jira_agent.safety import (
 from jira_agent.workflows import (
     drift_reconcile_comment_body,
     factory_contract_comment_body,
+    read_text_source,
     update_drift_labels,
 )
 
@@ -161,6 +162,73 @@ def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
                     fields=DEFAULT_FIELDS,
                 ),
             }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_create_issue(
+    project_key: str,
+    issue_type_name: str,
+    summary: str,
+    description: str | None = None,
+    description_file: str | None = None,
+    description_section: str | None = None,
+    labels: list[str] | None = None,
+    parent_key: str | None = None,
+    priority: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
+    try:
+        body = (
+            read_text_source(description, description_file, section=description_section)
+            if description or description_file
+            else None
+        )
+        payload = create_issue_payload(
+            project_key=project_key,
+            issue_type_name=issue_type_name,
+            summary=summary,
+            description=body,
+            labels=labels,
+            parent_key=parent_key,
+            priority=priority,
+        )
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+
+    if not execute:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "payload": payload,
+            "message": "Pass execute=true to create this issue in Jira.",
+        }
+
+    try:
+        config = load_config()
+        with JiraClient(config) as client:
+            ensure_project_write_allowed(config, project_key)
+            issue_result = client.create_issue(
+                project_key=project_key,
+                issue_type_name=issue_type_name,
+                summary=summary,
+                description=body,
+                labels=labels,
+                parent_key=parent_key,
+                priority=priority,
+            )
+            audit_write(
+                config,
+                action="create_issue",
+                issue_key=issue_result.get("key"),
+                payload=payload,
+                result=issue_result,
+            )
+            return {"ok": True, "issue": issue_result}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 
@@ -316,10 +384,14 @@ def jira_edit_issue(
     key: str | None = None,
     summary: str | None = None,
     description: str | None = None,
+    description_file: str | None = None,
+    description_section: str | None = None,
     labels: list[str] | None = None,
+    parent_key: str | None = None,
+    priority: str | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Edit summary, description, or labels. Defaults to dry-run."""
+    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -329,8 +401,19 @@ def jira_edit_issue(
         }
 
     try:
-        payload = edit_issue_payload(summary=summary, description=description, labels=labels)
-    except ValueError as exc:
+        body = (
+            read_text_source(description, description_file, section=description_section)
+            if description or description_file
+            else None
+        )
+        payload = edit_issue_payload(
+            summary=summary,
+            description=body,
+            labels=labels,
+            parent_key=parent_key,
+            priority=priority,
+        )
+    except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
 
     try:
@@ -347,7 +430,14 @@ def jira_edit_issue(
                     "message": "Pass execute=true to edit this issue in Jira.",
                 }
 
-            client.edit_issue(issue_key, summary=summary, description=description, labels=labels)
+            client.edit_issue(
+                issue_key,
+                summary=summary,
+                description=body,
+                labels=labels,
+                parent_key=parent_key,
+                priority=priority,
+            )
             audit_write(
                 config,
                 action="edit_issue",
