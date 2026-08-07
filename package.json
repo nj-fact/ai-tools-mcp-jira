@@ -1,0 +1,7 @@
+{
+  "name": "jira-agent-local-tools",
+  "private": true,
+  "devDependencies": {
+    "@mermaid-js/mermaid-cli": "11.12.0"
+  }
+}

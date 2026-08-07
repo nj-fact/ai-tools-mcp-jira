@@ -35,6 +35,7 @@ EXPECTED_TOOLS = {
     "jira_list_transitions",
     "jira_link_issue",
     "jira_attach_file",
+    "jira_render_mermaid_diagrams",
     "jira_changelog",
     "jira_transition_issue",
 }

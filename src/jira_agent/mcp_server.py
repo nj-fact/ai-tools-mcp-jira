@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -16,6 +17,17 @@ from jira_agent.client import (
     select_transition,
 )
 from jira_agent.config import load_config
+from jira_agent.image_gallery import (
+    image_gallery_blocks,
+    load_image_gallery_manifest,
+    newest_attachments_by_filename,
+    upsert_top_level_section,
+)
+from jira_agent.mermaid import (
+    discover_mermaid_runtime,
+    mermaid_sources_from_adf,
+    render_mermaid_png,
+)
 from jira_agent.reporting import agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
@@ -993,6 +1005,143 @@ def jira_delete_attachment(
 
 
 @mcp.tool
+def jira_render_mermaid_diagrams(
+    key: str | None = None,
+    filenames: list[str] | None = None,
+    alt_texts: list[str] | None = None,
+    output_dir: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Render Mermaid code blocks locally, upload PNGs, and embed them. Defaults to dry-run."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    uploaded_ids: list[str] = []
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            description = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            sources = mermaid_sources_from_adf(description)
+            if not sources:
+                return {"ok": False, "message": f"No Mermaid code blocks found on {issue_key}."}
+
+            names = filenames or [
+                f"{issue_key.lower()}-mermaid-{index}.png" for index in range(1, len(sources) + 1)
+            ]
+            alts = alt_texts or [f"Mermaid diagram {index}" for index in range(1, len(sources) + 1)]
+            if len(names) != len(sources) or len(alts) != len(sources):
+                return {
+                    "ok": False,
+                    "message": "filenames and alt_texts must match the Mermaid block count.",
+                }
+            if len(set(names)) != len(names):
+                return {"ok": False, "message": "Diagram filenames must be unique."}
+            for name in names:
+                path = Path(name)
+                if path.name != name or path.suffix.lower() != ".png":
+                    return {
+                        "ok": False,
+                        "message": f"Diagram filename must be a plain PNG filename: {name}",
+                    }
+
+            runtime = discover_mermaid_runtime()
+            destination = (
+                Path(output_dir)
+                if output_dir
+                else (Path(config.audit_log_path).parent / "diagrams" / issue_key)
+            )
+            paths = [destination / name for name in names]
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "diagram_count": len(sources),
+                    "files": [str(path) for path in paths],
+                    "runtime": {
+                        "node": str(runtime.node),
+                        "cli": str(runtime.cli),
+                        "browser": str(runtime.browser),
+                    },
+                    "safety": safety,
+                    "message": "Pass execute=true to render, upload, and embed the diagrams.",
+                }
+
+            for source, path in zip(sources, paths, strict=True):
+                render_mermaid_png(source, path, runtime=runtime)
+
+            attachments = issue.get("fields", {}).get("attachment") or []
+            previous_ids = {
+                str(attachment.get("id"))
+                for attachment in attachments
+                if attachment.get("filename") in names
+            }
+            new_attachments: list[dict[str, Any]] = []
+            updated_description = description
+            for path, alt in zip(paths, alts, strict=True):
+                uploaded = client.add_attachment(issue_key, path)
+                attachment = uploaded[0]
+                attachment_id = str(attachment.get("id"))
+                uploaded_ids.append(attachment_id)
+                new_attachments.append(attachment)
+                media_id = client.attachment_media_id(attachment_id)
+                width, height = png_dimensions(path)
+                updated_description = replace_diagram_with_media(
+                    updated_description,
+                    media_id=media_id,
+                    alt=alt,
+                    width=width,
+                    height=height,
+                )
+
+            result = client.edit_issue_adf_description(issue_key, updated_description)
+            deleted: list[str] = []
+            for attachment_id in sorted(previous_ids - set(uploaded_ids)):
+                client.delete_attachment(attachment_id)
+                deleted.append(attachment_id)
+            audit_write(
+                config,
+                action="render_mermaid_diagrams",
+                issue_key=issue_key,
+                payload={
+                    "files": [str(path) for path in paths],
+                    "attachment_ids": uploaded_ids,
+                    "deleted_attachment_ids": deleted,
+                },
+                result=result,
+            )
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "attachments": new_attachments,
+                "deleted_attachment_ids": deleted,
+            }
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        if uploaded_ids:
+            try:
+                with JiraClient(config) as cleanup_client:
+                    for attachment_id in uploaded_ids:
+                        cleanup_client.delete_attachment(attachment_id)
+            except JiraApiError:
+                pass
+        return _error(exc)
+
+
+@mcp.tool
 def jira_embed_diagram(
     file_path: str,
     key: str | None = None,
@@ -1072,6 +1221,82 @@ def jira_embed_diagram(
                 "media_id": media_id,
                 "deleted_attachment_ids": deleted,
             }
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_upsert_image_gallery(
+    manifest_path: str,
+    key: str | None = None,
+    documentation_filename: str | None = None,
+    before_heading: str = "Child Issues",
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {"ok": False, "message": "No issue key provided."}
+    try:
+        manifest = load_image_gallery_manifest(manifest_path)
+        filenames = {
+            str(row["file"]) for section in manifest["sections"] for row in section["rows"]
+        }
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            by_name = newest_attachments_by_filename(attachments)
+            missing = sorted(filenames - set(by_name))
+            if documentation_filename and documentation_filename not in by_name:
+                missing.append(documentation_filename)
+            if missing:
+                return {"ok": False, "message": "Missing Jira attachments.", "missing": missing}
+            blocks = image_gallery_blocks(
+                manifest,
+                attachment_urls={name: str(by_name[name]["content"]) for name in filenames},
+                documentation_url=(
+                    str(by_name[documentation_filename]["content"])
+                    if documentation_filename
+                    else None
+                ),
+            )
+            description = upsert_top_level_section(
+                issue.get("fields", {}).get("description")
+                or {"type": "doc", "version": 1, "content": []},
+                title=str(manifest["title"]),
+                blocks=blocks,
+                before_heading=before_heading,
+            )
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "title": manifest["title"],
+                    "screenshot_count": len(filenames),
+                    "before_heading": before_heading,
+                    "safety": safety,
+                }
+            result = client.edit_issue_adf_description(issue_key, description)
+            audit_write(
+                config,
+                action="upsert_image_gallery",
+                issue_key=issue_key,
+                payload={
+                    "manifest": manifest_path,
+                    "filenames": sorted(filenames),
+                    "documentation_filename": documentation_filename,
+                    "before_heading": before_heading,
+                },
+                result=result,
+            )
+            return {"ok": True, "issue": issue_key, "screenshot_count": len(filenames)}
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

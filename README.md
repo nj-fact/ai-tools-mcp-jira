@@ -73,6 +73,14 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\smoke_mcp.py
 ```
 
+On a fresh Windows system, the repository setup script installs the Python development extras and
+the pinned Mermaid CLI, verifies that an installed Chrome or Edge browser can be reused, and runs
+the local verification suite. It runs the Jira MCP smoke test as well when `.env` is configured:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+```
+
 Create commands are dry-run by default. They accept Markdown text or a UTF-8 Markdown file; use
 `--description-section` to file one heading body from a larger preparation document:
 
@@ -112,8 +120,14 @@ Create commands are dry-run by default. They accept Markdown text or a UTF-8 Mar
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
+- Insert or replace a linked screenshot gallery from existing attachments with
+  `upsert-image-gallery`
+- Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
+  and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
   inline code, emphasis, and HTTP links as native Jira ADF
+- Treat Markdown blank lines as source readability only; Jira headings, paragraphs, lists, and
+  tables provide their own layout spacing, so no empty ADF paragraphs are written
 - Inspect issue history with `changelog` or `agent-report --changelog`
 - Inspect local write audit records with `audit-log`
 - Run bundled write smoke checks against the configured test issue
@@ -173,6 +187,8 @@ Available MCP tools:
 - `jira_attach_file`
 - `jira_delete_attachment`
 - `jira_embed_diagram`
+- `jira_upsert_image_gallery`
+- `jira_render_mermaid_diagrams`
 - `jira_changelog`
 - `jira_transition_issue`
 

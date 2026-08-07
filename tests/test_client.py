@@ -13,6 +13,11 @@ from jira_agent.client import (
     text_to_adf,
 )
 from jira_agent.config import JiraConfig
+from jira_agent.image_gallery import (
+    image_gallery_blocks,
+    newest_attachments_by_filename,
+    upsert_top_level_section,
+)
 
 
 def make_config() -> JiraConfig:
@@ -549,13 +554,12 @@ def test_attachment_media_id_reads_redirect_location() -> None:
     assert client.attachment_media_id("123") == "media-abc"
 
 
-def test_text_to_adf_preserves_blank_lines() -> None:
+def test_text_to_adf_omits_layout_only_blank_paragraphs() -> None:
     assert text_to_adf("Hello\n\nworld") == {
         "type": "doc",
         "version": 1,
         "content": [
             {"type": "paragraph", "content": [{"type": "text", "text": "Hello"}]},
-            {"type": "paragraph"},
             {"type": "paragraph", "content": [{"type": "text", "text": "world"}]},
         ],
     }
@@ -587,39 +591,39 @@ def test_text_to_adf_renders_human_brief_markdown_blocks() -> None:
         "attrs": {"level": 1},
         "content": [{"type": "text", "text": "FC-121 Human Brief"}],
     }
-    assert content[2] == {
+    assert content[1] == {
         "type": "heading",
         "attrs": {"level": 2},
         "content": [{"type": "text", "text": "Brief"}],
     }
-    assert content[3]["type"] == "paragraph"
-    assert content[3]["content"][0] == {
+    assert content[2]["type"] == "paragraph"
+    assert content[2]["content"][0] == {
         "type": "text",
         "text": "Risk:",
         "marks": [{"type": "strong"}],
     }
-    assert content[3]["content"][2] == {
+    assert content[2]["content"][2] == {
         "type": "text",
         "text": "UNBEKANNT",
         "marks": [{"type": "code"}],
     }
-    assert content[5]["type"] == "taskList"
-    assert len(content[5]["content"]) == 2
-    assert content[5]["content"][0]["type"] == "taskItem"
-    assert content[5]["content"][0]["attrs"]["state"] == "TODO"
-    assert content[5]["content"][0]["content"][0] == {
+    assert content[3]["type"] == "taskList"
+    assert len(content[3]["content"]) == 2
+    assert content[3]["content"][0]["type"] == "taskItem"
+    assert content[3]["content"][0]["attrs"]["state"] == "TODO"
+    assert content[3]["content"][0]["content"][0] == {
         "type": "text",
         "text": "AC-1",
         "marks": [{"type": "strong"}],
     }
-    assert content[7] == {
+    assert content[4] == {
         "type": "codeBlock",
         "content": [{"type": "text", "text": "flowchart LR\n  A --> B"}],
         "attrs": {"language": "mermaid"},
     }
-    assert content[9]["type"] == "table"
-    assert content[9]["content"][0]["content"][0]["type"] == "tableHeader"
-    assert content[9]["content"][1]["content"][0]["type"] == "tableCell"
+    assert content[5]["type"] == "table"
+    assert content[5]["content"][0]["content"][0]["type"] == "tableHeader"
+    assert content[5]["content"][1]["content"][0]["type"] == "tableCell"
 
 
 def test_text_to_adf_renders_filing_markdown_semantically() -> None:
@@ -647,7 +651,7 @@ def test_text_to_adf_renders_filing_markdown_semantically() -> None:
             }
         ],
     }
-    ordered = content[2]
+    ordered = content[1]
     assert ordered["type"] == "orderedList"
     assert ordered["content"][0]["content"][0]["content"][0]["text"] == (
         "First contract rule that continues on another line."
@@ -657,7 +661,7 @@ def test_text_to_adf_renders_filing_markdown_semantically() -> None:
     assert linked_rule["marks"] == [
         {"type": "link", "attrs": {"href": "https://actico.atlassian.net/browse/FC-1"}}
     ]
-    tasks = content[4]
+    tasks = content[2]
     assert tasks["type"] == "taskList"
     assert len(tasks["content"]) == 2
     assert tasks["content"][0]["attrs"]["state"] == "TODO"
@@ -665,7 +669,7 @@ def test_text_to_adf_renders_filing_markdown_semantically() -> None:
         "The result remains atomic when validation fails."
     )
     assert tasks["content"][1]["attrs"]["state"] == "DONE"
-    table_link = content[6]["content"][1]["content"][0]["content"][0]["content"][0]
+    table_link = content[3]["content"][1]["content"][0]["content"][0]["content"][0]
     assert table_link["text"] == "Foundation"
     assert table_link["marks"][0]["type"] == "link"
 
@@ -690,9 +694,7 @@ def test_replace_diagram_with_media_replaces_mermaid_block() -> None:
         height=70,
     )
 
-    assert replaced["content"][2]["type"] == "paragraph"
-    assert replaced["content"][2]["content"][0]["text"] == "Rendered architecture diagram:"
-    assert replaced["content"][3] == {
+    assert replaced["content"][1] == {
         "type": "mediaSingle",
         "attrs": {"layout": "center"},
         "content": [
@@ -734,3 +736,70 @@ def test_replace_diagram_with_media_handles_multiple_mermaid_blocks_in_order() -
     media = [block for block in second["content"] if block["type"] == "mediaSingle"]
     assert [block["content"][0]["attrs"]["id"] for block in media] == ["media-1", "media-2"]
     assert not any(block["type"] == "codeBlock" for block in second["content"])
+
+
+def test_image_gallery_blocks_build_linked_tables() -> None:
+    manifest = {
+        "title": "UI/UX Reference",
+        "intro": "Review reference.",
+        "sections": [
+            {
+                "heading": "Core flow",
+                "rows": [
+                    {
+                        "file": "01-list.png",
+                        "title": "Start",
+                        "description": "Open the list.",
+                        "alt": "List",
+                    }
+                ],
+            }
+        ],
+    }
+
+    blocks = image_gallery_blocks(
+        manifest,
+        attachment_urls={"01-list.png": "https://example.atlassian.net/attachment/1"},
+        documentation_url="https://example.atlassian.net/attachment/2",
+    )
+
+    assert blocks[0]["content"][0]["text"] == "UI/UX Reference"
+    assert blocks[-1]["type"] == "table"
+    screenshot = blocks[-1]["content"][1]["content"][2]["content"][0]["content"][0]
+    assert screenshot["marks"][0]["attrs"]["href"].endswith("/attachment/1")
+
+
+def test_newest_attachments_by_filename_prefers_highest_numeric_id() -> None:
+    selected = newest_attachments_by_filename(
+        [
+            {"id": "286187", "filename": "03-decision.png"},
+            {"id": "286240", "filename": "03-decision.png"},
+            {"id": "286188", "filename": "04-contract.png"},
+        ]
+    )
+
+    assert selected["03-decision.png"]["id"] == "286240"
+    assert selected["04-contract.png"]["id"] == "286188"
+
+
+def test_upsert_top_level_section_inserts_before_named_heading() -> None:
+    adf = text_to_adf("### Outcome\n\nExisting.\n\n### Child Issues\n\nChildren.")
+    gallery = [
+        {
+            "type": "heading",
+            "attrs": {"level": 3},
+            "content": [{"type": "text", "text": "UI/UX Reference"}],
+        }
+    ]
+
+    updated = upsert_top_level_section(
+        adf,
+        title="UI/UX Reference",
+        blocks=gallery,
+        before_heading="Child Issues",
+    )
+
+    headings = [
+        block["content"][0]["text"] for block in updated["content"] if block["type"] == "heading"
+    ]
+    assert headings == ["Outcome", "UI/UX Reference", "Child Issues"]

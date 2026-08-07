@@ -21,6 +21,12 @@ from jira_agent.client import (
     select_transition,
 )
 from jira_agent.config import load_config
+from jira_agent.image_gallery import (
+    image_gallery_blocks,
+    load_image_gallery_manifest,
+    newest_attachments_by_filename,
+    upsert_top_level_section,
+)
 from jira_agent.reporting import adf_to_text, agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
@@ -1853,6 +1859,97 @@ def embed_diagram(
         f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
         f"deleted {len(deleted)} old attachment(s)."
     )
+
+
+@app.command("upsert-image-gallery")
+def upsert_image_gallery(
+    key: Annotated[str, typer.Argument(help="Jira issue key.")],
+    manifest_path: Annotated[
+        Path,
+        typer.Option("--manifest", exists=True, dir_okay=False, readable=True),
+    ],
+    documentation_filename: Annotated[
+        str | None,
+        typer.Option("--documentation-filename"),
+    ] = None,
+    before_heading: Annotated[
+        str,
+        typer.Option("--before-heading"),
+    ] = "Child Issues",
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually update the Jira description."),
+    ] = False,
+) -> None:
+    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
+    config = _config()
+    try:
+        manifest = load_image_gallery_manifest(manifest_path)
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Gallery manifest error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    filenames = {str(row["file"]) for section in manifest["sections"] for row in section["rows"]}
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, key)
+            issue = client.get_issue(key, fields=["description", "attachment"])
+            attachments = issue.get("fields", {}).get("attachment") or []
+            by_name = newest_attachments_by_filename(attachments)
+            missing = sorted(filenames - set(by_name))
+            if documentation_filename and documentation_filename not in by_name:
+                missing.append(documentation_filename)
+            if missing:
+                error_console.print(
+                    f"[red]Missing Jira attachments on {key}:[/red] {', '.join(missing)}"
+                )
+                raise typer.Exit(2)
+
+            urls = {name: str(by_name[name]["content"]) for name in filenames}
+            documentation_url = (
+                str(by_name[documentation_filename]["content"]) if documentation_filename else None
+            )
+            blocks = image_gallery_blocks(
+                manifest,
+                attachment_urls=urls,
+                documentation_url=documentation_url,
+            )
+            description = upsert_top_level_section(
+                issue.get("fields", {}).get("description")
+                or {"type": "doc", "version": 1, "content": []},
+                title=str(manifest["title"]),
+                blocks=blocks,
+                before_heading=before_heading,
+            )
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would upsert image gallery")
+                console.print(f"issue: {key}")
+                console.print(f"title: {manifest['title']}")
+                console.print(f"screenshots: {len(filenames)}")
+                console.print(f"before heading: {before_heading}")
+                console.print(f"safety: {safety}")
+                console.print("Pass --execute to update the Jira description.")
+                return
+
+            result = client.edit_issue_adf_description(key, description)
+            audit_write(
+                config,
+                action="upsert_image_gallery",
+                issue_key=key,
+                payload={
+                    "manifest": str(manifest_path),
+                    "filenames": sorted(filenames),
+                    "documentation_filename": documentation_filename,
+                    "before_heading": before_heading,
+                },
+                result=result,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    console.print(f"Updated image gallery '{manifest['title']}' on {key}.")
 
 
 @app.command()

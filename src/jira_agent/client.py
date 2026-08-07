@@ -414,13 +414,7 @@ def replace_diagram_with_media(
     )
 
     if mermaid_index is not None:
-        content[mermaid_index : mermaid_index + 1] = [
-            {
-                "type": "paragraph",
-                "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
-            },
-            replacement,
-        ]
+        content[mermaid_index] = replacement
     else:
         media_index = next(
             (index for index, block in enumerate(content) if block.get("type") == "mediaSingle"),
@@ -429,15 +423,7 @@ def replace_diagram_with_media(
         if media_index is not None:
             content[media_index] = replacement
         else:
-            content.extend(
-                [
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": "Rendered architecture diagram:"}],
-                    },
-                    replacement,
-                ]
-            )
+            content.append(replacement)
 
     return {**adf, "content": content}
 
@@ -453,7 +439,6 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
         stripped = line.strip()
 
         if not stripped:
-            blocks.append({"type": "paragraph"})
             index += 1
             continue
 
@@ -604,7 +589,7 @@ def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
             }
         )
 
-    return blocks
+    return blocks or [{"type": "paragraph"}]
 
 
 def _inline_text_to_adf(text: str) -> list[dict[str, Any]]:

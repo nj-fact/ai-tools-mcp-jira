@@ -13,6 +13,12 @@ dependencies = [
     "typer>=0.16.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.0",
+    "ruff>=0.12.0",
+]
+
 [project.scripts]
 jira-agent = "jira_agent.cli:app"
 jira-agent-mcp = "jira_agent.mcp_server:main"
