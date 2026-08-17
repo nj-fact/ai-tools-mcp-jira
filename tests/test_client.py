@@ -418,6 +418,85 @@ def test_edit_issue_payload_supports_parent_and_priority() -> None:
     }
 
 
+def test_create_issue_payload_writes_story_points_to_the_configured_field() -> None:
+    payload = create_issue_payload(
+        project_key="FC",
+        issue_type_name="Story",
+        summary="Estimated work",
+        story_points=8,
+    )
+
+    assert payload["fields"]["customfield_10028"] == 8
+
+
+def test_story_points_use_the_site_specific_field_id() -> None:
+    payload = edit_issue_payload(story_points=5, story_points_field="customfield_10016")
+
+    assert payload["fields"] == {"customfield_10016": 5}
+
+
+def test_whole_story_points_stay_integral_and_halves_survive() -> None:
+    assert edit_issue_payload(story_points=13.0)["fields"]["customfield_10028"] == 13
+    assert edit_issue_payload(story_points=0.5)["fields"]["customfield_10028"] == 0.5
+
+
+def test_zero_story_points_are_written_rather_than_dropped() -> None:
+    assert edit_issue_payload(story_points=0)["fields"] == {"customfield_10028": 0}
+
+
+def test_negative_story_points_are_rejected() -> None:
+    try:
+        edit_issue_payload(story_points=-1)
+    except ValueError as exc:
+        assert str(exc) == "Story points must not be negative"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_a_malformed_story_points_field_id_is_rejected_at_config_time() -> None:
+    try:
+        JiraConfig.model_validate(
+            {
+                "JIRA_SITE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_STORY_POINTS_FIELD": "Story Points",
+            }
+        )
+    except ValueError as exc:
+        assert "customfield_10028" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_sends_story_points_using_the_client_config() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(200, json={})
+
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_STORY_POINTS_FIELD": "customfield_11111",
+        }
+    )
+    client = JiraClient(
+        config,
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-308", story_points=21)
+
+    assert seen["json"] == '{"fields":{"customfield_11111":21}}'
+
+
 def test_issue_link_payload_supports_optional_comment() -> None:
     assert issue_link_payload(
         outward_issue_key="FC-107",

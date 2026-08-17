@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    DEFAULT_STORY_POINTS_FIELD,
     JiraApiError,
     JiraClient,
     create_issue_payload,
@@ -53,6 +54,15 @@ def _client() -> JiraClient:
 
 def _fields_or_default(fields: list[str] | None) -> list[str]:
     return fields or DEFAULT_FIELDS
+
+
+def _story_points_field() -> str:
+    """Dry runs must show the same field id the write would use, but must not fail
+    when the environment is incomplete."""
+    try:
+        return load_config().story_points_field
+    except Exception:
+        return DEFAULT_STORY_POINTS_FIELD
 
 
 def _error(exc: JiraApiError) -> dict[str, Any]:
@@ -189,6 +199,7 @@ def jira_create_issue(
     labels: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
+    story_points: float | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
@@ -206,6 +217,8 @@ def jira_create_issue(
             labels=labels,
             parent_key=parent_key,
             priority=priority,
+            story_points=story_points,
+            story_points_field=_story_points_field(),
         )
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
@@ -230,6 +243,7 @@ def jira_create_issue(
                 labels=labels,
                 parent_key=parent_key,
                 priority=priority,
+                story_points=story_points,
             )
             audit_write(
                 config,
@@ -401,6 +415,7 @@ def jira_edit_issue(
     labels: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
+    story_points: float | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
@@ -424,6 +439,8 @@ def jira_edit_issue(
             labels=labels,
             parent_key=parent_key,
             priority=priority,
+            story_points=story_points,
+            story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
@@ -449,6 +466,7 @@ def jira_edit_issue(
                 labels=labels,
                 parent_key=parent_key,
                 priority=priority,
+                story_points=story_points,
             )
             audit_write(
                 config,

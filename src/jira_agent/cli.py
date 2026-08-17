@@ -746,6 +746,10 @@ def create_issue(
         str | None,
         typer.Option("--priority", help="Optional Jira priority name."),
     ] = None,
+    story_points: Annotated[
+        float | None,
+        typer.Option("--story-points", help="Optional story-point estimate."),
+    ] = None,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually create the issue in Jira."),
@@ -768,15 +772,21 @@ def create_issue(
         error_console.print(f"[red]Description error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
-    payload = create_issue_payload(
-        project_key=project,
-        issue_type_name=issue_type,
-        summary=summary,
-        description=body,
-        labels=_csv_list(labels),
-        parent_key=parent,
-        priority=priority,
-    )
+    try:
+        payload = create_issue_payload(
+            project_key=project,
+            issue_type_name=issue_type,
+            summary=summary,
+            description=body,
+            labels=_csv_list(labels),
+            parent_key=parent,
+            priority=priority,
+            story_points=story_points,
+            story_points_field=config.story_points_field,
+        )
+    except ValueError as exc:
+        error_console.print(f"[red]Create error:[/red] {exc}")
+        raise typer.Exit(2) from exc
     if not execute:
         console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
         _print_json(payload)
@@ -794,6 +804,7 @@ def create_issue(
                 labels=_csv_list(labels),
                 parent_key=parent,
                 priority=priority,
+                story_points=story_points,
             )
             audit_write(
                 config,
@@ -1279,6 +1290,10 @@ def edit_issue(
         str | None,
         typer.Option("--priority", help="New Jira priority name."),
     ] = None,
+    story_points: Annotated[
+        float | None,
+        typer.Option("--story-points", help="New story-point estimate."),
+    ] = None,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually edit the issue in Jira."),
@@ -1309,6 +1324,8 @@ def edit_issue(
             labels=_csv_list(labels),
             parent_key=parent,
             priority=priority,
+            story_points=story_points,
+            story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
         error_console.print(f"[red]Edit error:[/red] {exc}")
@@ -1332,6 +1349,7 @@ def edit_issue(
                 labels=_csv_list(labels),
                 parent_key=parent,
                 priority=priority,
+                story_points=story_points,
             )
             audit_write(
                 config,

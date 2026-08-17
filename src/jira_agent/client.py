@@ -137,6 +137,7 @@ class JiraClient:
         labels: list[str] | None = None,
         parent_key: str | None = None,
         priority: str | None = None,
+        story_points: float | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -149,6 +150,8 @@ class JiraClient:
                 labels=labels,
                 parent_key=parent_key,
                 priority=priority,
+                story_points=story_points,
+                story_points_field=self.config.story_points_field,
             ),
         )
 
@@ -186,6 +189,7 @@ class JiraClient:
         labels: list[str] | None = None,
         parent_key: str | None = None,
         priority: str | None = None,
+        story_points: float | None = None,
     ) -> dict[str, Any]:
         return self._request(
             "PUT",
@@ -196,6 +200,8 @@ class JiraClient:
                 labels=labels,
                 parent_key=parent_key,
                 priority=priority,
+                story_points=story_points,
+                story_points_field=self.config.story_points_field,
             ),
         )
 
@@ -741,6 +747,16 @@ def _table_row_to_adf(cells: list[str], *, header: bool) -> dict[str, Any]:
     }
 
 
+DEFAULT_STORY_POINTS_FIELD = "customfield_10028"
+
+
+def _story_points_value(story_points: float) -> float | int:
+    """Jira stores story points as a number. Keep whole values integral."""
+    if story_points < 0:
+        raise ValueError("Story points must not be negative")
+    return int(story_points) if float(story_points).is_integer() else story_points
+
+
 def create_issue_payload(
     *,
     project_key: str,
@@ -750,6 +766,8 @@ def create_issue_payload(
     labels: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
+    story_points: float | None = None,
+    story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "project": {"key": project_key},
@@ -764,6 +782,8 @@ def create_issue_payload(
         fields["parent"] = {"key": parent_key}
     if priority:
         fields["priority"] = {"name": priority}
+    if story_points is not None:
+        fields[story_points_field] = _story_points_value(story_points)
     return {"fields": fields}
 
 
@@ -774,6 +794,8 @@ def edit_issue_payload(
     labels: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
+    story_points: float | None = None,
+    story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if summary is not None:
@@ -786,6 +808,8 @@ def edit_issue_payload(
         fields["parent"] = {"key": parent_key}
     if priority is not None:
         fields["priority"] = {"name": priority}
+    if story_points is not None:
+        fields[story_points_field] = _story_points_value(story_points)
     if not fields:
         raise ValueError("At least one editable field must be provided")
     return {"fields": fields}

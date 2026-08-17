@@ -93,8 +93,14 @@ Create commands are dry-run by default. They accept Markdown text or a UTF-8 Mar
   --description-section "Exact proposed Jira description" `
   --labels FA101,MVP,risk-high `
   --parent FC-123 `
-  --priority High
+  --priority High `
+  --story-points 8
 ```
+
+`--story-points` writes to the Jira custom field named by `JIRA_STORY_POINTS_FIELD`, which defaults
+to `customfield_10028`. That numeric id differs per Jira site: look yours up under
+`/rest/api/3/field` and set the variable in `.env` if it is not the default. Whole values are sent as
+integers, halves such as `0.5` are preserved, and `edit-issue` takes the same option.
 
 ## Current Scope
 
@@ -105,8 +111,8 @@ Create commands are dry-run by default. They accept Markdown text or a UTF-8 Mar
 - Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
 - Run read-only smoke checks inside the configured FC test scope with `test-scope`
 - Inspect create metadata and create dry-run/real test issues in the configured FC project
-- Create arbitrary allowed issue types with labels, parent, priority, and Markdown-to-ADF
-  descriptions; optionally select one Markdown section from a preparation file
+- Create arbitrary allowed issue types with labels, parent, priority, story points, and
+  Markdown-to-ADF descriptions; optionally select one Markdown section from a preparation file
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`
 - Prepare standardized agent comments with `agent-plan-comment`
@@ -114,7 +120,7 @@ Create commands are dry-run by default. They accept Markdown text or a UTF-8 Mar
 - Store Factory Contracts as comments or attachments with `factory-contract`
 - Post Drift Reconcile comments with `drift-reconcile-comment`
 - Set or remove `drift-*` labels with `drift-labels`
-- Edit summary, description, and labels with `edit-issue`
+- Edit summary, description, labels, parent, priority, and story points with `edit-issue`
 - Search assignable users with `user-search` and assign by query with `assign-user`
 - Link issues with `link-issue`
 - Attach local files with `attach`

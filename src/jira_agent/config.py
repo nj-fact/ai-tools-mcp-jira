@@ -25,6 +25,7 @@ class JiraConfig(BaseModel):
     )
     write_issue_keys: list[str] = Field(default_factory=list, alias="JIRA_WRITE_ISSUE_KEYS")
     audit_log_path: str = Field(default=".jira-agent/audit.jsonl", alias="JIRA_AUDIT_LOG_PATH")
+    story_points_field: str = Field(default="customfield_10028", alias="JIRA_STORY_POINTS_FIELD")
 
     @field_validator("site_url")
     @classmethod
@@ -74,6 +75,17 @@ class JiraConfig(BaseModel):
             return None
         normalized = value.strip()
         return normalized or None
+
+    @field_validator("story_points_field")
+    @classmethod
+    def validate_story_points_field(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("customfield_") or not normalized[12:].isdigit():
+            raise ValueError(
+                "JIRA_STORY_POINTS_FIELD must look like customfield_10028; "
+                "the numeric id differs per Jira site"
+            )
+        return normalized
 
     @field_validator("write_project_keys", "write_issue_keys", mode="before")
     @classmethod
