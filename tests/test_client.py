@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import httpx
 
 from jira_agent.client import (
@@ -882,3 +885,162 @@ def test_upsert_top_level_section_inserts_before_named_heading() -> None:
         block["content"][0]["text"] for block in updated["content"] if block["type"] == "heading"
     ]
     assert headings == ["Outcome", "UI/UX Reference", "Child Issues"]
+
+
+def test_update_comment_puts_adf_body_to_the_comment_endpoint() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"id": "667040", "updated": "2026-08-21T09:30:00.000+0200"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.update_comment("FC-264", "667040", "Corrected text")
+
+    assert result["id"] == "667040"
+    assert seen["method"] == "PUT"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-264/comment/667040"
+    assert seen["json"] == {"body": text_to_adf("Corrected text")}
+
+
+def test_get_comment_reads_one_comment_by_id() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"id": "667040"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_comment("FC-264", "667040")["id"] == "667040"
+    assert seen["method"] == "GET"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-264/comment/667040"
+
+
+def make_override_config() -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_PROJECT__FINRP__EMAIL": "finrp@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "finrp-token",
+        }
+    )
+
+
+def basic_auth(email: str, token: str) -> str:
+    return "Basic " + base64.b64encode(f"{email}:{token}".encode()).decode()
+
+
+def test_client_selects_credentials_per_issue_key() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["Authorization"]))
+        return httpx.Response(200, json={"key": "stub"})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        client.get_issue("FINRP-123")
+        client.get_issue("FC-1")
+        client.myself()
+
+    assert seen[0] == (
+        "https://example.atlassian.net/rest/api/3/issue/FINRP-123",
+        basic_auth("finrp@example.com", "finrp-token"),
+    )
+    assert seen[1][1] == basic_auth("user@example.com", "token")
+    assert seen[2][1] == basic_auth("user@example.com", "token")
+
+
+def test_client_uses_override_site_url_for_that_project_only() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["Authorization"]))
+        return httpx.Response(200, json={"key": "stub"})
+
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_PROJECT__FINRP__EMAIL": "finrp@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "finrp-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://other.atlassian.net",
+        }
+    )
+    with JiraClient(config, transport=httpx.MockTransport(handler)) as client:
+        client.get_issue("FINRP-123")
+        client.myself()
+
+    assert seen[0][0] == "https://other.atlassian.net/rest/api/3/issue/FINRP-123"
+    assert seen[1][0] == "https://example.atlassian.net/rest/api/3/myself"
+
+
+def test_create_issue_uses_the_target_project_credentials() -> None:
+    seen: list[tuple[str, str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url), request.headers["Authorization"]))
+        return httpx.Response(201, json={"key": "FINRP-1"})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        client.create_issue(project_key="FINRP", issue_type_name="Task", summary="Summary")
+        client.create_issue(project_key="FC", issue_type_name="Task", summary="Summary")
+
+    assert seen[0] == (
+        "POST",
+        "https://example.atlassian.net/rest/api/3/issue",
+        basic_auth("finrp@example.com", "finrp-token"),
+    )
+    assert seen[1][2] == basic_auth("user@example.com", "token")
+
+
+def test_myself_can_target_a_project_credential_set() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Authorization"])
+        return httpx.Response(200, json={"accountId": "1"})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        client.myself(key="FINRP-42")
+        client.myself()
+
+    assert seen[0] == basic_auth("finrp@example.com", "finrp-token")
+    assert seen[1] == basic_auth("user@example.com", "token")
+
+
+def test_injected_http_client_serves_the_default_credentials() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"key": "FC-1"})
+
+    injected = httpx.Client(
+        base_url="https://example.atlassian.net/rest/api/3",
+        transport=httpx.MockTransport(handler),
+    )
+    with JiraClient(make_override_config(), http_client=injected) as client:
+        client.get_issue("FC-1")
+
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1"
+    assert not injected.is_closed

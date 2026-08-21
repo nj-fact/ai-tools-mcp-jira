@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from jira_agent.config import JiraConfig
+from jira_agent.config import DEFAULT_CREDENTIAL_SOURCE, JiraConfig
 
 
 class JiraApiError(RuntimeError):
@@ -25,22 +25,49 @@ class JiraApiError(RuntimeError):
 
 
 class JiraClient:
-    def __init__(self, config: JiraConfig, *, http_client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        config: JiraConfig,
+        *,
+        http_client: httpx.Client | None = None,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self.config = config
-        self._owns_client = http_client is None
-        self._client = http_client or httpx.Client(
-            base_url=f"{config.site_url}/rest/api/3",
-            auth=(config.email, config.api_token.get_secret_value()),
-            timeout=config.timeout_seconds,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "jira-agent/0.1",
-            },
-        )
+        self._transport = transport
+        self._clients: dict[str, httpx.Client] = {}
+        self._owned_clients: list[httpx.Client] = []
+        if http_client is not None:
+            self._clients[DEFAULT_CREDENTIAL_SOURCE] = http_client
+
+    def _http_client_for(self, key: str | None) -> httpx.Client:
+        """Return the HTTP client for a project or issue key, one per credential set."""
+        source = self.config.credential_source_for(key)
+        client = self._clients.get(source)
+        if client is None:
+            credentials = self.config.credentials_for(key)
+            kwargs: dict[str, Any] = {
+                "base_url": f"{credentials.site_url}/rest/api/3",
+                "auth": (credentials.email, credentials.api_token.get_secret_value()),
+                "timeout": self.config.timeout_seconds,
+                "headers": {
+                    "Accept": "application/json",
+                    "User-Agent": "jira-agent/0.1",
+                },
+            }
+            if self._transport is not None:
+                kwargs["transport"] = self._transport
+            client = httpx.Client(**kwargs)
+            self._clients[source] = client
+            self._owned_clients.append(client)
+        return client
 
     def close(self) -> None:
-        if self._owns_client:
-            self._client.close()
+        """Close the HTTP clients this instance created; injected clients stay open."""
+        for source, client in list(self._clients.items()):
+            if client in self._owned_clients:
+                client.close()
+                del self._clients[source]
+        self._owned_clients.clear()
 
     def __enter__(self) -> JiraClient:
         return self
@@ -48,8 +75,8 @@ class JiraClient:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def myself(self) -> dict[str, Any]:
-        return self._request("GET", "/myself")
+    def myself(self, *, key: str | None = None) -> dict[str, Any]:
+        return self._request("GET", "/myself", key=key)
 
     def get_issue(
         self,
@@ -63,7 +90,7 @@ class JiraClient:
             params["fields"] = ",".join(fields)
         if expand:
             params["expand"] = ",".join(expand)
-        return self._request("GET", f"/issue/{issue_key}", params=params)
+        return self._request("GET", f"/issue/{issue_key}", params=params, key=issue_key)
 
     def search_issues(
         self,
@@ -72,6 +99,7 @@ class JiraClient:
         limit: int = 20,
         fields: Iterable[str] | None = None,
         next_page_token: str | None = None,
+        project_key: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "jql": jql,
@@ -81,7 +109,7 @@ class JiraClient:
             params["fields"] = list(fields)
         if next_page_token:
             params["nextPageToken"] = next_page_token
-        return self._request("GET", "/search/jql", params=params)
+        return self._request("GET", "/search/jql", params=params, key=project_key)
 
     def list_comments(
         self,
@@ -94,6 +122,7 @@ class JiraClient:
             "GET",
             f"/issue/{issue_key}/comment",
             params={"startAt": start_at, "maxResults": limit},
+            key=issue_key,
         )
 
     def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
@@ -101,16 +130,34 @@ class JiraClient:
             "POST",
             f"/issue/{issue_key}/comment",
             json={"body": text_to_adf(body)},
+            key=issue_key,
+        )
+
+    def get_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/issue/{issue_key}/comment/{comment_id}", key=issue_key)
+
+    def update_comment(self, issue_key: str, comment_id: str, body: str) -> dict[str, Any]:
+        """Replace the body of one existing comment.
+
+        Jira keeps the original author and created instant and records the edit through
+        updateAuthor and updated, so a correction stays attributable without a second comment.
+        """
+        return self._request(
+            "PUT",
+            f"/issue/{issue_key}/comment/{comment_id}",
+            json={"body": text_to_adf(body)},
+            key=issue_key,
         )
 
     def get_transitions(self, issue_key: str) -> dict[str, Any]:
-        return self._request("GET", f"/issue/{issue_key}/transitions")
+        return self._request("GET", f"/issue/{issue_key}/transitions", key=issue_key)
 
     def transition_issue(self, issue_key: str, transition_id: str) -> dict[str, Any]:
         return self._request(
             "POST",
             f"/issue/{issue_key}/transitions",
             json={"transition": {"id": transition_id}},
+            key=issue_key,
         )
 
     def create_metadata(
@@ -125,7 +172,7 @@ class JiraClient:
         }
         if issue_type_name:
             params["issuetypeNames"] = issue_type_name
-        return self._request("GET", "/issue/createmeta", params=params)
+        return self._request("GET", "/issue/createmeta", params=params, key=project_key)
 
     def create_issue(
         self,
@@ -153,6 +200,7 @@ class JiraClient:
                 story_points=story_points,
                 story_points_field=self.config.story_points_field,
             ),
+            key=project_key,
         )
 
     def assign_issue(self, issue_key: str, account_id: str | None) -> dict[str, Any]:
@@ -160,6 +208,7 @@ class JiraClient:
             "PUT",
             f"/issue/{issue_key}/assignee",
             json={"accountId": account_id},
+            key=issue_key,
         )
 
     def search_assignable_users(
@@ -178,7 +227,12 @@ class JiraClient:
             params["issueKey"] = issue_key
         if project_key:
             params["project"] = project_key
-        return self._request("GET", "/user/assignable/search", params=params)
+        return self._request(
+            "GET",
+            "/user/assignable/search",
+            params=params,
+            key=issue_key or project_key,
+        )
 
     def edit_issue(
         self,
@@ -203,6 +257,7 @@ class JiraClient:
                 story_points=story_points,
                 story_points_field=self.config.story_points_field,
             ),
+            key=issue_key,
         )
 
     def edit_issue_adf_description(
@@ -214,6 +269,7 @@ class JiraClient:
             "PUT",
             f"/issue/{issue_key}",
             json={"fields": {"description": description}},
+            key=issue_key,
         )
 
     def link_issues(
@@ -233,13 +289,14 @@ class JiraClient:
                 link_type=link_type,
                 comment=comment,
             ),
+            key=outward_issue_key,
         )
 
     def add_attachment(self, issue_key: str, file_path: str | Path) -> list[dict[str, Any]]:
         path = Path(file_path)
         with path.open("rb") as handle:
             try:
-                response = self._client.request(
+                response = self._http_client_for(issue_key).request(
                     "POST",
                     f"/issue/{issue_key}/attachments",
                     headers={"X-Atlassian-Token": "no-check"},
@@ -268,12 +325,17 @@ class JiraClient:
             )
         return data
 
-    def delete_attachment(self, attachment_id: str) -> dict[str, Any]:
-        return self._request("DELETE", f"/attachment/{attachment_id}")
+    def delete_attachment(
+        self,
+        attachment_id: str,
+        *,
+        issue_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request("DELETE", f"/attachment/{attachment_id}", key=issue_key)
 
-    def attachment_media_id(self, attachment_id: str) -> str:
+    def attachment_media_id(self, attachment_id: str, *, issue_key: str | None = None) -> str:
         try:
-            response = self._client.get(
+            response = self._http_client_for(issue_key).get(
                 f"/attachment/content/{attachment_id}",
                 follow_redirects=False,
             )
@@ -303,6 +365,7 @@ class JiraClient:
             "GET",
             f"/issue/{issue_key}/changelog",
             params={"startAt": start_at, "maxResults": limit},
+            key=issue_key,
         )
 
     def _request(
@@ -312,9 +375,10 @@ class JiraClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        key: str | None = None,
     ) -> dict[str, Any]:
         try:
-            response = self._client.request(method, path, params=params, json=json)
+            response = self._http_client_for(key).request(method, path, params=params, json=json)
         except httpx.HTTPError as exc:
             raise JiraApiError(f"Jira request failed before receiving a response: {exc}") from exc
 

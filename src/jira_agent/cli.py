@@ -1747,7 +1747,7 @@ def delete_attachment(
                 console.print("Pass --execute to delete it from Jira.")
                 return
 
-            data = client.delete_attachment(attachment_id)
+            data = client.delete_attachment(attachment_id, issue_key=issue_key)
             audit_write(
                 config,
                 action="delete_attachment",
@@ -1837,7 +1837,7 @@ def embed_diagram(
             uploaded = client.add_attachment(issue_key, file_path)
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
-            media_id = client.attachment_media_id(attachment_id)
+            media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
             existing_description = issue.get("fields", {}).get("description") or {
                 "type": "doc",
                 "version": 1,
@@ -1853,7 +1853,7 @@ def embed_diagram(
             result = client.edit_issue_adf_description(issue_key, description)
             deleted: list[str] = []
             for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id)
+                client.delete_attachment(item_id, issue_key=issue_key)
                 deleted.append(item_id)
             audit_write(
                 config,

@@ -19,6 +19,29 @@ JIRA_WRITE_ISSUE_KEYS=
 JIRA_AUDIT_LOG_PATH=.jira-agent/audit.jsonl
 ```
 
+### Per-project credentials
+
+Some Jira projects require a different user/API token on the same site. Add per-project
+overrides with `JIRA_PROJECT__<PROJECTKEY>__*` variables; every other project keeps using
+the default `JIRA_EMAIL`/`JIRA_API_TOKEN`:
+
+```env
+JIRA_PROJECT__FINRP__EMAIL=finrp-user@example.com
+JIRA_PROJECT__FINRP__API_TOKEN=finrp-api-token
+# Optional; falls back to JIRA_SITE_URL:
+# JIRA_PROJECT__FINRP__SITE_URL=https://your-domain.atlassian.net
+```
+
+The project key is case-insensitive in the variable name and is normalized to uppercase.
+`EMAIL` and `API_TOKEN` must both be set for a project; a partial override fails config
+validation. Requests are matched by the target project or issue key (`FINRP-123` uses the
+`FINRP` credentials); requests without a project target, such as `jira_myself` or plain
+JQL searches, use the default credentials. `jira_myself`, `jira_search_issues`, `jira_mine`,
+and `jira_by_status` accept an optional project argument to run under that project's
+credential set. Write audit records name the credential set used as `credential_source`
+(the project key or `default`); tokens are never logged. Restart the MCP server (or the
+Claude/Codex session hosting it) after changing `.env`.
+
 Install and run:
 
 ```bash
@@ -188,6 +211,7 @@ Available MCP tools:
 - `jira_assign_user`
 - `jira_list_comments`
 - `jira_add_comment`
+- `jira_update_comment`
 - `jira_list_transitions`
 - `jira_link_issue`
 - `jira_attach_file`

@@ -82,24 +82,29 @@ def _safety_error(exc: JiraWriteSafetyError) -> dict[str, Any]:
     }
 
 
-def _run_jql(jql: str, limit: int = 20) -> dict[str, Any]:
+def _run_jql(jql: str, limit: int = 20, project: str | None = None) -> dict[str, Any]:
     try:
         with _client() as client:
             return {
                 "ok": True,
                 "jql": jql,
-                "result": client.search_issues(jql, limit=limit, fields=DEFAULT_FIELDS),
+                "result": client.search_issues(
+                    jql,
+                    limit=limit,
+                    fields=DEFAULT_FIELDS,
+                    project_key=project,
+                ),
             }
     except JiraApiError as exc:
         return _error(exc)
 
 
 @mcp.tool
-def jira_myself() -> dict[str, Any]:
-    """Return the authenticated Jira user."""
+def jira_myself(project: str | None = None) -> dict[str, Any]:
+    """Return the authenticated Jira user. Pass a project key to check its credential set."""
     try:
         with _client() as client:
-            return {"ok": True, "user": client.myself()}
+            return {"ok": True, "user": client.myself(key=project)}
     except JiraApiError as exc:
         return _error(exc)
 
@@ -120,8 +125,9 @@ def jira_search_issues(
     limit: int = 20,
     fields: list[str] | None = None,
     next_page_token: str | None = None,
+    project: str | None = None,
 ) -> dict[str, Any]:
-    """Search Jira issues with JQL."""
+    """Search Jira issues with JQL. Pass a project key to search with its credential set."""
     try:
         with _client() as client:
             return {
@@ -131,6 +137,7 @@ def jira_search_issues(
                     limit=limit,
                     fields=_fields_or_default(fields),
                     next_page_token=next_page_token,
+                    project_key=project,
                 ),
             }
     except JiraApiError as exc:
@@ -150,7 +157,7 @@ def jira_mine(project: str | None = None, limit: int = 20) -> dict[str, Any]:
     clauses = ["assignee = currentUser()", "resolution = Unresolved"]
     if project:
         clauses.insert(0, f"project = {project}")
-    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit, project=project)
 
 
 @mcp.tool
@@ -166,7 +173,7 @@ def jira_by_status(status: str, project: str | None = None, limit: int = 20) -> 
     clauses = [f'status = "{escaped_status}"']
     if project:
         clauses.insert(0, f"project = {project}")
-    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit, project=project)
 
 
 @mcp.tool
@@ -341,7 +348,7 @@ def jira_assign_issue(
 
     try:
         with JiraClient(config) as client:
-            me = client.myself()
+            me = client.myself(key=issue_key)
             target_account_id = None if unassigned else account_id or str(me["accountId"])
             if not execute:
                 return {
@@ -866,6 +873,60 @@ def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, An
 
 
 @mcp.tool
+def jira_update_comment(
+    key: str,
+    comment_id: str,
+    body: str,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Replace the body of one existing comment on a Jira issue. Defaults to dry-run.
+
+    Use this to correct a comment in place instead of stacking a second comment that contradicts
+    the first. Jira keeps the original author and created instant and records the edit separately,
+    so the correction stays attributable. The dry run returns the current body so the replacement
+    can be compared against what it overwrites.
+    """
+    try:
+        with _client() as client:
+            safety = ensure_issue_write_allowed(client.config, client, key)
+            try:
+                current = client.get_comment(key, comment_id)
+            except JiraApiError as exc:
+                if exc.status_code == 404:
+                    return {
+                        "ok": False,
+                        "message": f"Comment {comment_id} is not present on {key}.",
+                    }
+                raise
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    "comment_id": comment_id,
+                    "current_author": (current.get("author") or {}).get("displayName"),
+                    "current_body": current.get("body"),
+                    "new_body": body,
+                    "safety": safety,
+                    "message": "Pass execute=true to replace this comment body in Jira.",
+                }
+
+            result = client.update_comment(key, comment_id, body)
+            audit_write(
+                client.config,
+                action="update_comment",
+                issue_key=key,
+                payload={"comment_id": comment_id, "body": body},
+                result={"id": result.get("id"), "updated": result.get("updated")},
+            )
+            return {"ok": True, "comment": result}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
 def jira_list_transitions(key: str) -> dict[str, Any]:
     """List available transitions for one Jira issue."""
     try:
@@ -1004,7 +1065,7 @@ def jira_delete_attachment(
                     "safety": safety,
                     "message": "Pass execute=true to delete this attachment from Jira.",
                 }
-            result = client.delete_attachment(attachment_id)
+            result = client.delete_attachment(attachment_id, issue_key=issue_key)
             audit_write(
                 config,
                 action="delete_attachment",
@@ -1112,7 +1173,7 @@ def jira_render_mermaid_diagrams(
                 attachment_id = str(attachment.get("id"))
                 uploaded_ids.append(attachment_id)
                 new_attachments.append(attachment)
-                media_id = client.attachment_media_id(attachment_id)
+                media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
                 width, height = png_dimensions(path)
                 updated_description = replace_diagram_with_media(
                     updated_description,
@@ -1125,7 +1186,7 @@ def jira_render_mermaid_diagrams(
             result = client.edit_issue_adf_description(issue_key, updated_description)
             deleted: list[str] = []
             for attachment_id in sorted(previous_ids - set(uploaded_ids)):
-                client.delete_attachment(attachment_id)
+                client.delete_attachment(attachment_id, issue_key=issue_key)
                 deleted.append(attachment_id)
             audit_write(
                 config,
@@ -1153,7 +1214,7 @@ def jira_render_mermaid_diagrams(
             try:
                 with JiraClient(config) as cleanup_client:
                     for attachment_id in uploaded_ids:
-                        cleanup_client.delete_attachment(attachment_id)
+                        cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
             except JiraApiError:
                 pass
         return _error(exc)
@@ -1205,7 +1266,7 @@ def jira_embed_diagram(
             uploaded = client.add_attachment(issue_key, file_path)
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
-            media_id = client.attachment_media_id(attachment_id)
+            media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
             description = replace_diagram_with_media(
                 issue.get("fields", {}).get("description")
                 or {"type": "doc", "version": 1, "content": []},
@@ -1217,7 +1278,7 @@ def jira_embed_diagram(
             result = client.edit_issue_adf_description(issue_key, description)
             deleted: list[str] = []
             for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id)
+                client.delete_attachment(item_id, issue_key=issue_key)
                 deleted.append(item_id)
             audit_write(
                 config,
