@@ -421,6 +421,58 @@ def test_edit_issue_payload_supports_parent_and_priority() -> None:
     }
 
 
+def test_create_issue_payload_sets_one_fix_version() -> None:
+    payload = create_issue_payload(
+        project_key="FC",
+        issue_type_name="Task",
+        summary="Ship it",
+        fix_versions=["FCL-MVP"],
+    )
+
+    assert payload["fields"]["fixVersions"] == [{"name": "FCL-MVP"}]
+
+
+def test_edit_issue_payload_sets_several_fix_versions() -> None:
+    payload = edit_issue_payload(fix_versions=["FCL-MVP", "FCL-1.1"])
+
+    assert payload["fields"]["fixVersions"] == [
+        {"name": "FCL-MVP"},
+        {"name": "FCL-1.1"},
+    ]
+
+
+def test_edit_issue_payload_omits_fix_versions_key_by_default() -> None:
+    payload = edit_issue_payload(summary="Updated")
+
+    assert "fixVersions" not in payload["fields"]
+
+
+def test_edit_issue_payload_clears_fix_versions_with_an_empty_list() -> None:
+    payload = edit_issue_payload(fix_versions=[])
+
+    assert payload["fields"]["fixVersions"] == []
+
+
+def test_edit_issue_sends_fix_versions_in_the_jira_shape() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-107", fix_versions=["FCL-MVP"])
+
+    assert seen["json"] == '{"fields":{"fixVersions":[{"name":"FCL-MVP"}]}}'
+
+
 def test_create_issue_payload_writes_story_points_to_the_configured_field() -> None:
     payload = create_issue_payload(
         project_key="FC",

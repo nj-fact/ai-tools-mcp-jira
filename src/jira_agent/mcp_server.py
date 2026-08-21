@@ -204,6 +204,7 @@ def jira_create_issue(
     description_file: str | None = None,
     description_section: str | None = None,
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -222,6 +223,7 @@ def jira_create_issue(
             summary=summary,
             description=body,
             labels=labels,
+            fix_versions=fix_versions,
             parent_key=parent_key,
             priority=priority,
             story_points=story_points,
@@ -248,6 +250,7 @@ def jira_create_issue(
                 summary=summary,
                 description=body,
                 labels=labels,
+                fix_versions=fix_versions,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -420,12 +423,17 @@ def jira_edit_issue(
     description_file: str | None = None,
     description_section: str | None = None,
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
+    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
+
+    Omitting fix_versions leaves the issue's fix versions untouched. Pass an empty list to
+    clear them, matching the labels convention; pass one or more version names to set them.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -444,6 +452,7 @@ def jira_edit_issue(
             summary=summary,
             description=body,
             labels=labels,
+            fix_versions=fix_versions,
             parent_key=parent_key,
             priority=priority,
             story_points=story_points,
@@ -471,6 +480,7 @@ def jira_edit_issue(
                 summary=summary,
                 description=body,
                 labels=labels,
+                fix_versions=fix_versions,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,

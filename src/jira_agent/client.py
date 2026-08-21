@@ -182,6 +182,7 @@ class JiraClient:
         summary: str,
         description: str | None = None,
         labels: list[str] | None = None,
+        fix_versions: list[str] | None = None,
         parent_key: str | None = None,
         priority: str | None = None,
         story_points: float | None = None,
@@ -195,6 +196,7 @@ class JiraClient:
                 summary=summary,
                 description=description,
                 labels=labels,
+                fix_versions=fix_versions,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -241,6 +243,7 @@ class JiraClient:
         summary: str | None = None,
         description: str | None = None,
         labels: list[str] | None = None,
+        fix_versions: list[str] | None = None,
         parent_key: str | None = None,
         priority: str | None = None,
         story_points: float | None = None,
@@ -252,6 +255,7 @@ class JiraClient:
                 summary=summary,
                 description=description,
                 labels=labels,
+                fix_versions=fix_versions,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -828,6 +832,7 @@ def create_issue_payload(
     summary: str,
     description: str | None = None,
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -842,6 +847,8 @@ def create_issue_payload(
         fields["description"] = text_to_adf(description)
     if labels is not None:
         fields["labels"] = labels
+    if fix_versions is not None:
+        fields["fixVersions"] = [{"name": version} for version in fix_versions]
     if parent_key:
         fields["parent"] = {"key": parent_key}
     if priority:
@@ -856,6 +863,7 @@ def edit_issue_payload(
     summary: str | None = None,
     description: str | None = None,
     labels: list[str] | None = None,
+    fix_versions: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -868,6 +876,8 @@ def edit_issue_payload(
         fields["description"] = text_to_adf(description)
     if labels is not None:
         fields["labels"] = labels
+    if fix_versions is not None:
+        fields["fixVersions"] = [{"name": version} for version in fix_versions]
     if parent_key is not None:
         fields["parent"] = {"key": parent_key}
     if priority is not None:
