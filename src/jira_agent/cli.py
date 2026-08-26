@@ -27,6 +27,11 @@ from jira_agent.image_gallery import (
     newest_attachments_by_filename,
     upsert_top_level_section,
 )
+from jira_agent.mermaid import (
+    discover_mermaid_runtime,
+    embed_mermaid_diagrams,
+    mermaid_sources_from_adf,
+)
 from jira_agent.reporting import adf_to_text, agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
@@ -754,6 +759,13 @@ def create_issue(
         bool,
         typer.Option("--execute", help="Actually create the issue in Jira."),
     ] = False,
+    render_mermaid: Annotated[
+        bool,
+        typer.Option(
+            "--render-mermaid/--no-render-mermaid",
+            help="Render Mermaid code blocks to PNG, attach, and embed them.",
+        ),
+    ] = True,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
@@ -787,9 +799,17 @@ def create_issue(
     except ValueError as exc:
         error_console.print(f"[red]Create error:[/red] {exc}")
         raise typer.Exit(2) from exc
+    description_adf = payload["fields"].get("description")
+    diagram_count = (
+        len(mermaid_sources_from_adf(description_adf))
+        if render_mermaid and isinstance(description_adf, dict)
+        else 0
+    )
     if not execute:
         console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
         _print_json(payload)
+        if diagram_count:
+            console.print(f"Mermaid diagrams to render after creation: {diagram_count}")
         console.print("Pass --execute to create it in Jira.")
         return
 
@@ -813,15 +833,141 @@ def create_issue(
                 payload=payload,
                 result=data,
             )
+            mermaid_result: dict[str, Any] | None = None
+            if diagram_count and data.get("key") and isinstance(description_adf, dict):
+                try:
+                    mermaid_result = embed_mermaid_diagrams(
+                        client,
+                        issue_key=str(data["key"]),
+                        description=description_adf,
+                        output_dir=Path(config.audit_log_path).parent
+                        / "diagrams"
+                        / str(data["key"]),
+                    )
+                    audit_write(
+                        config,
+                        action="render_mermaid_diagrams",
+                        issue_key=str(data["key"]),
+                        payload={
+                            "files": mermaid_result["files"],
+                            "attachment_ids": mermaid_result["attachment_ids"],
+                            "deleted_attachment_ids": mermaid_result["deleted_attachment_ids"],
+                        },
+                        result=mermaid_result["result"],
+                    )
+                except (JiraApiError, OSError, RuntimeError, ValueError) as exc:
+                    mermaid_result = {"ok": False, "message": str(exc)}
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        if mermaid_result is None:
+            _print_json(data)
+        else:
+            _print_json({"issue": data, "mermaid": mermaid_result})
         return
     console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
+    if mermaid_result is not None:
+        if mermaid_result.get("ok"):
+            console.print(f"Embedded {mermaid_result['diagram_count']} Mermaid diagram(s).")
+        else:
+            error_console.print(
+                f"[yellow]Warning:[/yellow] issue was created, but Mermaid embedding failed: "
+                f"{mermaid_result['message']}"
+            )
+
+
+@app.command("render-mermaid")
+def render_mermaid(
+    key: Annotated[str, typer.Argument(help="Jira issue key.")],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for rendered PNG files."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Render, upload, and embed the diagrams in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable result."),
+    ] = False,
+) -> None:
+    """Render and embed all Mermaid blocks in an existing issue. Defaults to dry-run."""
+    config = _config()
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, key)
+            issue = client.get_issue(key, fields=["description", "attachment"])
+            description_adf = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            sources = mermaid_sources_from_adf(description_adf)
+            if not sources:
+                error_console.print(f"[yellow]No Mermaid code blocks found on {key}.[/yellow]")
+                raise typer.Exit(1)
+
+            runtime = discover_mermaid_runtime()
+            destination = output_dir or (Path(config.audit_log_path).parent / "diagrams" / key)
+            if not execute:
+                result = {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    "diagram_count": len(sources),
+                    "output_dir": str(destination),
+                    "runtime": {
+                        "node": str(runtime.node),
+                        "cli": str(runtime.cli),
+                        "browser": str(runtime.browser),
+                    },
+                    "safety": safety,
+                }
+                if json_output:
+                    _print_json(result)
+                else:
+                    console.print("[yellow]Dry run:[/yellow] would render Mermaid diagrams")
+                    console.print(f"issue: {key}")
+                    console.print(f"Mermaid diagrams: {len(sources)}")
+                    console.print(f"output directory: {destination}")
+                    console.print("Pass --execute to render, upload, and embed them.")
+                return
+
+            result = embed_mermaid_diagrams(
+                client,
+                issue_key=key,
+                description=description_adf,
+                attachments=issue.get("fields", {}).get("attachment") or [],
+                output_dir=destination,
+                runtime=runtime,
+            )
+            audit_write(
+                config,
+                action="render_mermaid_diagrams",
+                issue_key=key,
+                payload={
+                    "files": result["files"],
+                    "attachment_ids": result["attachment_ids"],
+                    "deleted_attachment_ids": result["deleted_attachment_ids"],
+                },
+                result=result["result"],
+            )
+    except JiraWriteSafetyError as exc:
+        _exit_safety_error(exc)
+    except JiraApiError as exc:
+        _exit_api_error(exc)
+    except (OSError, RuntimeError, ValueError) as exc:
+        error_console.print(f"[red]Mermaid error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    if json_output:
+        _print_json(result)
+        return
+    console.print(f"Embedded {result['diagram_count']} Mermaid diagram(s) in {key}.")
 
 
 @app.command("test-issue")

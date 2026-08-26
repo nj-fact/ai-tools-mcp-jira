@@ -55,6 +55,8 @@ uv run jira-agent by-status Open --project FC --limit 5
 uv run jira-agent user-search Norman --issue FC-107
 uv run jira-agent create-meta --project FC
 uv run jira-agent create-test-issue "jira-agent smoke test" --description "Dry-run by default."
+uv run jira-agent create-issue "Diagram example" --issue-type Task --description-file issue.md
+uv run jira-agent render-mermaid FC-107
 uv run jira-agent test-issue
 uv run jira-agent agent-report
 uv run jira-agent agent-report FC-107 --changelog 5 --json
@@ -149,6 +151,8 @@ integers, halves such as `0.5` are preserved, and `edit-issue` takes the same op
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
+- Automatically render and embed Mermaid blocks after `create-issue` (disable with
+  `--no-render-mermaid`) and retrofit an existing issue with `render-mermaid`
 - Insert or replace a linked screenshot gallery from existing attachments with
   `upsert-image-gallery`
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,

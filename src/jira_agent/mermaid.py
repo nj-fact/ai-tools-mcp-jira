@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jira_agent.client import JiraApiError, png_dimensions, replace_diagram_with_media
+
 
 @dataclass(frozen=True)
 class MermaidRuntime:
@@ -119,6 +121,98 @@ def render_mermaid_png(
     if not output.is_file() or output.stat().st_size == 0:
         raise RuntimeError(f"Mermaid rendering produced no PNG: {output}")
     return output
+
+
+def embed_mermaid_diagrams(
+    client: Any,
+    *,
+    issue_key: str,
+    description: dict[str, Any],
+    attachments: list[dict[str, Any]] | None = None,
+    output_dir: str | Path,
+    filenames: list[str] | None = None,
+    alt_texts: list[str] | None = None,
+    runtime: MermaidRuntime | None = None,
+) -> dict[str, Any]:
+    """Render, upload, and embed every top-level Mermaid block.
+
+    All diagrams are rendered before the first Jira write. Uploads are rolled
+    back if a later upload or the description update fails.
+    """
+    sources = mermaid_sources_from_adf(description)
+    if not sources:
+        return {"ok": True, "issue": issue_key, "diagram_count": 0, "attachments": []}
+
+    names = filenames or [
+        f"{issue_key.lower()}-mermaid-{index}.png" for index in range(1, len(sources) + 1)
+    ]
+    alts = alt_texts or [f"Mermaid diagram {index}" for index in range(1, len(sources) + 1)]
+    if len(names) != len(sources) or len(alts) != len(sources):
+        raise ValueError("filenames and alt_texts must match the Mermaid block count.")
+    if len(set(names)) != len(names):
+        raise ValueError("Diagram filenames must be unique.")
+    for name in names:
+        path = Path(name)
+        if path.name != name or path.suffix.lower() != ".png":
+            raise ValueError(f"Diagram filename must be a plain PNG filename: {name}")
+
+    selected_runtime = runtime or discover_mermaid_runtime()
+    destination = Path(output_dir)
+    paths = [destination / name for name in names]
+    for source, path in zip(sources, paths, strict=True):
+        render_mermaid_png(source, path, runtime=selected_runtime)
+
+    previous_ids = {
+        str(attachment.get("id"))
+        for attachment in (attachments or [])
+        if attachment.get("filename") in names
+    }
+    uploaded_ids: list[str] = []
+    uploaded_attachments: list[dict[str, Any]] = []
+    updated_description = description
+    try:
+        for path, alt in zip(paths, alts, strict=True):
+            uploaded = client.add_attachment(issue_key, path)
+            if not uploaded:
+                raise JiraApiError(f"Jira returned no attachment metadata for {path.name}.")
+            attachment = uploaded[0]
+            attachment_id = str(attachment.get("id"))
+            uploaded_ids.append(attachment_id)
+            uploaded_attachments.append(attachment)
+            media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
+            width, height = png_dimensions(path)
+            updated_description = replace_diagram_with_media(
+                updated_description,
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+            )
+
+        result = client.edit_issue_adf_description(issue_key, updated_description)
+    except (JiraApiError, OSError, ValueError):
+        for attachment_id in uploaded_ids:
+            try:
+                client.delete_attachment(attachment_id, issue_key=issue_key)
+            except JiraApiError:
+                pass
+        raise
+
+    deleted_ids: list[str] = []
+    for attachment_id in sorted(previous_ids - set(uploaded_ids)):
+        client.delete_attachment(attachment_id, issue_key=issue_key)
+        deleted_ids.append(attachment_id)
+
+    return {
+        "ok": True,
+        "issue": issue_key,
+        "diagram_count": len(sources),
+        "attachments": uploaded_attachments,
+        "attachment_ids": uploaded_ids,
+        "deleted_attachment_ids": deleted_ids,
+        "files": [str(path) for path in paths],
+        "result": result,
+    }
 
 
 def _first_file(*candidates: object) -> Path | None:

@@ -26,6 +26,7 @@ from jira_agent.image_gallery import (
 )
 from jira_agent.mermaid import (
     discover_mermaid_runtime,
+    embed_mermaid_diagrams,
     mermaid_sources_from_adf,
     render_mermaid_png,
 )
@@ -209,8 +210,9 @@ def jira_create_issue(
     priority: str | None = None,
     story_points: float | None = None,
     execute: bool = False,
+    render_mermaid: bool = True,
 ) -> dict[str, Any]:
-    """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
+    """Create an issue and automatically embed Mermaid diagrams. Defaults to dry-run."""
     try:
         body = (
             read_text_source(description, description_file, section=description_section)
@@ -232,11 +234,19 @@ def jira_create_issue(
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
 
+    description_adf = payload["fields"].get("description")
+    diagram_count = (
+        len(mermaid_sources_from_adf(description_adf))
+        if render_mermaid and isinstance(description_adf, dict)
+        else 0
+    )
+
     if not execute:
         return {
             "ok": True,
             "dry_run": True,
             "payload": payload,
+            "mermaid_diagrams": diagram_count,
             "message": "Pass execute=true to create this issue in Jira.",
         }
 
@@ -262,7 +272,32 @@ def jira_create_issue(
                 payload=payload,
                 result=issue_result,
             )
-            return {"ok": True, "issue": issue_result}
+            result: dict[str, Any] = {"ok": True, "issue": issue_result}
+            if diagram_count and issue_result.get("key") and isinstance(description_adf, dict):
+                try:
+                    mermaid_result = embed_mermaid_diagrams(
+                        client,
+                        issue_key=str(issue_result["key"]),
+                        description=description_adf,
+                        output_dir=Path(config.audit_log_path).parent
+                        / "diagrams"
+                        / str(issue_result["key"]),
+                    )
+                    audit_write(
+                        config,
+                        action="render_mermaid_diagrams",
+                        issue_key=str(issue_result["key"]),
+                        payload={
+                            "files": mermaid_result["files"],
+                            "attachment_ids": mermaid_result["attachment_ids"],
+                            "deleted_attachment_ids": mermaid_result["deleted_attachment_ids"],
+                        },
+                        result=mermaid_result["result"],
+                    )
+                    result["mermaid"] = mermaid_result
+                except (JiraApiError, OSError, RuntimeError, ValueError) as exc:
+                    result["mermaid"] = {"ok": False, "message": str(exc)}
+            return result
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
