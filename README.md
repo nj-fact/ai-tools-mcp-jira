@@ -19,6 +19,34 @@ JIRA_WRITE_ISSUE_KEYS=
 JIRA_AUDIT_LOG_PATH=.jira-agent/audit.jsonl
 ```
 
+### Where configuration is read from
+
+Values are merged from three layers, lowest to highest precedence:
+
+1. the real process environment
+2. `.env` — dotenv syntax, read by `python-dotenv`
+3. `.envrc` — a direnv file, so a direnv setup can override `.env`
+
+Both files are re-checked on **every** CLI command and MCP tool call and reparsed
+when they changed, so an edit takes effect on the next call instead of at the next
+process start. Files are only reparsed when their mtime or size moved, and a file
+that does not exist yet is watched too — creating `.envrc.local` later is picked up.
+
+`.envrc` is a shell script, and it is **not** executed. Only these lines are honoured:
+
+- `KEY=value` and `export KEY=value` (surrounding quotes and trailing `# comments`
+  are stripped; no variable expansion or command substitution)
+- `source_env <file>` / `source_env_if_exists <file>` — included as a `.envrc`
+- `dotenv <file>` / `dotenv_if_exists <file>` — included as a `.env`
+- `unset KEY` / `unset_var KEY` — removes the name entirely, cancelling a value
+  from `.env` or from the process environment
+
+Everything else — `use flake`, `layout`, `PATH_add`, conditionals — is ignored.
+So a `.envrc` that only carries `use flake` plus `source_env_if_exists .envrc.local`
+contributes exactly what `.envrc.local` assigns. If you need the full direnv
+semantics, export the values from your shell instead; the process environment is
+the base layer.
+
 ### Per-project credentials
 
 Some Jira projects require a different user/API token on the same site. Add per-project

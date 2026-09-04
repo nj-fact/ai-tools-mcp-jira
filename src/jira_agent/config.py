@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 
 DEFAULT_CREDENTIAL_SOURCE = "default"
+
+DEFAULT_ENV_FILE = ".env"
+DEFAULT_ENVRC_FILE = ".envrc"
 
 _PROJECT_CREDENTIAL_PATTERN = re.compile(
     r"JIRA_PROJECT__(?P<project>.+)__(?P<field>EMAIL|API_TOKEN|SITE_URL)"
@@ -213,6 +217,199 @@ class JiraConfig(BaseModel):
         raise TypeError("Expected comma-separated string or list")
 
 
-def load_config(env_file: str | Path = ".env") -> JiraConfig:
-    load_dotenv(env_file, override=False)
-    return JiraConfig.model_validate(dict(os.environ))
+# --- Environment layering -------------------------------------------------
+#
+# Values are merged lowest to highest precedence:
+#   1. the real process environment
+#   2. .env      (dotenv syntax, python-dotenv)
+#   3. .envrc    (direnv file; assignments and source/dotenv includes only)
+#
+# Both files are re-checked on every resolve, so an edit takes effect on the
+# next tool call instead of at the next process start.
+
+_MAX_INCLUDE_DEPTH = 8
+
+_INCLUDE_PATTERN = re.compile(
+    r"^(?P<directive>source_env_if_exists|source_env|dotenv_if_exists|dotenv)"
+    r"\s+(?P<argument>\S.*)$"
+)
+_ASSIGNMENT_PATTERN = re.compile(r"^(?:export\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>.*)$")
+_UNSET_PATTERN = re.compile(r"^(?:unset|unset_var)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+_Stamp = tuple[int, int]
+# A layer maps a name to its value, or to None when the file unsets it.
+_Layer = dict[str, str | None]
+
+_resolve_lock = threading.Lock()
+# Cache per root file: the stamps of every file that contributed (missing ones
+# included, so creating .envrc.local later invalidates the entry) plus the
+# values that parse produced.
+_layer_cache: dict[tuple[Path, bool], tuple[dict[Path, _Stamp | None], _Layer]] = {}
+# Keys this module wrote into os.environ, mapped to the value that was there
+# before, so a key dropped from the files can be restored instead of lingering.
+_process_overrides: dict[str, str | None] = {}
+
+
+def _stamp(path: Path) -> _Stamp | None:
+    """Change marker for a file, or None when it does not exist."""
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    return (status.st_mtime_ns, status.st_size)
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Drop a whitespace-preceded trailing # comment from an unquoted value."""
+    for separator in (" #", "\t#"):
+        value = value.split(separator, 1)[0]
+    return value.strip()
+
+
+def _unquote(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in "\"'":
+        return stripped[1:-1]
+    return _strip_inline_comment(stripped)
+
+
+def _absorb(
+    path: Path,
+    *,
+    as_envrc: bool,
+    values: _Layer,
+    stamps: dict[Path, _Stamp | None],
+    seen: set[Path],
+    depth: int,
+) -> None:
+    """Merge one env file into values, following .envrc include directives.
+
+    Every file consulted is recorded in stamps, whether or not it exists.
+    """
+    key = path.resolve()
+    stamp = _stamp(path)
+    stamps.setdefault(key, stamp)
+    if stamp is None or key in seen or depth > _MAX_INCLUDE_DEPTH:
+        return
+    seen.add(key)
+
+    if not as_envrc:
+        for name, value in dotenv_values(path).items():
+            if value is not None:
+                values[name] = value
+        return
+
+    # A .envrc is a shell script. Only plain assignments and include directives
+    # are honoured; `use flake`, `layout`, conditionals and command
+    # substitution are ignored because evaluating them would mean running a
+    # shell on every tool call.
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        include = _INCLUDE_PATTERN.match(line)
+        if include is not None:
+            target = _unquote(include.group("argument"))
+            if target:
+                nested = Path(target)
+                if not nested.is_absolute():
+                    nested = path.parent / nested
+                _absorb(
+                    nested,
+                    as_envrc=include.group("directive").startswith("source_env"),
+                    values=values,
+                    stamps=stamps,
+                    seen=seen,
+                    depth=depth + 1,
+                )
+            continue
+
+        unset = _UNSET_PATTERN.match(line)
+        if unset is not None:
+            values[unset.group("name")] = None
+            continue
+
+        assignment = _ASSIGNMENT_PATTERN.match(line)
+        if assignment is not None:
+            values[assignment.group("name")] = _unquote(assignment.group("value"))
+
+
+def _file_layer(path: Path, *, as_envrc: bool) -> _Layer:
+    """Values from one env file, reparsed only when it or an include changed."""
+    cache_key = (path.resolve(), as_envrc)
+    cached = _layer_cache.get(cache_key)
+    if cached is not None:
+        stamps, values = cached
+        if all(_stamp(known) == stamp for known, stamp in stamps.items()):
+            return dict(values)
+
+    values: _Layer = {}
+    stamps: dict[Path, _Stamp | None] = {}
+    _absorb(path, as_envrc=as_envrc, values=values, stamps=stamps, seen=set(), depth=0)
+    _layer_cache[cache_key] = (stamps, dict(values))
+    return values
+
+
+def _base_environment() -> dict[str, str]:
+    """The process environment as it was before this module wrote to it."""
+    base = dict(os.environ)
+    for name, original in _process_overrides.items():
+        if original is None:
+            base.pop(name, None)
+        else:
+            base[name] = original
+    return base
+
+
+def _publish(file_values: _Layer) -> None:
+    """Mirror file values into os.environ for consumers that read it directly.
+
+    jira_agent.mermaid picks up JIRA_MERMAID_* and PUPPETEER_EXECUTABLE_PATH
+    from os.environ, so the files have to reach it there too.
+    """
+    for name in set(_process_overrides) - set(file_values):
+        original = _process_overrides.pop(name)
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
+    for name, value in file_values.items():
+        if name not in _process_overrides:
+            _process_overrides[name] = os.environ.get(name)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def resolve_environment(
+    env_file: str | Path = DEFAULT_ENV_FILE,
+    envrc_file: str | Path = DEFAULT_ENVRC_FILE,
+) -> dict[str, str]:
+    """Merge process environment, .env and .envrc, re-reading both files."""
+    with _resolve_lock:
+        file_values = _file_layer(Path(env_file), as_envrc=False)
+        file_values.update(_file_layer(Path(envrc_file), as_envrc=True))
+        merged = _base_environment()
+        for name, value in file_values.items():
+            if value is None:
+                merged.pop(name, None)
+            else:
+                merged[name] = value
+        _publish(file_values)
+        return merged
+
+
+def reset_environment_cache() -> None:
+    """Forget parsed files and restore os.environ. Intended for tests."""
+    with _resolve_lock:
+        _layer_cache.clear()
+        _publish({})
+
+
+def load_config(
+    env_file: str | Path = DEFAULT_ENV_FILE,
+    envrc_file: str | Path = DEFAULT_ENVRC_FILE,
+) -> JiraConfig:
+    return JiraConfig.model_validate(resolve_environment(env_file, envrc_file))
