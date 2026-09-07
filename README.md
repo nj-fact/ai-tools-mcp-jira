@@ -32,6 +32,22 @@ when they changed, so an edit takes effect on the next call instead of at the ne
 process start. Files are only reparsed when their mtime or size moved, and a file
 that does not exist yet is watched too — creating `.envrc.local` later is picked up.
 
+#### Which files are read
+
+Neither file is looked for in the working directory alone — the MCP server is started
+as `python3 -m jira_agent.mcp_server` and inherits whatever working directory its host
+process happens to have. `.env` is resolved highest to lowest precedence:
+
+1. `$JIRA_ENV_FILE`, absolute or relative to the working directory
+2. `.env` in the working directory, when it is actually there
+3. `.env` next to the `pyproject.toml` of the checkout the package was imported from
+
+`.envrc` follows the same order via `$JIRA_ENVRC_FILE`. Step 3 is skipped for an
+installed (non-editable) distribution, which has no checkout to fall back to; point
+`$JIRA_ENV_FILE` at the file in that case. `$JIRA_ENV_FILE` is read from the process
+environment only: setting it inside `.env` or `.envrc` has no effect, because it is the
+value that decides which file is read in the first place.
+
 `.envrc` is a shell script, and it is **not** executed. Only these lines are honoured:
 
 - `KEY=value` and `export KEY=value` (surrounding quotes and trailing `# comments`

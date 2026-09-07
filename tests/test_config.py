@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from jira_agent import config as config_module
 from jira_agent.config import (
     JiraConfig,
     load_config,
@@ -127,6 +128,20 @@ def test_normalize_project_key_handles_issue_keys_and_blanks() -> None:
 def _clean_environment_cache():
     yield
     reset_environment_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_file_lookup(monkeypatch):
+    """Keep the developer's own .env out of the suite.
+
+    Without this the checkout fallback in config._default_file would resolve to
+    this repository whenever a test leaves its tmp_path without a .env, and the
+    real values would leak into the assertions. Tests that mean to exercise the
+    fallback set PROJECT_ROOT to a tmp_path of their own.
+    """
+    monkeypatch.delenv(config_module.ENV_FILE_VARIABLE, raising=False)
+    monkeypatch.delenv(config_module.ENVRC_FILE_VARIABLE, raising=False)
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", None)
 
 
 def write_env(path: Path, **values: str) -> Path:
@@ -342,3 +357,155 @@ def test_mermaid_variables_reach_os_environ(tmp_path, monkeypatch) -> None:
     resolve(tmp_path, monkeypatch)
 
     assert os.environ["JIRA_MERMAID_NODE_PATH"] == "/usr/bin/node"
+
+
+# --- Where the files are looked up ----------------------------------------
+
+
+def test_project_root_is_found_for_a_src_layout(tmp_path) -> None:
+    root = tmp_path / "checkout"
+    package = root / "src" / "jira_agent"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text('[project]\nname = "jira-agent"\n')
+
+    assert config_module._find_project_root(package / "config.py") == root
+
+
+def test_project_root_is_found_for_a_flat_layout(tmp_path) -> None:
+    root = tmp_path / "checkout"
+    package = root / "jira_agent"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text('[project]\nname = "jira-agent"\n')
+
+    assert config_module._find_project_root(package / "config.py") == root
+
+
+def test_project_root_is_none_for_an_installed_distribution(tmp_path) -> None:
+    package = tmp_path / "lib" / "python3.12" / "site-packages" / "jira_agent"
+    package.mkdir(parents=True)
+
+    assert config_module._find_project_root(package / "config.py") is None
+
+
+def test_checkout_root_is_used_when_the_working_directory_has_no_env_file(
+    tmp_path, monkeypatch
+) -> None:
+    # The MCP server case: launched as a module with a foreign working directory.
+    root = tmp_path / "checkout"
+    root.mkdir()
+    write_env(root / ".env", JIRA_EMAIL="checkout@example.com")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", root)
+    monkeypatch.chdir(elsewhere)
+
+    assert resolve_environment()["JIRA_EMAIL"] == "checkout@example.com"
+
+
+def test_working_directory_env_file_wins_over_the_checkout_root(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    write_env(root / ".env", JIRA_EMAIL="checkout@example.com")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    write_env(elsewhere / ".env", JIRA_EMAIL="working-directory@example.com")
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", root)
+    monkeypatch.chdir(elsewhere)
+
+    assert resolve_environment()["JIRA_EMAIL"] == "working-directory@example.com"
+
+
+def test_env_file_variable_wins_over_both(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    write_env(root / ".env", JIRA_EMAIL="checkout@example.com")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    write_env(elsewhere / ".env", JIRA_EMAIL="working-directory@example.com")
+    pinned = write_env(tmp_path / "pinned.env", JIRA_EMAIL="pinned@example.com")
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", root)
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv(config_module.ENV_FILE_VARIABLE, str(pinned))
+
+    assert resolve_environment()["JIRA_EMAIL"] == "pinned@example.com"
+
+
+def test_env_file_variable_accepts_a_relative_path(tmp_path, monkeypatch) -> None:
+    write_env(tmp_path / ".env", JIRA_EMAIL="working-directory@example.com")
+    (tmp_path / "config").mkdir()
+    write_env(tmp_path / "config" / "shared.env", JIRA_EMAIL="relative@example.com")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(config_module.ENV_FILE_VARIABLE, "config/shared.env")
+
+    assert resolve_environment()["JIRA_EMAIL"] == "relative@example.com"
+
+
+def test_envrc_file_variable_is_honoured_too(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    write_env(root / ".env", JIRA_EMAIL="checkout@example.com", JIRA_WRITE_PROJECT_KEYS="FC")
+    pinned = tmp_path / "pinned.envrc"
+    pinned.write_text("export JIRA_WRITE_PROJECT_KEYS=FC,ITHD\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", root)
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv(config_module.ENVRC_FILE_VARIABLE, str(pinned))
+
+    merged = resolve_environment()
+
+    assert merged["JIRA_EMAIL"] == "checkout@example.com"
+    assert merged["JIRA_WRITE_PROJECT_KEYS"] == "FC,ITHD"
+
+
+def test_explicit_arguments_win_over_the_variable(tmp_path, monkeypatch) -> None:
+    explicit = write_env(tmp_path / "explicit.env", JIRA_EMAIL="explicit@example.com")
+    pinned = write_env(tmp_path / "pinned.env", JIRA_EMAIL="pinned@example.com")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(config_module.ENV_FILE_VARIABLE, str(pinned))
+
+    merged = resolve_environment(explicit, tmp_path / "missing.envrc")
+
+    assert merged["JIRA_EMAIL"] == "explicit@example.com"
+
+
+def test_env_file_in_the_files_cannot_redirect_the_lookup(tmp_path, monkeypatch) -> None:
+    # The override is a bootstrap value: it decides which file is read, so it
+    # must not be readable from that file.
+    write_env(
+        tmp_path / ".env",
+        JIRA_ENV_FILE=str(tmp_path / "other.env"),
+        JIRA_EMAIL="working-directory@example.com",
+    )
+    write_env(tmp_path / "other.env", JIRA_EMAIL="other@example.com")
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_environment()["JIRA_EMAIL"] == "working-directory@example.com"
+    assert resolve_environment()["JIRA_EMAIL"] == "working-directory@example.com"
+
+
+def test_missing_checkout_root_falls_back_to_the_working_directory(tmp_path, monkeypatch) -> None:
+    write_env(tmp_path / ".env", JIRA_EMAIL="working-directory@example.com")
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", None)
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_environment()["JIRA_EMAIL"] == "working-directory@example.com"
+
+
+def test_load_config_reads_the_checkout_root_from_a_foreign_working_directory(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "checkout"
+    root.mkdir()
+    write_env(
+        root / ".env",
+        JIRA_SITE_URL="https://example.atlassian.net",
+        JIRA_EMAIL="user@example.com",
+        JIRA_API_TOKEN="token",
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setattr(config_module, "PROJECT_ROOT", root)
+    monkeypatch.chdir(elsewhere)
+
+    assert load_config().site_url == "https://example.atlassian.net"

@@ -14,6 +14,27 @@ DEFAULT_CREDENTIAL_SOURCE = "default"
 DEFAULT_ENV_FILE = ".env"
 DEFAULT_ENVRC_FILE = ".envrc"
 
+ENV_FILE_VARIABLE = "JIRA_ENV_FILE"
+ENVRC_FILE_VARIABLE = "JIRA_ENVRC_FILE"
+
+
+def _find_project_root(module_path: Path) -> Path | None:
+    """The checkout root this module was imported from, or None when installed.
+
+    The marker is the pyproject.toml next to the package: one level above the
+    package directory for a flat layout, two for the src layout this project
+    uses. An installed (non-editable) distribution sits in site-packages, where
+    no marker is found and callers keep the working-directory behaviour.
+    """
+    for candidate in module_path.resolve().parent.parents[:2]:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return None
+
+
+# Resolved once: the checkout does not move while the process runs.
+PROJECT_ROOT: Path | None = _find_project_root(Path(__file__))
+
 _PROJECT_CREDENTIAL_PATTERN = re.compile(
     r"JIRA_PROJECT__(?P<project>.+)__(?P<field>EMAIL|API_TOKEN|SITE_URL)"
 )
@@ -226,6 +247,9 @@ class JiraConfig(BaseModel):
 #
 # Both files are re-checked on every resolve, so an edit takes effect on the
 # next tool call instead of at the next process start.
+#
+# Where the two files live is decided by _default_file: $JIRA_ENV_FILE /
+# $JIRA_ENVRC_FILE first, then the working directory, then the checkout root.
 
 _MAX_INCLUDE_DEPTH = 8
 
@@ -383,12 +407,46 @@ def _publish(file_values: _Layer) -> None:
             os.environ[name] = value
 
 
+def _default_file(variable: str, basename: str) -> Path:
+    """Locate .env/.envrc when the caller named no path.
+
+    Highest to lowest precedence:
+
+    1. ``$JIRA_ENV_FILE`` / ``$JIRA_ENVRC_FILE`` — absolute, or relative to the
+       working directory
+    2. the working directory, but only when the file is actually there
+    3. the checkout root the package was imported from
+
+    Step 2 keeps a `jira-agent` run from inside another project reading that
+    project's file. Step 3 is what lets the MCP server start from a foreign
+    working directory: it is launched as `python3 -m jira_agent.mcp_server`
+    with whatever cwd the host process happens to have.
+
+    The override is read from the process environment as it was before this
+    module wrote to it, so a `.env` cannot redirect the lookup that found it.
+    """
+    override = _base_environment().get(variable, "").strip()
+    if override:
+        return Path(override).expanduser()
+    in_working_directory = Path(basename)
+    if PROJECT_ROOT is None or in_working_directory.exists():
+        return in_working_directory
+    return PROJECT_ROOT / basename
+
+
 def resolve_environment(
-    env_file: str | Path = DEFAULT_ENV_FILE,
-    envrc_file: str | Path = DEFAULT_ENVRC_FILE,
+    env_file: str | Path | None = None,
+    envrc_file: str | Path | None = None,
 ) -> dict[str, str]:
-    """Merge process environment, .env and .envrc, re-reading both files."""
+    """Merge process environment, .env and .envrc, re-reading both files.
+
+    Passing a path pins that file; passing None resolves it via `_default_file`.
+    """
     with _resolve_lock:
+        if env_file is None:
+            env_file = _default_file(ENV_FILE_VARIABLE, DEFAULT_ENV_FILE)
+        if envrc_file is None:
+            envrc_file = _default_file(ENVRC_FILE_VARIABLE, DEFAULT_ENVRC_FILE)
         file_values = _file_layer(Path(env_file), as_envrc=False)
         file_values.update(_file_layer(Path(envrc_file), as_envrc=True))
         merged = _base_environment()
@@ -409,7 +467,7 @@ def reset_environment_cache() -> None:
 
 
 def load_config(
-    env_file: str | Path = DEFAULT_ENV_FILE,
-    envrc_file: str | Path = DEFAULT_ENVRC_FILE,
+    env_file: str | Path | None = None,
+    envrc_file: str | Path | None = None,
 ) -> JiraConfig:
     return JiraConfig.model_validate(resolve_environment(env_file, envrc_file))
