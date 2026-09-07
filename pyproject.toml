@@ -38,4 +38,6 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# PLW0129 only, not PL wholesale: the rest of pylint is noisy here, and this single rule catches
+# the class of defect where an assertion is a bare truthy literal and therefore never runs.
+select = ["E", "F", "I", "UP", "B", "PLW0129"]

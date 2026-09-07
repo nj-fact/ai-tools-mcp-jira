@@ -8,11 +8,14 @@ from fastmcp import FastMCP
 from jira_agent.audit import audit_write
 from jira_agent.client import (
     DEFAULT_STORY_POINTS_FIELD,
+    AdfPatchInvariantError,
+    AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     select_transition,
@@ -212,7 +215,13 @@ def jira_create_issue(
     execute: bool = False,
     render_mermaid: bool = True,
 ) -> dict[str, Any]:
-    """Create an issue and automatically embed Mermaid diagrams. Defaults to dry-run."""
+    """Create an issue and automatically embed Mermaid diagrams. Defaults to dry-run.
+
+    description_section is an input filter, not an in-place edit. It selects one heading body out
+    of the Markdown supplied in description or description_file, and that extract becomes the
+    entire description field. To change one section of an issue that already exists, use
+    jira_patch_description_section.
+    """
     try:
         body = (
             read_text_source(description, description_file, section=description_section)
@@ -466,6 +475,11 @@ def jira_edit_issue(
 ) -> dict[str, Any]:
     """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
 
+    description and description_file replace the whole description field. description_section does
+    not narrow that write: it is an input filter that selects one heading body out of the Markdown
+    you supply, and that extract then becomes the entire description, dropping every other section
+    the issue had. To change one section and keep the rest, use jira_patch_description_section.
+
     Omitting fix_versions leaves the issue's fix versions untouched. Pass an empty list to
     clear them, matching the labels convention; pass one or more version names to set them.
     """
@@ -528,6 +542,169 @@ def jira_edit_issue(
                 result={},
             )
             return {"ok": True, "issue": issue_key}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+_PATCH_SUMMARY_KEYS = (
+    "heading",
+    "level",
+    "mode",
+    "start_index",
+    "end_index",
+    "replaced_node_count",
+    "new_node_count",
+    "preserved_before",
+    "preserved_after",
+    "original_node_count",
+    "patched_node_count",
+    "whole_document",
+    "swallowed_headings",
+)
+
+
+def _patch_summary(patch: dict[str, Any]) -> dict[str, Any]:
+    """Return the counts that show at a glance whether a payload patches or replaces."""
+    return {key: patch[key] for key in _PATCH_SUMMARY_KEYS}
+
+
+@mcp.tool
+def jira_patch_description_section(
+    key: str,
+    section: str,
+    content: str | None = None,
+    content_file: str | None = None,
+    mode: str = "replace",
+    include_heading: bool = True,
+    expect_swallowed_headings: list[str] | None = None,
+    allow_wide_rewrite: bool = False,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Rewrite one section of an issue's existing description. Defaults to dry-run.
+
+    Use this whenever only part of a description changes. Unlike jira_edit_issue, this tool reads
+    the current ADF description and rewrites only the matched section. Every top-level node
+    outside that section is carried over unchanged, keeping its taskItem ids and states, tables,
+    panels, and inline marks. New checklist items are numbered past the highest task localId
+    already in the description, so they cannot collide with a preserved one.
+
+    The section is the matched heading plus every following node up to the next heading of the
+    same or a lower level, so "## A" also covers its "### A.1" and stops before "## B". A heading
+    with no such peer below it takes everything after it, whatever sits in front of it, so
+    naming the document title can mean the whole field.
+
+    replace and delete pass two independent controls, and neither substitutes for the other.
+
+    First, arithmetic: if the slice is the whole content list, nothing outside it survives, and
+    that is refused unless you pass allow_wide_rewrite.
+
+    Second, a naming duty. swallowed_headings is the ordered text of every heading inside the
+    slice below the one you named, so it is the list of extra sections the patch removes. Pass
+    expect_swallowed_headings equal to that list, in that order. Absent, short, long, different,
+    or supplied when the slice swallows nothing is a mismatch and is refused, and the refusal
+    prints both lists so you can correct the call. A section is removed only if you named it. A
+    heading with no text is listed and named as <untitled>.
+
+    allow_wide_rewrite covers the first control only; it does not satisfy the naming duty.
+    append and prepend remove nothing, so neither control applies to them. Naming the only
+    section of a description carries no naming duty, because there is no unnamed section to
+    lose, but control 1 still applies to it: an ordinary single-section description starts at
+    index 0, so its slice is the whole content list and the flag is required. It goes through
+    unflagged only when something precedes the section.
+
+    A refusal returns error_type "section_patch_refused" together with swallowed_headings and
+    expect_swallowed_headings as lists, so the correction is data and never a parsed sentence.
+
+    There is no optimistic concurrency. The description is read and then written back whole, so
+    an edit that lands in between is silently reverted. Keep the gap short, and re-read before a
+    second write.
+
+    section names a top-level heading and is matched with leading # characters optional, case
+    insensitively, and whitespace-trimmed. An unknown heading and an ambiguous heading are
+    refused. An ADF level that is missing or out of range is never guessed: on the matched
+    heading it is refused, and below it the section ends there. No level outside the slice is
+    consulted.
+
+    mode is replace (default), append, prepend, or delete. content or content_file carries the new
+    Markdown and is required unless mode is delete. include_heading applies to replace: leave it
+    true and start content with its own heading, or set it false to keep the existing heading node
+    and change only the body below it; passing false with another mode is refused, because append
+    and prepend always keep the heading. A patch that would leave the description with no content
+    at all is refused.
+
+    The dry run reports the matched heading, the replaced index range, and the top-level node
+    counts before and after, so a destructive payload is visible before anything is written.
+    """
+    try:
+        if mode == "delete":
+            if content is not None or content_file is not None:
+                return {
+                    "ok": False,
+                    "message": "Mode delete removes the section and takes no content.",
+                }
+            body = None
+        else:
+            body = read_text_source(content, content_file)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+
+    config = load_config()
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, key)
+            issue = client.get_issue(key, fields=["description"])
+            patch = patch_adf_description_section(
+                (issue.get("fields") or {}).get("description"),
+                section=section,
+                mode=mode,
+                content=body,
+                include_heading=include_heading,
+                expect_swallowed_headings=expect_swallowed_headings,
+                allow_wide_rewrite=allow_wide_rewrite,
+            )
+            summary = _patch_summary(patch)
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    **summary,
+                    "new_nodes": patch["new_nodes"],
+                    "safety": safety,
+                    "write_scope": write_scope_summary(config),
+                    "message": "Pass execute=true to patch this section in Jira.",
+                }
+
+            result = client.edit_issue_adf_description(key, patch["document"])
+            audit_write(
+                config,
+                action="patch_description_section",
+                issue_key=key,
+                payload={
+                    "section": section,
+                    "include_heading": include_heading,
+                    "expect_swallowed_headings": expect_swallowed_headings,
+                    "allow_wide_rewrite": allow_wide_rewrite,
+                    **summary,
+                },
+                result=result,
+            )
+            return {"ok": True, "issue": key, **summary}
+    except AdfSectionPatchRefused as exc:
+        return {
+            "ok": False,
+            "error_type": "section_patch_refused",
+            "message": str(exc),
+            "swallowed_headings": exc.swallowed_headings,
+            "expect_swallowed_headings": exc.named_headings,
+            "whole_document": exc.whole_document,
+        }
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
+    except AdfPatchInvariantError as exc:
+        return {"ok": False, "message": str(exc), "error_type": "patch_invariant"}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

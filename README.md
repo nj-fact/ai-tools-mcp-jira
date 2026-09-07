@@ -150,6 +150,67 @@ Create commands are dry-run by default. They accept Markdown text or a UTF-8 Mar
   --story-points 8
 ```
 
+`--description-section` selects a heading body out of the Markdown you supply, and that extract
+becomes the whole description field. On `edit-issue` that means every other section of the existing
+issue is dropped. To change one section of a live description and keep the rest, use
+`patch-description-section`, which reads the current ADF and rewrites only the matched section:
+
+```bash
+uv run jira-agent patch-description-section FC-385 \
+  --section "Acceptance criteria" \
+  --content-file ./acceptance-criteria.md \
+  --mode replace
+```
+
+A section is the matched heading plus every following top-level node up to the next heading of the
+same or a lower level, so `## A` also covers its `### A.1` and stops before `## B`. An unknown
+heading and an ambiguous heading are refused. An ADF level that is missing or out of range is never
+guessed: on the matched heading it is refused, and below it the section ends there.
+
+`--mode replace` and `--mode delete` pass two independent controls. Neither inspects a node to
+decide whether it counts as content, and neither substitutes for the other.
+
+The first is arithmetic. If the slice is the whole content list, nothing outside it survives, and
+that needs `--allow-wide-rewrite`.
+
+The second is a naming duty. Every heading inside the slice below the one you named is a section
+the patch removes on top of it, and each has to be named with a repeated
+`--expect-swallowed-heading`, in document order. Absent, short, long, differing, or supplied when
+the slice removes nothing is a mismatch and is refused; the refusal prints the exact list in full,
+so the correction is a copy. A heading with no text is printed and named as `<untitled>`.
+`--allow-wide-rewrite` covers the first control only and does not satisfy the naming duty.
+
+```bash
+uv run jira-agent patch-description-section FC-385 \
+  --section "Scope" \
+  --content-file ./scope.md \
+  --expect-swallowed-heading "In scope" \
+  --expect-swallowed-heading "Out of scope"
+```
+
+A section is removed only if you named it. What the tool does not do is judge whether what remains
+is meaningful — there is no such detection. Naming the only section of a description carries no
+naming duty, because there is no unnamed section to lose, but the first control still applies: an
+ordinary single-section description starts at the first node, so its slice is the whole content
+list and `--allow-wide-rewrite` is required. Only a description with something in front of the
+section goes through unflagged. A separate rule still refuses any patch that would leave the
+description with no content at all.
+
+A refusal prints each name as a quoted JSON array, so a heading containing a comma stays one name
+and an empty list is not the word "nothing". The MCP tool returns `swallowed_headings` and
+`expect_swallowed_headings` as lists alongside the message, and the CLI prints the same JSON, so
+the correction is a copy of data rather than a parse of a sentence.
+
+`--mode append` and `--mode prepend` remove nothing, so neither control applies to them, and
+`--no-include-heading` keeps the existing heading node and changes only the body below it. The dry
+run prints the matched heading, the replaced index range, `swallowed_headings`, `whole_document`,
+and the top-level node counts before and after.
+
+Two limitations worth knowing. The command reads the description and writes the field back whole
+with no optimistic concurrency, so an edit that lands between the read and the write is silently
+reverted. And new checklist items are numbered past the highest task localId already present, which
+keeps them unique within the description but does not renumber anything that was already there.
+
 `--story-points` writes to the Jira custom field named by `JIRA_STORY_POINTS_FIELD`, which defaults
 to `customfield_10028`. That numeric id differs per Jira site: look yours up under
 `/rest/api/3/field` and set the variable in `.env` if it is not the default. Whole values are sent as
@@ -174,6 +235,10 @@ integers, halves such as `0.5` are preserved, and `edit-issue` takes the same op
 - Post Drift Reconcile comments with `drift-reconcile-comment`
 - Set or remove `drift-*` labels with `drift-labels`
 - Edit summary, description, labels, parent, priority, and story points with `edit-issue`
+- Rewrite one section of an existing description with `patch-description-section`, which
+  replaces, appends to, prepends to, or deletes the matched section and carries every top-level
+  node outside it over unchanged; any further section the slice removes has to be named with
+  `--expect-swallowed-heading`, and a slice that is the whole field needs `--allow-wide-rewrite`
 - Search assignable users with `user-search` and assign by query with `assign-user`
 - Link issues with `link-issue`
 - Attach local files with `attach`
@@ -234,6 +299,7 @@ Available MCP tools:
 - `jira_assign_issue`
 - `jira_agent_report`
 - `jira_edit_issue`
+- `jira_patch_description_section`
 - `jira_agent_plan_comment`
 - `jira_write_human_brief`
 - `jira_store_factory_contract`

@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import Any
 
 import httpx
 
+from jira_agent import client as client_module
 from jira_agent.client import (
+    AdfPatchInvariantError,
+    AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    adf_heading_text,
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     text_to_adf,
@@ -1096,3 +1102,1651 @@ def test_injected_http_client_serves_the_default_credentials() -> None:
 
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1"
     assert not injected.is_closed
+
+
+def _heading(level: int, text: str) -> dict[str, Any]:
+    return {
+        "type": "heading",
+        "attrs": {"level": level},
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def _paragraph(text: str) -> dict[str, Any]:
+    return {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+
+
+def section_patch_document() -> dict[str, Any]:
+    """A description shaped like the FC-385 issue a section patch must not flatten.
+
+    Top-level indices: 0 h1, 1 paragraph, 2 h2 Observed, 3 paragraph, 4 h2 Scope, 5 h3 In scope,
+    6 bulletList, 7 table, 8 h2 Acceptance criteria, 9 taskList, 10 h2 Test approach, 11 paragraph.
+    """
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(1, "Dry run prevented a description wipe"),
+            _paragraph("Reported after an edit-issue dry run."),
+            _heading(2, "Observed"),
+            _paragraph("The payload carried one bullet list and nothing else."),
+            _heading(2, "Scope"),
+            _heading(3, "In scope"),
+            {
+                "type": "bulletList",
+                "content": [
+                    {"type": "listItem", "content": [_paragraph("Description writes")]},
+                    {"type": "listItem", "content": [_paragraph("Section patches")]},
+                ],
+            },
+            {
+                "type": "table",
+                "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableHeader",
+                                "attrs": {},
+                                "content": [_paragraph("Field")],
+                            },
+                            {
+                                "type": "tableCell",
+                                "attrs": {},
+                                "content": [_paragraph("description")],
+                            },
+                        ],
+                    }
+                ],
+            },
+            _heading(2, "Acceptance criteria"),
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "DONE"},
+                        "content": [{"type": "text", "text": "A dry run shows the node counts"}],
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-2", "state": "TODO"},
+                        "content": [{"type": "text", "text": "A patch never wipes the field"}],
+                    },
+                ],
+            },
+            _heading(2, "Test approach"),
+            _paragraph("Unit tests over the ADF document."),
+        ],
+    }
+
+
+def ambiguous_section_document() -> dict[str, Any]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(2, "Scope"),
+            _paragraph("First."),
+            _heading(2, "Scope"),
+            _paragraph("Second."),
+        ],
+    }
+
+
+def test_patch_replaces_a_middle_section_and_leaves_every_other_node_deep_equal() -> None:
+    original = section_patch_document()
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        original,
+        section="Scope",
+        content="## Scope\n\nOnly the description field.",
+        expect_swallowed_headings=["In scope"],
+    )
+
+    assert (patch["heading"], patch["level"], patch["mode"]) == ("Scope", 2, "replace")
+    assert (patch["start_index"], patch["end_index"]) == (4, 8)
+    assert patch["replaced_node_count"] == 4
+    assert patch["new_node_count"] == 2
+    assert (patch["preserved_before"], patch["preserved_after"]) == (4, 4)
+    assert (patch["original_node_count"], patch["patched_node_count"]) == (12, 10)
+
+    content = patch["document"]["content"]
+    assert content[:4] == reference["content"][:4]
+    assert content[6:] == reference["content"][8:]
+    assert content[4:6] == patch["new_nodes"]
+
+
+def test_patch_accepts_a_heading_written_with_hashes_and_mixed_case() -> None:
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="##   scope  ",
+        content="## Scope\n\nMatched anyway.",
+        expect_swallowed_headings=["In scope"],
+    )
+
+    assert (patch["start_index"], patch["end_index"]) == (4, 8)
+
+
+def test_patch_replaces_the_first_body_section_and_keeps_the_title() -> None:
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Observed",
+        content="## Observed\n\nThe payload dropped five acceptance criteria.",
+    )
+
+    content = patch["document"]["content"]
+    assert (patch["start_index"], patch["end_index"]) == (2, 4)
+    assert content[:2] == reference["content"][:2]
+    assert content[4:] == reference["content"][4:]
+
+
+def test_append_to_a_whole_document_span_needs_no_opt_in_because_it_removes_nothing() -> None:
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Dry run prevented a description wipe",
+        mode="append",
+        content="- One more note",
+    )
+
+    assert patch["whole_document"] is True
+    assert patch["patched_node_count"] == 13
+    assert patch["document"]["content"][:12] == section_patch_document()["content"]
+
+
+def test_patch_replaces_the_last_section() -> None:
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Test approach",
+        content="## Test approach\n\nUnit tests plus one regression test.",
+    )
+
+    content = patch["document"]["content"]
+    assert (patch["start_index"], patch["end_index"]) == (10, 12)
+    assert patch["preserved_after"] == 0
+    assert content[:10] == reference["content"][:10]
+    assert len(content) == 12
+
+
+def test_patch_delete_removes_exactly_the_matched_slice() -> None:
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Scope",
+        mode="delete",
+        expect_swallowed_headings=["In scope"],
+    )
+
+    content = patch["document"]["content"]
+    assert patch["new_nodes"] == []
+    assert (patch["replaced_node_count"], patch["patched_node_count"]) == (4, 8)
+    assert content == reference["content"][:4] + reference["content"][8:]
+    assert not [node for node in content if node.get("type") in {"table", "bulletList"}]
+
+
+def test_patch_append_keeps_the_existing_section_body() -> None:
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Acceptance criteria",
+        mode="append",
+        content="- [ ] The invariant check refuses a wipe",
+    )
+
+    content = patch["document"]["content"]
+    assert (patch["start_index"], patch["end_index"]) == (8, 10)
+    assert content[8] == reference["content"][8]
+    assert content[9] == reference["content"][9]
+    assert content[10]["type"] == "taskList"
+    assert content[11:] == reference["content"][10:]
+
+
+def test_patch_prepend_inserts_below_the_heading_and_keeps_the_body() -> None:
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Acceptance criteria",
+        mode="prepend",
+        content="The criteria below are binding.",
+    )
+
+    content = patch["document"]["content"]
+    assert content[8] == reference["content"][8]
+    assert content[9]["type"] == "paragraph"
+    assert content[10] == reference["content"][9]
+    assert content[11:] == reference["content"][10:]
+
+
+def test_patch_without_include_heading_preserves_the_original_heading_node() -> None:
+    original = section_patch_document()
+    heading_node = original["content"][2]
+
+    patch = patch_adf_description_section(
+        original,
+        section="Observed",
+        include_heading=False,
+        content="The payload reduced the description to one bullet list.",
+    )
+
+    content = patch["document"]["content"]
+    assert content[2] is heading_node
+    assert patch["new_nodes"][0] is heading_node
+    assert content[3]["type"] == "paragraph"
+
+
+def test_patch_covers_a_subsection_and_stops_at_the_next_peer_heading() -> None:
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Scope",
+        content="## Scope\n\nRewritten.",
+        expect_swallowed_headings=["In scope"],
+    )
+
+    replaced_types = [node["type"] for node in section_patch_document()["content"][4:8]]
+    assert replaced_types == ["heading", "heading", "bulletList", "table"]
+    assert patch["document"]["content"][6] == section_patch_document()["content"][8]
+
+
+def test_patch_leaves_task_item_ids_and_states_untouched() -> None:
+    original = section_patch_document()
+    task_list = original["content"][9]
+
+    patch = patch_adf_description_section(
+        original,
+        section="Observed",
+        content="## Observed\n\nRewritten.",
+    )
+
+    patched_task_list = patch["document"]["content"][9]
+    assert patched_task_list is task_list
+    assert [item["attrs"] for item in patched_task_list["content"]] == [
+        {"localId": "task-1", "state": "DONE"},
+        {"localId": "task-2", "state": "TODO"},
+    ]
+
+
+def test_patch_reports_the_existing_headings_when_the_section_is_unknown() -> None:
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Reproduction",
+            content="## Reproduction\n\nRun the dry run.",
+        )
+    except ValueError as exc:
+        assert str(exc) == (
+            "Description section not found: Reproduction. Existing headings: "
+            "Dry run prevented a description wipe, Observed, Scope, In scope, "
+            "Acceptance criteria, Test approach"
+        )
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_patch_refuses_an_ambiguous_heading() -> None:
+    try:
+        patch_adf_description_section(
+            ambiguous_section_document(),
+            section="Scope",
+            content="## Scope\n\nRewritten.",
+        )
+    except ValueError as exc:
+        assert str(exc) == "Description section is ambiguous: Scope"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_patch_refuses_a_missing_or_non_adf_description() -> None:
+    for description, message in [
+        (None, "The issue has no description, so no section can be patched."),
+        (
+            "plain text",
+            "The issue description is not an ADF doc node, so no section can be patched.",
+        ),
+        (
+            {"type": "paragraph", "content": []},
+            "The issue description is not an ADF doc node, so no section can be patched.",
+        ),
+        (
+            {"type": "doc", "version": 1, "content": []},
+            "The issue description is empty, so no section can be patched.",
+        ),
+    ]:
+        try:
+            patch_adf_description_section(description, section="Scope", content="## Scope\n\nX")
+        except ValueError as exc:
+            assert str(exc) == message
+        else:
+            raise AssertionError("Expected ValueError")
+
+
+def test_patch_refuses_content_that_does_not_match_the_mode() -> None:
+    for kwargs, message in [
+        (
+            {"mode": "delete", "content": "## Scope\n\nX"},
+            "Mode delete removes the section and takes no content.",
+        ),
+        ({"mode": "replace"}, "Mode replace requires the Markdown content of the new section."),
+        (
+            {"mode": "append", "content": "   "},
+            "Mode append requires the Markdown content of the new section.",
+        ),
+        (
+            {"mode": "overwrite", "content": "X"},
+            "Unknown section patch mode: overwrite. Use one of replace, append, prepend, delete.",
+        ),
+    ]:
+        try:
+            patch_adf_description_section(section_patch_document(), section="Scope", **kwargs)
+        except ValueError as exc:
+            assert str(exc) == message
+        else:
+            raise AssertionError("Expected ValueError")
+
+
+def test_a_rebuild_that_returns_only_the_new_content_is_refused(monkeypatch) -> None:
+    """The FC-385 defect class: the operation reimplemented as a whole-field replacement."""
+    content = "## Acceptance criteria\n\n- [ ] Only this bullet survives"
+    monkeypatch.setattr(
+        client_module,
+        "_rebuild_with_section",
+        lambda source, *, start, end, new_nodes: text_to_adf(content)["content"],
+    )
+
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Acceptance criteria",
+            content=content,
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == "Slice replacement produced 2 top-level nodes instead of 12."
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_a_rebuild_that_re_renders_an_untouched_node_is_refused(monkeypatch) -> None:
+    """Equal-looking nodes are not enough: an untouched node has to be the same object."""
+
+    def rerender(source, *, start, end, new_nodes):
+        rebuilt = [json.loads(json.dumps(node)) for node in source[:start]]
+        return [*rebuilt, *new_nodes, *source[end:]]
+
+    monkeypatch.setattr(client_module, "_rebuild_with_section", rerender)
+
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Acceptance criteria",
+            content="## Acceptance criteria\n\n- [ ] Rewritten",
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == (
+            "Slice replacement rebuilt one of the 8 top-level node(s) before the slice."
+        )
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_a_rebuild_that_mutates_the_caller_document_is_refused(monkeypatch) -> None:
+    document = section_patch_document()
+
+    def mutate(source, *, start, end, new_nodes):
+        document["content"][start:end] = new_nodes
+        return list(document["content"])
+
+    monkeypatch.setattr(client_module, "_rebuild_with_section", mutate)
+
+    try:
+        patch_adf_description_section(
+            document,
+            section="Acceptance criteria",
+            content="## Acceptance criteria\n\n- [ ] Rewritten",
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == (
+            "Slice replacement changed the document it was given instead of building a new one."
+        )
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_bounds_that_are_not_a_slice_of_the_document_are_refused(monkeypatch) -> None:
+    monkeypatch.setattr(client_module, "_adf_section_bounds", lambda content, section: (8, 4))
+
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Acceptance criteria",
+            content="## Acceptance criteria\n\n- [ ] Rewritten",
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == "Slice bounds 8..4 are not a slice of 12 top-level nodes."
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_a_section_patch_never_reduces_the_description_to_the_new_content_alone() -> None:
+    """FC-385 regression: a section patch must not behave like a whole-field replacement.
+
+    A reimplementation that renders the caller's Markdown into the description field would make
+    the patched document equal to text_to_adf(content) and would drop every other section.
+    """
+    content = "## Acceptance criteria\n\n- [ ] Only this bullet survives"
+    reference = section_patch_document()
+
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Acceptance criteria",
+        content=content,
+    )
+    document = patch["document"]
+
+    assert document != text_to_adf(content)
+    assert document["content"] != text_to_adf(content)["content"]
+    assert len(document["content"]) > len(text_to_adf(content)["content"])
+    for index in list(range(8)) + [10, 11]:
+        assert reference["content"][index] in document["content"]
+    assert patch["preserved_before"] == 8
+    assert patch["preserved_after"] == 2
+
+
+def malformed_heading_document(attrs: dict[str, Any] | None) -> dict[str, Any]:
+    """The reviewer's repro: Observed carries a broken level, Acceptance criteria follows it."""
+    heading: dict[str, Any] = {
+        "type": "heading",
+        "content": [{"type": "text", "text": "Observed"}],
+    }
+    if attrs is not None:
+        heading["attrs"] = attrs
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(1, "Title"),
+            _paragraph("Intro."),
+            heading,
+            _paragraph("The payload replaced the whole field."),
+            _heading(2, "Acceptance criteria"),
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Survive the patch"}],
+                    }
+                ],
+            },
+            _heading(2, "Test approach"),
+            _paragraph("Unit tests."),
+        ],
+    }
+
+
+def test_a_matched_heading_without_a_usable_level_is_refused_not_guessed() -> None:
+    for attrs in [
+        None,
+        {},
+        {"level": None},
+        {"level": "two"},
+        {"level": []},
+        {"level": True},
+        {"level": 0},
+        {"level": 7},
+        {"level": 2.0},
+    ]:
+        try:
+            patch_adf_description_section(
+                malformed_heading_document(attrs),
+                section="Observed",
+                content="## Observed\n\nRewritten.",
+            )
+        except ValueError as exc:
+            assert str(exc) == (
+                "Heading 'Observed' has no usable attrs.level between 1 and 6, so the extent "
+                "of its section cannot be determined."
+            )
+        else:
+            raise AssertionError(f"Expected ValueError for attrs={attrs!r}")
+
+
+def test_an_unreadable_heading_below_the_target_ends_the_section() -> None:
+    document = malformed_heading_document({"level": 2})
+    document["content"][4] = {
+        "type": "heading",
+        "content": [{"type": "text", "text": "Acceptance criteria"}],
+    }
+    reference = [node for node in document["content"]]
+
+    patch = patch_adf_description_section(
+        document,
+        section="Observed",
+        content="## Observed\n\nRewritten.",
+    )
+
+    assert (patch["start_index"], patch["end_index"]) == (2, 4)
+    assert patch["document"]["content"][4:] == reference[4:]
+    assert patch["document"]["content"][5]["type"] == "taskList"
+
+
+def test_replace_with_include_heading_requires_content_that_carries_a_heading() -> None:
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Observed",
+            content="Just a paragraph, and the heading would be gone.",
+        )
+    except ValueError as exc:
+        assert str(exc) == (
+            "Mode replace with include_heading replaces the 'Observed' heading node, so the "
+            "content has to start with its own heading. Add the heading to the content, or "
+            "pass include_heading=false to keep the existing heading and change only the body."
+        )
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_heading_text_reads_emoji_mention_status_and_date_nodes() -> None:
+    heading = {
+        "type": "heading",
+        "attrs": {"level": 2},
+        "content": [
+            {"type": "emoji", "attrs": {"shortName": ":warning:", "text": "⚠"}},
+            {"type": "text", "text": " Blocked for "},
+            {"type": "mention", "attrs": {"id": "557", "text": "@Sabine"}},
+            {"type": "text", "text": " at "},
+            {"type": "status", "attrs": {"text": "In progress", "color": "yellow"}},
+        ],
+    }
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [heading, _paragraph("Body."), _heading(2, "Next"), _paragraph("More.")],
+    }
+
+    patch = patch_adf_description_section(
+        document,
+        section="⚠ blocked for @sabine at in progress",
+        content="## Unblocked\n\nDone.",
+    )
+
+    assert patch["heading"] == "⚠ Blocked for @Sabine at In progress"
+    assert (patch["start_index"], patch["end_index"]) == (0, 2)
+    assert adf_heading_text({"type": "date", "attrs": {"timestamp": "1758067200000"}}) == (
+        "1758067200000"
+    )
+    assert adf_heading_text({"type": "emoji", "attrs": {"shortName": ":smile:"}}) == ":smile:"
+
+
+def test_a_heading_split_across_text_nodes_and_marks_still_matches() -> None:
+    heading = {
+        "type": "heading",
+        "attrs": {"level": 2},
+        "content": [
+            {"type": "text", "text": "Acceptance "},
+            {"type": "text", "text": "criteria", "marks": [{"type": "strong"}]},
+        ],
+    }
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), heading, _paragraph("Body.")],
+    }
+
+    patch = patch_adf_description_section(
+        document,
+        section="acceptance criteria",
+        content="## Acceptance criteria\n\nRewritten.",
+    )
+
+    assert patch["heading"] == "Acceptance criteria"
+    assert (patch["start_index"], patch["end_index"]) == (1, 3)
+
+
+def test_the_patch_keeps_document_metadata_and_leaves_the_input_untouched() -> None:
+    document = section_patch_document()
+    document["version"] = 1
+    snapshot = json.loads(json.dumps(document))
+    nodes = document["content"]
+
+    patch = patch_adf_description_section(
+        document,
+        section="Observed",
+        content="## Observed\n\nRewritten.",
+    )
+
+    assert patch["document"]["type"] == "doc"
+    assert patch["document"]["version"] == 1
+    assert patch["document"] is not document
+    assert patch["document"]["content"] is not nodes
+    assert document == snapshot
+    assert document["content"] is nodes
+
+
+def test_upsert_top_level_section_refuses_an_ambiguous_title() -> None:
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(3, "Screens"),
+            _paragraph("One."),
+            _heading(3, "Screens"),
+            _paragraph("Two."),
+        ],
+    }
+
+    try:
+        upsert_top_level_section(adf, title="Screens", blocks=[_heading(3, "Screens")])
+    except ValueError as exc:
+        assert str(exc) == "Description section is ambiguous: Screens"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_upsert_top_level_section_replaces_the_section_with_its_subsections() -> None:
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(3, "Screens"),
+            _heading(4, "Desktop"),
+            _paragraph("Old."),
+            _heading(3, "Child Issues"),
+            _paragraph("Keep."),
+        ],
+    }
+
+    result = upsert_top_level_section(
+        adf,
+        title="screens",
+        blocks=[_heading(3, "Screens"), _paragraph("New.")],
+    )
+
+    assert result["content"] == [
+        _heading(3, "Screens"),
+        _paragraph("New."),
+        _heading(3, "Child Issues"),
+        _paragraph("Keep."),
+    ]
+
+
+def test_include_heading_false_is_refused_outside_replace_mode() -> None:
+    for mode, extra in [
+        ("append", {"content": "- One more"}),
+        ("prepend", {"content": "Intro."}),
+        ("delete", {}),
+    ]:
+        try:
+            patch_adf_description_section(
+                section_patch_document(),
+                section="Acceptance criteria",
+                mode=mode,
+                include_heading=False,
+                **extra,
+            )
+        except ValueError as exc:
+            assert str(exc) == (
+                f"include_heading applies to mode replace only; mode {mode} always keeps the "
+                "existing heading node."
+            )
+        else:
+            raise AssertionError(f"Expected ValueError for mode {mode}")
+
+
+def preamble_document() -> dict[str, object]:
+    """A description whose title is not node 0, which is how the whole-field guard was bypassed.
+
+    Indices: 0 panel, 1 h1 Title, 2 h2 Observed, 3 paragraph, 4 h2 Acceptance criteria,
+    5 taskList, 6 h2 Test approach, 7 paragraph.
+    """
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "panel",
+                "attrs": {"panelType": "info"},
+                "content": [_paragraph("Read the linked decision first.")],
+            },
+            _heading(1, "Title"),
+            _heading(2, "Observed"),
+            _paragraph("The payload replaced the whole field."),
+            _heading(2, "Acceptance criteria"),
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Survive the patch"}],
+                    }
+                ],
+            },
+            _heading(2, "Test approach"),
+            _paragraph("Unit tests."),
+        ],
+    }
+
+
+def test_a_section_ends_at_the_next_heading_even_with_no_body_between_them() -> None:
+    """Kills the `end = start + 1` off-by-one: 1..2 and 1..3 are both valid slices."""
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), _heading(2, "A"), _heading(2, "B")],
+    }
+    reference = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), _heading(2, "A"), _heading(2, "B")],
+    }
+
+    patch = patch_adf_description_section(
+        document,
+        section="A",
+        content="## A\n\nBody for A.",
+    )
+
+    assert (patch["start_index"], patch["end_index"]) == (1, 2)
+    assert patch["replaced_node_count"] == 1
+    assert patch["document"]["content"][0] == reference["content"][0]
+    assert patch["document"]["content"][-1] == reference["content"][2]
+
+
+def test_consecutive_headings_before_a_body_do_not_widen_the_slice() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), _heading(2, "A"), _heading(2, "B"), _paragraph("B.")],
+    }
+
+    patch = patch_adf_description_section(document, section="A", content="## A\n\nBody for A.")
+
+    assert (patch["start_index"], patch["end_index"]) == (1, 2)
+    assert [node.get("type") for node in patch["document"]["content"]] == [
+        "heading",
+        "heading",
+        "paragraph",
+        "heading",
+        "paragraph",
+    ]
+
+
+def test_a_heading_as_the_last_node_is_a_section_with_an_empty_body() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), _paragraph("Intro."), _heading(2, "A")],
+    }
+
+    patch = patch_adf_description_section(document, section="A", content="## A\n\nBody for A.")
+
+    assert (patch["start_index"], patch["end_index"]) == (2, 3)
+    assert patch["preserved_after"] == 0
+    assert patch["document"]["content"][:2] == document["content"][:2]
+
+
+def test_a_rebuild_that_corrupts_a_node_after_the_section_is_refused(monkeypatch) -> None:
+    def copy_tail(source, *, start, end, new_nodes):
+        return [
+            *source[:start],
+            *new_nodes,
+            *[json.loads(json.dumps(node)) for node in source[end:]],
+        ]
+
+    monkeypatch.setattr(client_module, "_rebuild_with_section", copy_tail)
+
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Observed",
+            content="## Observed\n\nRewritten.",
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == (
+            "Slice replacement rebuilt one of the 8 top-level node(s) after the slice."
+        )
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_a_rebuild_that_reorders_the_new_slice_is_refused(monkeypatch) -> None:
+    def reverse_new(source, *, start, end, new_nodes):
+        return [*source[:start], *reversed(new_nodes), *source[end:]]
+
+    monkeypatch.setattr(client_module, "_rebuild_with_section", reverse_new)
+
+    try:
+        patch_adf_description_section(
+            section_patch_document(),
+            section="Observed",
+            content="## Observed\n\nRewritten.",
+        )
+    except AdfPatchInvariantError as exc:
+        assert str(exc) == "Slice replacement did not place the new nodes in the matched slice."
+    else:
+        raise AssertionError("Expected AdfPatchInvariantError")
+
+
+def test_new_task_items_do_not_reuse_a_local_id_already_in_the_description() -> None:
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section="Observed",
+        content="## Observed\n\n- [ ] First new item\n- [x] Second new item",
+    )
+    local_ids = [
+        node["attrs"]["localId"]
+        for node in _walk(patch["document"])
+        if isinstance(node.get("attrs"), dict) and "localId" in node["attrs"]
+    ]
+
+    assert len(local_ids) == len(set(local_ids))
+    assert "task-1" in local_ids and "task-2" in local_ids
+    assert {"task-3", "task-4", "task-list-3"} <= set(local_ids)
+
+
+def test_the_task_id_seed_looks_at_the_whole_document_not_only_the_top_level() -> None:
+    nested = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(2, "Observed"),
+            {
+                "type": "panel",
+                "attrs": {"panelType": "note"},
+                "content": [
+                    {
+                        "type": "taskList",
+                        "attrs": {"localId": "task-list-9"},
+                        "content": [
+                            {
+                                "type": "taskItem",
+                                "attrs": {"localId": "task-9", "state": "TODO"},
+                                "content": [{"type": "text", "text": "Nested"}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            _heading(2, "Acceptance criteria"),
+            _paragraph("Body."),
+        ],
+    }
+
+    patch = patch_adf_description_section(
+        nested,
+        section="Acceptance criteria",
+        content="## Acceptance criteria\n\n- [ ] New item",
+    )
+    local_ids = [
+        node["attrs"]["localId"]
+        for node in _walk(patch["document"])
+        if isinstance(node.get("attrs"), dict) and "localId" in node["attrs"]
+    ]
+
+    assert len(local_ids) == len(set(local_ids))
+    assert {"task-10", "task-list-10"} <= set(local_ids)
+
+
+def test_upsert_top_level_section_keeps_untouched_nodes_as_the_same_objects() -> None:
+    keep_before = _paragraph("Before.")
+    keep_after = _heading(3, "Child Issues")
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [keep_before, _heading(3, "Screens"), _paragraph("Old."), keep_after],
+    }
+
+    result = upsert_top_level_section(
+        adf,
+        title="Screens",
+        blocks=[_heading(3, "Screens"), _paragraph("New.")],
+    )
+
+    assert result["content"][0] is keep_before
+    assert result["content"][3] is keep_after
+    assert adf["content"][1]["type"] == "heading"
+    assert len(adf["content"]) == 4
+
+
+def test_upsert_top_level_section_appends_into_an_empty_document() -> None:
+    blocks = [_heading(3, "Screens"), _paragraph("New.")]
+
+    result = upsert_top_level_section({"type": "doc", "version": 1}, title="Screens", blocks=blocks)
+
+    assert result["content"] == blocks
+
+
+def _walk(node: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict):
+            continue
+        found.append(current)
+        children = current.get("content")
+        if isinstance(children, list):
+            stack.extend(children)
+    return found
+
+
+EMPTY_HEADING = {"type": "heading", "attrs": {"level": 1}, "content": []}
+BLANK_HEADING = {
+    "type": "heading",
+    "attrs": {"level": 1},
+    "content": [{"type": "text", "text": "   "}],
+}
+UNLEVELLED_HEADING = {"type": "heading", "content": [{"type": "text", "text": "Stray"}]}
+
+
+def _stray_heading(level: object) -> dict[str, Any]:
+    return {
+        "type": "heading",
+        "attrs": {"level": level},
+        "content": [{"type": "text", "text": "Stray"}],
+    }
+
+
+def _titled_document(prefix: list[dict[str, Any]], suffix: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [*prefix, *section_patch_document()["content"], *suffix],
+    }
+
+
+def _panel() -> dict[str, Any]:
+    return {
+        "type": "panel",
+        "attrs": {"panelType": "info"},
+        "content": [_paragraph("Read the linked decision first.")],
+    }
+
+
+def _padded_title_document(padding: list[dict[str, Any]]) -> dict[str, Any]:
+    """A titled description behind `padding`. Round 4 used padding to switch the guard off."""
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            *padding,
+            _heading(1, "Title"),
+            _heading(2, "A"),
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "DONE"},
+                        "content": [{"type": "text", "text": "Survive"}],
+                    }
+                ],
+            },
+            _heading(2, "B"),
+            _paragraph("z"),
+        ],
+    }
+
+
+EMPTY_HEADING = {"type": "heading", "attrs": {"level": 1}, "content": []}
+BLANK_HEADING = {
+    "type": "heading",
+    "attrs": {"level": 1},
+    "content": [{"type": "text", "text": "   "}],
+}
+UNLEVELLED_HEADING = {"type": "heading", "content": [{"type": "text", "text": "Stray"}]}
+TITLE = "Dry run prevented a description wipe"
+TITLE_SUBSECTIONS = ["Observed", "Scope", "In scope", "Acceptance criteria", "Test approach"]
+
+
+def _panel() -> dict[str, Any]:
+    return {
+        "type": "panel",
+        "attrs": {"panelType": "info"},
+        "content": [_paragraph("Read the linked decision first.")],
+    }
+
+
+def _stray_heading(level: object) -> dict[str, Any]:
+    return {
+        "type": "heading",
+        "attrs": {"level": level},
+        "content": [{"type": "text", "text": "Stray"}],
+    }
+
+
+def _titled_document(prefix: list[Any], suffix: list[Any]) -> dict[str, Any]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [*prefix, *section_patch_document()["content"], *suffix],
+    }
+
+
+def _refuse(document: dict[str, Any], section: str, **kwargs: Any) -> str:
+    kwargs.setdefault("mode", "delete")
+    try:
+        patch_adf_description_section(document, section=section, **kwargs)
+    except ValueError as exc:
+        return str(exc)
+    raise AssertionError(f"Expected ValueError patching {section!r}")
+
+
+# --- control 1: nothing outside the slice would survive ----------------------
+
+
+def test_control_1_refuses_a_slice_that_is_the_whole_content_list() -> None:
+    for mode, extra in [("delete", {}), ("replace", {"content": "# T\n\nNew."})]:
+        message = _refuse(section_patch_document(), TITLE, mode=mode, **extra)
+        assert "Nothing outside the slice would survive" in message
+        assert "covers all 12 top-level nodes" in message
+        assert "allow_wide_rewrite" in message
+
+
+def test_control_1_is_pure_arithmetic_and_inspects_no_node() -> None:
+    """Round 2's panel and round 3's content-free heading move the bounds, nothing else."""
+    for prefix, suffix in [([_panel()], []), ([], [EMPTY_HEADING]), ([UNLEVELLED_HEADING], [])]:
+        patch = patch_adf_description_section(
+            _titled_document(prefix, suffix),
+            section=TITLE,
+            mode="delete",
+            expect_swallowed_headings=TITLE_SUBSECTIONS,
+        )
+        assert patch["whole_document"] is False
+
+
+def test_control_1_makes_replace_no_more_permissive_than_delete() -> None:
+    """Round 6 F2: replace used to rewrite a 21-node field to one node without a flag."""
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(1, "Title"), *[_paragraph(str(index)) for index in range(20)]],
+    }
+    for mode, extra in [("replace", {"content": "# Title\n\nNew."}), ("delete", {})]:
+        assert "Nothing outside the slice would survive" in _refuse(
+            document, "Title", mode=mode, **extra
+        )
+
+    patch = patch_adf_description_section(
+        document, section="Title", content="# Title\n\nNew.", allow_wide_rewrite=True
+    )
+    assert patch["patched_node_count"] == 2
+
+
+# --- control 2: the naming duty ----------------------------------------------
+
+
+def test_control_2_refuses_a_slice_whose_swallowed_sections_were_not_named() -> None:
+    message = _refuse(_titled_document([_panel()], []), TITLE)
+    assert "Swallowed-section mismatch" in message
+    assert (
+        'the slice removes ["Observed", "Scope", "In scope", "Acceptance criteria", '
+        '"Test approach"]'
+    ) in message
+    assert "the call named []" in message
+    assert "Nothing outside the slice would survive" not in message
+
+
+def test_control_2_accepts_the_exact_ordered_list_the_refusal_printed() -> None:
+    patch = patch_adf_description_section(
+        _titled_document([_panel()], []),
+        section=TITLE,
+        mode="delete",
+        expect_swallowed_headings=TITLE_SUBSECTIONS,
+    )
+
+    assert patch["swallowed_headings"] == TITLE_SUBSECTIONS
+    assert patch["document"]["content"] == [_panel()]
+
+
+def test_control_2_compares_an_ordered_list_and_not_a_set() -> None:
+    swapped = [
+        "Observed",
+        "Scope",
+        "Acceptance criteria",
+        "In scope",
+        "Test approach",
+    ]
+    message = _refuse(_titled_document([_panel()], []), TITLE, expect_swallowed_headings=swapped)
+    assert "Swallowed-section mismatch" in message
+
+
+def test_control_2_refuses_a_short_a_long_and_a_spurious_expectation() -> None:
+    document = _titled_document([_panel()], [])
+    for named in [TITLE_SUBSECTIONS[:2], [*TITLE_SUBSECTIONS, "Extra"]]:
+        assert "Swallowed-section mismatch" in _refuse(
+            document, TITLE, expect_swallowed_headings=named
+        )
+
+    # A caller with a wrong model of the document must not proceed either.
+    assert "Swallowed-section mismatch" in _refuse(
+        section_patch_document(), "Test approach", expect_swallowed_headings=["Nope"]
+    )
+
+
+def test_control_2_names_a_heading_that_has_no_text() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(1, "Title"),
+            _heading(2, "A"),
+            {"type": "heading", "attrs": {"level": 3}, "content": []},
+            {"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": " "}]},
+            _paragraph("body"),
+            _heading(1, "Notes"),
+        ],
+    }
+
+    message = _refuse(document, "A")
+    assert 'the slice removes ["<untitled>", "<untitled>"]' in message
+
+    patch = patch_adf_description_section(
+        document,
+        section="A",
+        mode="delete",
+        expect_swallowed_headings=["<untitled>", "<untitled>"],
+    )
+    assert patch["swallowed_headings"] == ["<untitled>", "<untitled>"]
+
+
+def test_control_2_handles_duplicate_heading_text_inside_one_slice() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(1, "Title"),
+            _heading(2, "A"),
+            _heading(3, "Detail"),
+            _paragraph("one"),
+            _heading(3, "Detail"),
+            _paragraph("two"),
+            _heading(2, "B"),
+        ],
+    }
+
+    assert "Swallowed-section mismatch" in _refuse(
+        document, "A", expect_swallowed_headings=["Detail"]
+    )
+    patch = patch_adf_description_section(
+        document, section="A", mode="delete", expect_swallowed_headings=["Detail", "Detail"]
+    )
+    assert patch["swallowed_headings"] == ["Detail", "Detail"]
+
+
+def test_control_2_prints_the_whole_list_and_never_truncates_it() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(1, "Title"),
+            *[_heading(2, f"S{index}") for index in range(8)],
+            _paragraph("tail"),
+            _heading(1, "Notes"),
+        ],
+    }
+
+    message = _refuse(document, "Title")
+    assert '"S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7"' in message
+    assert "more" not in message
+
+
+# --- the two controls are independent ----------------------------------------
+
+
+def test_allow_wide_rewrite_does_not_satisfy_the_naming_duty() -> None:
+    message = _refuse(section_patch_document(), TITLE, allow_wide_rewrite=True)
+
+    assert "Swallowed-section mismatch" in message
+    assert "Nothing outside the slice would survive" not in message
+
+
+def test_naming_does_not_satisfy_the_whole_content_control() -> None:
+    message = _refuse(section_patch_document(), TITLE, expect_swallowed_headings=TITLE_SUBSECTIONS)
+
+    assert "Nothing outside the slice would survive" in message
+    assert "Swallowed-section mismatch" not in message
+
+
+def test_a_slice_that_trips_both_controls_reports_both() -> None:
+    message = _refuse(section_patch_document(), TITLE)
+
+    assert "Nothing outside the slice would survive" in message
+    assert "Swallowed-section mismatch" in message
+
+
+def test_both_controls_together_let_the_patch_through() -> None:
+    patch = patch_adf_description_section(
+        section_patch_document(),
+        section=TITLE,
+        content="# Title\n\nNew.",
+        expect_swallowed_headings=TITLE_SUBSECTIONS,
+        allow_wide_rewrite=True,
+    )
+
+    assert patch["whole_document"] is True
+    assert patch["patched_node_count"] == 2
+
+
+# --- neither control applies to append or prepend ----------------------------
+
+
+def test_append_and_prepend_need_neither_control_because_they_remove_nothing() -> None:
+    reference = section_patch_document()
+    for mode in ("append", "prepend"):
+        patch = patch_adf_description_section(
+            section_patch_document(), section=TITLE, mode=mode, content="- One more note"
+        )
+        assert patch["whole_document"] is True
+        assert patch["swallowed_headings"] == TITLE_SUBSECTIONS
+        assert patch["patched_node_count"] == 13
+        assert all(node in patch["document"]["content"] for node in reference["content"])
+
+
+def _controls_that_fire(message: str) -> set[str]:
+    fired = set()
+    if "Nothing outside the slice would survive" in message:
+        fired.add("whole-content")
+    if "Swallowed-section mismatch" in message:
+        fired.add("naming")
+    return fired
+
+
+def test_every_historical_defect_shape_refuses_and_names_which_control_fired() -> None:
+    """Rounds 1 to 6. A shape refused by the wrong control would be a latent defect."""
+    padded = lambda pad: {  # noqa: E731 - a table of shapes reads better than six defs
+        "type": "doc",
+        "version": 1,
+        "content": [
+            *pad,
+            _heading(1, "Title"),
+            _heading(2, "A"),
+            _paragraph("x"),
+            _heading(2, "B"),
+            _paragraph("z"),
+        ],
+    }
+    shapes = [
+        # round 1: the title is node 0, so the slice is the whole content list.
+        ("r1 title at index 0", section_patch_document(), TITLE, {"whole-content", "naming"}),
+        # round 2: a leading panel moves the bounds; only the naming duty applies.
+        ("r2 panel preamble", _titled_document([_panel()], []), TITLE, {"naming"}),
+        # round 3: content-free and malformed headings outside the slice.
+        ("r3 empty heading appended", _titled_document([], [EMPTY_HEADING]), TITLE, {"naming"}),
+        ("r3 empty heading prepended", _titled_document([EMPTY_HEADING], []), TITLE, {"naming"}),
+        ("r3 blank-text heading", _titled_document([], [BLANK_HEADING]), TITLE, {"naming"}),
+        (
+            "r3 real heading appended",
+            _titled_document([], [_heading(1, "Appendix")]),
+            TITLE,
+            {"naming"},
+        ),
+        ("r3 heading with no level", _titled_document([UNLEVELLED_HEADING], []), TITLE, {"naming"}),
+        ("r3 heading at level 0", _titled_document([_stray_heading(0)], []), TITLE, {"naming"}),
+        ("r3 heading at level 9", _titled_document([_stray_heading(9)], []), TITLE, {"naming"}),
+        ("r3 heading at level '1'", _titled_document([_stray_heading("1")], []), TITLE, {"naming"}),
+        # round 4: padding outside the slice used to buy a wipe through the size term.
+        (
+            "r4 panel and four paragraphs",
+            padded([_panel(), *[_paragraph(c) for c in "abcd"]]),
+            "Title",
+            {"naming"},
+        ),
+        ("r4 five rule nodes", padded([{"type": "rule"} for _ in range(5)]), "Title", {"naming"}),
+        (
+            "r4 five empty paragraphs",
+            padded([{"type": "paragraph"} for _ in range(5)]),
+            "Title",
+            {"naming"},
+        ),
+        # round 5: an unreadable level outside the slice used to lower the rank bar.
+        (
+            "r5 degenerate heading outside",
+            padded([UNLEVELLED_HEADING, *[_paragraph(str(i)) for i in range(5)]]),
+            "Title",
+            {"naming"},
+        ),
+    ]
+    for name, document, section, expected in shapes:
+        fired = _controls_that_fire(_refuse(document, section))
+        assert fired == expected, f"{name}: {fired} fired, expected {expected}"
+
+
+def test_round_6_f1_a_content_free_heading_no_longer_buys_a_subsection_wipe() -> None:
+    """F1: one empty h1 outside the slice set the rank bar to 1 and allowed 40 nodes to 22."""
+    body = [
+        node
+        for index in range(6)
+        for node in (_heading(3, f"D{index}"), _paragraph("x"), {"type": "rule"})
+    ]
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            EMPTY_HEADING,
+            *[{"type": "paragraph"} for _ in range(20)],
+            _heading(2, "Scope"),
+            *body,
+        ],
+    }
+    names = [f"D{index}" for index in range(6)]
+
+    assert _controls_that_fire(
+        _refuse(document, "Scope", mode="replace", content="## Scope\n\nnew")
+    ) == {"naming"}
+
+    patch = patch_adf_description_section(
+        document,
+        section="Scope",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=names,
+    )
+    assert patch["swallowed_headings"] == names
+    assert patch["document"]["content"][0] is document["content"][0]
+
+
+def test_round_6_f3_a_trailing_content_free_heading_no_longer_flips_the_decision() -> None:
+    siblings = lambda suffix: {  # noqa: E731
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(2, "Observed"),
+            _paragraph("a"),
+            _heading(2, "Scope"),
+            _paragraph("b"),
+            _heading(3, "In scope"),
+            _paragraph("c"),
+            _heading(2, "AC"),
+            _paragraph("d"),
+            *suffix,
+        ],
+    }
+    for suffix in ([], [EMPTY_HEADING]):
+        assert _controls_that_fire(
+            _refuse(siblings(suffix), "Scope", mode="replace", content="## Scope\n\nnew")
+        ) == {"naming"}
+
+    patch = patch_adf_description_section(
+        siblings([EMPTY_HEADING]),
+        section="Scope",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=["In scope"],
+    )
+    assert patch["patched_node_count"] == 7
+
+
+def test_round_6_f4_the_trailing_heading_witness() -> None:
+    """As stated the slice swallows nothing, so it is allowed and always was correct.
+
+    The witness that carried the defect is the same shape with A owning a subsection: a trailing
+    h1 used to quiet the rank term there. The naming duty catches it whatever sits around it.
+    """
+    as_stated = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(2, "A"),
+            _paragraph("a"),
+            _heading(2, "B"),
+            _paragraph("b"),
+            _heading(1, "Notes"),
+        ],
+    }
+    patch = patch_adf_description_section(as_stated, section="A", content="## A\n\nnew")
+    assert patch["swallowed_headings"] == []
+    assert patch["document"]["content"][2:] == as_stated["content"][2:]
+
+    carrying = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(2, "A"),
+            _paragraph("a"),
+            _heading(3, "A1"),
+            _paragraph("x"),
+            _heading(2, "B"),
+            *[_paragraph(str(index)) for index in range(4)],
+            _heading(1, "Notes"),
+        ],
+    }
+    assert _controls_that_fire(_refuse(carrying, "A", mode="replace", content="## A\n\nnew")) == {
+        "naming"
+    }
+
+
+def test_the_number_of_surviving_nodes_does_not_enter_the_decision() -> None:
+    """Rounds 4 and 6 both turned on counting survivors. Padding must change nothing now."""
+
+    def document(padding: int) -> dict[str, Any]:
+        return {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                *[{"type": "paragraph"} for _ in range(padding)],
+                _heading(2, "A"),
+                _heading(3, "A1"),
+                _paragraph("x"),
+            ],
+        }
+
+    for padding in (1, 5, 40):
+        assert _controls_that_fire(_refuse(document(padding), "A")) == {"naming"}
+        patch = patch_adf_description_section(
+            document(padding), section="A", mode="delete", expect_swallowed_headings=["A1"]
+        )
+        assert patch["patched_node_count"] == padding
+
+
+def test_the_empty_description_rule_still_applies_behind_the_flag() -> None:
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_heading(2, "Only section"), _paragraph("Body.")],
+    }
+
+    assert _controls_that_fire(_refuse(document, "Only section")) == {"whole-content"}
+
+    try:
+        patch_adf_description_section(
+            document, section="Only section", mode="delete", allow_wide_rewrite=True
+        )
+    except ValueError as exc:
+        assert "would leave the description with no content" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_naming_the_only_section_of_a_description_is_not_refused() -> None:
+    """Documented residual: nothing unnamed can be lost, so neither control applies."""
+    document = {
+        "type": "doc",
+        "version": 1,
+        "content": [_panel(), _heading(1, "Title"), *[_paragraph(str(i)) for i in range(50)]],
+    }
+
+    patch = patch_adf_description_section(document, section="Title", mode="delete")
+
+    assert patch["swallowed_headings"] == []
+    assert patch["whole_document"] is False
+    assert patch["document"]["content"] == [document["content"][0]]
+
+
+def test_the_image_gallery_splice_is_untouched_by_the_two_controls() -> None:
+    """It reaches find_adf_section_bounds only, so it carries no naming duty."""
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _heading(3, "Screens"),
+            _heading(4, "Desktop"),
+            _paragraph("Old."),
+            _heading(3, "Child Issues"),
+        ],
+    }
+
+    result = upsert_top_level_section(
+        adf, title="Screens", blocks=[_heading(3, "Screens"), _paragraph("New.")]
+    )
+
+    assert result["content"] == [
+        _heading(3, "Screens"),
+        _paragraph("New."),
+        _heading(3, "Child Issues"),
+    ]
+
+
+def _copy_back(message: str) -> list[str]:
+    """Recover the swallowed names from a refusal the way a caller would: parse the array."""
+    start = message.index("the slice removes ") + len("the slice removes ")
+    end = message.index("] on top of", start) + 1
+    return json.loads(message[start:end])
+
+
+def _awkward_document(name: str) -> dict[str, Any]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _paragraph("Preamble so control 1 stays out of this."),
+            _heading(2, "Scope"),
+            _heading(3, name),
+            _paragraph("body"),
+            _heading(2, "Next"),
+        ],
+    }
+
+
+def test_the_names_a_refusal_prints_authorise_the_patch_when_copied_back() -> None:
+    """The naming duty is only a control if the refusal itself carries the correction."""
+    for name in [
+        "In scope, Out of scope",
+        "nothing",
+        "@Ada, Lovelace",
+        "In  scope",
+        '"quoted"',
+        "<untitled>",
+    ]:
+        document = _awkward_document(name)
+        reference = _awkward_document(name)
+        message = _refuse(document, "Scope", mode="replace", content="## Scope\n\nnew")
+        recovered = _copy_back(message)
+
+        assert recovered == [name], f"{name!r} came back as {recovered!r}"
+
+        patch = patch_adf_description_section(
+            document,
+            section="Scope",
+            content="## Scope\n\nnew",
+            expect_swallowed_headings=recovered,
+        )
+        assert patch["swallowed_headings"] == [name]
+        assert patch["document"]["content"][0] == reference["content"][0]
+        assert patch["document"]["content"][-1] == reference["content"][-1]
+
+
+def test_a_comma_in_a_name_is_one_name_and_not_two() -> None:
+    document = _awkward_document("In scope, Out of scope")
+
+    assert "Swallowed-section mismatch" in _refuse(
+        document,
+        "Scope",
+        mode="replace",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=["In scope", "Out of scope"],
+    )
+
+
+def test_an_empty_list_is_not_the_word_nothing() -> None:
+    """Two opposite situations must not produce the same sentence."""
+    swallows_nothing = _refuse(
+        _awkward_document("Detail"),
+        "Next",
+        mode="replace",
+        content="## Next\n\nnew",
+        expect_swallowed_headings=["nothing"],
+    )
+    swallows_a_section_called_nothing = _refuse(
+        _awkward_document("nothing"), "Scope", mode="replace", content="## Scope\n\nnew"
+    )
+
+    assert "the slice removes [] on top of" in swallows_nothing
+    assert 'the call named ["nothing"]' in swallows_nothing
+    assert 'the slice removes ["nothing"] on top of' in swallows_a_section_called_nothing
+    assert "the call named []" in swallows_a_section_called_nothing
+    assert swallows_nothing != swallows_a_section_called_nothing
+
+
+def test_names_differing_only_by_case_do_not_match() -> None:
+    assert "Swallowed-section mismatch" in _refuse(
+        _awkward_document("In scope"),
+        "Scope",
+        mode="replace",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=["in scope"],
+    )
+
+
+def test_internal_whitespace_is_significant_and_surrounding_whitespace_is_not() -> None:
+    document = _awkward_document("In  scope")
+
+    assert "Swallowed-section mismatch" in _refuse(
+        document,
+        "Scope",
+        mode="replace",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=["In scope"],
+    )
+    patch = patch_adf_description_section(
+        document,
+        section="Scope",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=["  In  scope  "],
+    )
+    assert patch["swallowed_headings"] == ["In  scope"]
+
+
+def test_a_refusal_carries_the_lists_as_data() -> None:
+    try:
+        patch_adf_description_section(
+            _awkward_document("In scope, Out of scope"),
+            section="Scope",
+            content="## Scope\n\nnew",
+            expect_swallowed_headings=["wrong"],
+        )
+    except AdfSectionPatchRefused as exc:
+        assert exc.swallowed_headings == ["In scope, Out of scope"]
+        assert exc.named_headings == ["wrong"]
+        assert exc.whole_document is False
+        assert isinstance(exc, ValueError)
+    else:
+        raise AssertionError("Expected AdfSectionPatchRefused")
+
+
+def test_a_non_ascii_name_is_printed_readably_and_still_copies_back() -> None:
+    document = _awkward_document("Prüfung ⚠ Sicherheit")
+
+    message = _refuse(document, "Scope", mode="replace", content="## Scope\n\nnew")
+
+    assert 'the slice removes ["Prüfung ⚠ Sicherheit"]' in message
+    assert "\\u" not in message
+    patch = patch_adf_description_section(
+        document,
+        section="Scope",
+        content="## Scope\n\nnew",
+        expect_swallowed_headings=_copy_back(message),
+    )
+    assert patch["swallowed_headings"] == ["Prüfung ⚠ Sicherheit"]

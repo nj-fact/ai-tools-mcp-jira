@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typer.testing import CliRunner
 
 from jira_agent import cli
@@ -81,3 +83,208 @@ def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -
     assert result.exit_code == 0, result.output
     assert "Embedded 1 Mermaid diagram(s)." in result.output
     assert calls["embed"]["issue_key"] == "FC-123"
+
+
+def _patch_description() -> dict[str, object]:
+    """Indices: 0 h1, 1 h2 Observed, 2 paragraph, 3 h2 Acceptance criteria, 4 taskList."""
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 1},
+                "content": [{"type": "text", "text": "Description wipe"}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Observed"}],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "The payload replaced the whole field."}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Acceptance criteria"}],
+            },
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Keep every other section"}],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _install_patch_cli(monkeypatch, tmp_path) -> list[dict[str, object]]:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    writes: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {
+                "key": issue_key,
+                "fields": {"project": {"key": "FC"}, "description": _patch_description()},
+            }
+
+        def edit_issue_adf_description(self, issue_key, description):
+            writes.append({"issue": issue_key, "description": description})
+            return {"updated": True}
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+    return writes
+
+
+def test_patch_description_section_cli_dry_run_shows_counts_and_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Acceptance criteria",
+            "--content",
+            "## Acceptance criteria\n\n- [ ] Only the section changes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would patch one description section" in result.output
+    assert '"preserved_before": 3' in result.output
+    assert '"original_node_count": 5' in result.output
+    assert writes == []
+
+
+def test_patch_description_section_cli_execute_keeps_the_untouched_nodes(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nThe dry run showed a one-bullet payload.",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = writes[0]["description"]
+    assert written["content"][3:] == _patch_description()["content"][3:]
+    assert written["content"][0] == _patch_description()["content"][0]
+
+
+def test_patch_description_section_cli_refuses_a_wide_rewrite(tmp_path, monkeypatch) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet survives",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Swallowed-section mismatch" in result.output
+    assert "allow_wide_rewrite" in result.output
+    assert writes == []
+
+
+def test_patch_description_section_cli_allows_a_wide_rewrite_on_request(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet survives",
+            "--expect-swallowed-heading",
+            "Observed",
+            "--expect-swallowed-heading",
+            "Acceptance criteria",
+            "--allow-wide-rewrite",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(writes[0]["description"]["content"]) == 2
+
+
+def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet",
+            "--allow-wide-rewrite",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output[result.output.index("{") :])
+    assert payload == {
+        "error_type": "section_patch_refused",
+        "swallowed_headings": ["Observed", "Acceptance criteria"],
+        "expect_swallowed_headings": [],
+        "whole_document": True,
+    }
+    assert writes == []

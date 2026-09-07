@@ -11,11 +11,14 @@ from rich.table import Table
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    AdfPatchInvariantError,
+    AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     select_transition,
@@ -736,7 +739,11 @@ def create_issue(
         str | None,
         typer.Option(
             "--description-section",
-            help="Optional heading whose body is selected from the description source.",
+            help=(
+                "Select one heading body from the supplied Markdown. The extract becomes the "
+                "whole description field; use patch-description-section to edit one section "
+                "of an existing description in place."
+            ),
         ),
     ] = None,
     labels: Annotated[
@@ -1421,7 +1428,11 @@ def edit_issue(
         str | None,
         typer.Option(
             "--description-section",
-            help="Optional heading whose body is selected from the description source.",
+            help=(
+                "Select one heading body from the supplied Markdown. The extract becomes the "
+                "whole description field; use patch-description-section to edit one section "
+                "of an existing description in place."
+            ),
         ),
     ] = None,
     labels: Annotated[
@@ -1514,6 +1525,171 @@ def edit_issue(
         return
 
     console.print(f"Edited {issue_key}.")
+
+
+@app.command("patch-description-section")
+def patch_description_section(
+    key: Annotated[str, typer.Argument(help="Jira issue key.")],
+    section: Annotated[
+        str,
+        typer.Option("--section", help="Heading of the section to patch in the live description."),
+    ],
+    content: Annotated[
+        str | None,
+        typer.Option("--content", help="Markdown for the new section."),
+    ] = None,
+    content_file: Annotated[
+        Path | None,
+        typer.Option("--content-file", help="UTF-8 Markdown file for the new section."),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="replace, append, prepend, or delete."),
+    ] = "replace",
+    include_heading: Annotated[
+        bool,
+        typer.Option(
+            "--include-heading/--no-include-heading",
+            help=(
+                "With --mode replace only: the content carries its own heading, or keep the "
+                "existing heading node and change only the body."
+            ),
+        ),
+    ] = True,
+    expect_swallowed_heading: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--expect-swallowed-heading",
+            help="Name one section the slice removes besides the one named. Repeat, in order.",
+        ),
+    ] = None,
+    allow_wide_rewrite: Annotated[
+        bool,
+        typer.Option(
+            "--allow-wide-rewrite",
+            help="Permit a slice that is the whole description. It grants nothing else.",
+        ),
+    ] = False,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually patch the section in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Rewrite one section of an issue's existing description. Defaults to dry-run.
+
+    Only the matched section changes; every top-level node outside it is carried over unchanged.
+    A heading with no peer of the same or a lower level below it takes everything after it,
+    whatever sits in front of it, so naming the document title can mean the whole field.
+    `--mode replace` and `--mode delete` pass two independent controls. A slice that is the
+    whole content list needs `--allow-wide-rewrite`. Every heading inside the slice below the
+    one you named has to be named too, with a repeated `--expect-swallowed-heading` in document
+    order; the refusal prints the exact list. `--allow-wide-rewrite` does not satisfy the naming
+    duty. There is no optimistic concurrency: the description is
+    read and written back whole, so an edit that lands in between is silently reverted. Use this
+    instead of `edit-issue --description-section`, which always replaces the whole field.
+    """
+    config = _config()
+    try:
+        if mode == "delete":
+            if content is not None or content_file is not None:
+                error_console.print(
+                    "[red]Patch error:[/red] Mode delete removes the section and takes no content."
+                )
+                raise typer.Exit(2)
+            body = None
+        else:
+            body = read_text_source(content, content_file)
+    except (OSError, ValueError) as exc:
+        error_console.print(f"[red]Patch error:[/red] {exc}")
+        raise typer.Exit(2) from exc
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, key)
+            issue = client.get_issue(key, fields=["description"])
+            patch = patch_adf_description_section(
+                (issue.get("fields") or {}).get("description"),
+                section=section,
+                mode=mode,
+                content=body,
+                include_heading=include_heading,
+                expect_swallowed_headings=expect_swallowed_heading,
+                allow_wide_rewrite=allow_wide_rewrite,
+            )
+        except AdfSectionPatchRefused as exc:
+            error_console.print(f"[red]Patch refused:[/red] {exc}")
+            _print_json(
+                {
+                    "error_type": "section_patch_refused",
+                    "swallowed_headings": exc.swallowed_headings,
+                    "expect_swallowed_headings": exc.named_headings,
+                    "whole_document": exc.whole_document,
+                }
+            )
+            raise typer.Exit(2) from exc
+        except (OSError, ValueError) as exc:
+            error_console.print(f"[red]Patch error:[/red] {exc}")
+            raise typer.Exit(2) from exc
+        except AdfPatchInvariantError as exc:
+            error_console.print(f"[red]Patch invariant error:[/red] {exc}")
+            raise typer.Exit(2) from exc
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+        summary = {
+            "issue": key,
+            "heading": patch["heading"],
+            "level": patch["level"],
+            "mode": patch["mode"],
+            "start_index": patch["start_index"],
+            "end_index": patch["end_index"],
+            "replaced_node_count": patch["replaced_node_count"],
+            "new_node_count": patch["new_node_count"],
+            "preserved_before": patch["preserved_before"],
+            "preserved_after": patch["preserved_after"],
+            "original_node_count": patch["original_node_count"],
+            "patched_node_count": patch["patched_node_count"],
+            "whole_document": patch["whole_document"],
+            "swallowed_headings": patch["swallowed_headings"],
+        }
+
+        if not execute:
+            console.print("[yellow]Dry run:[/yellow] would patch one description section")
+            console.print(f"safety: {safety}")
+            _print_json(summary)
+            _print_json(patch["new_nodes"])
+            console.print("Pass --execute to write it to Jira.")
+            return
+
+        try:
+            data = client.edit_issue_adf_description(key, patch["document"])
+            audit_write(
+                config,
+                action="patch_description_section",
+                issue_key=key,
+                payload={
+                    "section": section,
+                    "include_heading": include_heading,
+                    "expect_swallowed_headings": expect_swallowed_heading,
+                    "allow_wide_rewrite": allow_wide_rewrite,
+                    **summary,
+                },
+                result=data,
+            )
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _print_json(data)
+        return
+
+    console.print(f"Patched section {patch['heading']!r} of {key}.")
 
 
 @app.command("mcp-config")
@@ -2108,6 +2284,9 @@ def upsert_image_gallery(
                 },
                 result=result,
             )
+        except ValueError as exc:
+            error_console.print(f"[red]Gallery error:[/red] {exc}")
+            raise typer.Exit(2) from exc
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
