@@ -206,10 +206,10 @@ uv run jira-agent patch-description-section FC-385 \
 
 A section is removed only if you named it. What the tool does not do is judge whether what remains
 is meaningful — there is no such detection. Naming the only section of a description carries no
-naming duty, because there is no unnamed section to lose, but the first control still applies: an
-ordinary single-section description starts at the first node, so its slice is the whole content
-list and `--allow-wide-rewrite` is required. Only a description with something in front of the
-section goes through unflagged. A separate rule still refuses any patch that would leave the
+naming duty, because there is no unnamed section to lose, but the first control still applies: if
+that section is also the whole content list — it starts at the first node and nothing follows it —
+`--allow-wide-rewrite` is required. A section that starts at the first node but is bounded by a
+later heading is not the whole content list and needs no flag. A separate rule still refuses any patch that would leave the
 description with no content at all.
 
 A refusal prints each name as a quoted JSON array, so a heading containing a comma stays one name

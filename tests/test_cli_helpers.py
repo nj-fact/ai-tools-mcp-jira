@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 
+from rich.console import Console
 from typer.testing import CliRunner
 
 from jira_agent import cli
@@ -288,3 +290,162 @@ def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
         "whole_document": True,
     }
     assert writes == []
+
+
+MARKUP_HOSTILE_NAMES = [
+    "Costs [in EUR/m2]",
+    "[wip] Detail",
+    "[open] Risks",
+    "[#1234] Rework",
+    "[/red] Detail",
+    "L" * 120,
+]
+
+
+def _print_json_output(payload: object) -> str:
+    with cli.data_console.capture() as captured:
+        cli._print_json(payload)
+    return captured.get()
+
+
+def test_print_json_is_byte_exact_for_every_caller_of_the_shared_helper() -> None:
+    """34 commands print JSON through this helper, so pin it here and not per command."""
+    for name in MARKUP_HOSTILE_NAMES:
+        payload = {"summary": name, "nested": [{"heading": name}]}
+        output = _print_json_output(payload)
+
+        assert json.loads(output) == payload
+        assert output.rstrip("\n") == json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _patch_cli_document(name: str) -> dict[str, object]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Preamble."}]},
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Scope"}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 3},
+                "content": [{"type": "text", "text": name}],
+            },
+            {"type": "paragraph", "content": [{"type": "text", "text": "body"}]},
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Next"}],
+            },
+        ],
+    }
+
+
+def test_patch_description_section_cli_payload_survives_a_markup_hostile_heading(
+    tmp_path, monkeypatch
+) -> None:
+    """The refusal payload is the correction, so the channel must not rewrite the names."""
+    for name in MARKUP_HOSTILE_NAMES:
+        config = JiraConfig.model_validate(
+            {
+                "JIRA_SITE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_WRITE_PROJECT_KEYS": "FC",
+                "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+            }
+        )
+        document = _patch_cli_document(name)
+
+        class FakeClient:
+            def __init__(self, _config, _document=document):
+                self.document = _document
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def get_issue(self, issue_key, **_kwargs):
+                return {
+                    "key": issue_key,
+                    "fields": {"project": {"key": "FC"}, "description": self.document},
+                }
+
+            def edit_issue_adf_description(self, issue_key, description):
+                raise AssertionError("must not write")
+
+        monkeypatch.setattr(cli, "load_config", lambda _config=config: _config)
+        monkeypatch.setattr(cli, "JiraClient", FakeClient)
+        monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+
+        result = CliRunner().invoke(
+            cli.app,
+            [
+                "patch-description-section",
+                "FC-385",
+                "--section",
+                "Scope",
+                "--content",
+                "## Scope\n\nnew",
+                "--execute",
+            ],
+        )
+
+        assert result.exit_code == 2, f"{name!r}: {result.output}"
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        payload = json.loads(result.output[result.output.index("{") :])
+        assert payload["swallowed_headings"] == [name], f"{name!r} came back altered"
+        assert payload["error_type"] == "section_patch_refused"
+
+
+def _on_a_terminal(console: Console) -> Console:
+    """Rebuild a console with its own settings, forced to behave as a terminal.
+
+    Highlighting and colour only appear on a terminal, so a capture in a test would never see
+    them. Reading the settings off the real console keeps this honest: loosen any of the three
+    on the module object and this probe loosens with it.
+    """
+    return Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        width=80,
+        markup=console._markup,
+        highlight=console._highlight,
+        soft_wrap=console.soft_wrap,
+    )
+
+
+def test_structured_output_adds_no_ansi_when_stdout_is_a_terminal() -> None:
+    """A copy out of a real terminal has to be the same bytes as a copy out of a pipe."""
+    text = json.dumps({"swallowed_headings": ["Costs [in EUR/m2]", "L" * 120]}, indent=2)
+    probe = _on_a_terminal(cli.data_console)
+
+    probe.print(text)
+    written = probe.file.getvalue()
+
+    assert "\x1b" not in written
+    assert written.rstrip("\n") == text
+
+
+def test_a_table_cell_keeps_jira_text_that_looks_like_markup() -> None:
+    """Same defect class as the JSON channel, display only: rich reads markup in table cells."""
+    issues = [
+        {
+            "key": "FC-385",
+            "fields": {
+                "summary": "Costs [in EUR/m2]",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Ada"},
+            },
+        }
+    ]
+
+    with cli.table_console.capture() as captured:
+        cli._print_issues_table(issues)
+
+    assert "Costs [in EUR/m2]" in captured.get()
