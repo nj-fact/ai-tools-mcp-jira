@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "jira_assign_issue",
     "jira_agent_report",
     "jira_edit_issue",
+    "jira_patch_description_section",
     "jira_agent_plan_comment",
     "jira_write_human_brief",
     "jira_store_factory_contract",

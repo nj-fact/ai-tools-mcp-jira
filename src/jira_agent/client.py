@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import struct
 from collections.abc import Iterable
@@ -502,11 +503,436 @@ def replace_diagram_with_media(
     return {**adf, "content": content}
 
 
-def _markdown_blocks_to_adf(text: str) -> list[dict[str, Any]]:
+ADF_SECTION_PATCH_MODES = ("replace", "append", "prepend", "delete")
+ADF_HEADING_LEVELS = range(1, 7)
+
+# Inline nodes that carry their text in attrs instead of in a text child.
+_ADF_INLINE_TEXT_ATTRS = {
+    "emoji": ("text", "shortName"),
+    "mention": ("text",),
+    "status": ("text",),
+    "date": ("timestamp",),
+}
+
+
+class AdfSectionPatchRefused(ValueError):
+    """A section patch was refused by one of the two controls.
+
+    Carries the lists as data so a caller never has to parse the sentence to recover.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        swallowed_headings: list[str],
+        named_headings: list[str],
+        whole_document: bool,
+    ) -> None:
+        super().__init__(message)
+        self.swallowed_headings = list(swallowed_headings)
+        self.named_headings = list(named_headings)
+        self.whole_document = whole_document
+
+
+class AdfPatchInvariantError(RuntimeError):
+    """A rebuilt description failed the postcondition that only the matched slice may change."""
+
+
+def patch_adf_description_section(
+    description: Any,
+    *,
+    section: str,
+    mode: str = "replace",
+    content: str | None = None,
+    include_heading: bool = True,
+    expect_swallowed_headings: list[str] | None = None,
+    allow_wide_rewrite: bool = False,
+) -> dict[str, Any]:
+    """Rewrite one section of an existing ADF description and leave every other node in place.
+
+    A section is the matched heading node plus every following top-level node up to, but not
+    including, the next heading whose level is the same or lower. Patching ``## A`` therefore
+    covers its ``### A.1`` subsection and stops before ``## B``.
+
+    ``replace`` and ``delete`` pass two independent controls. Neither inspects a node to judge
+    whether it counts as content, and neither substitutes for the other.
+
+    The first is arithmetic: when the slice is the entire content list, nothing outside it
+    survives, and that is refused unless the caller passes ``allow_wide_rewrite``.
+
+    The second is a naming duty. ``swallowed_headings`` is the ordered text of every heading
+    inside the slice below the matched one, so it lists the sections the patch removes on top of
+    the one named in ``section``. ``expect_swallowed_headings`` has to equal that list exactly,
+    in order; absent, short, long, differing, or supplied when the slice swallows nothing is a
+    mismatch and is refused, and the refusal prints both lists so the call can be corrected. A
+    section is therefore removed only if the caller named it. A heading with no text is listed
+    as ``<untitled>`` and is named with that same string.
+
+    ``allow_wide_rewrite`` covers the first control only. It does not satisfy the naming duty.
+
+    ``append`` and ``prepend`` remove nothing, so neither control applies to them.
+
+    Naming the only section of a description carries no naming duty, because there is no
+    unnamed section to lose. Control 1 still applies to it: an ordinary single-section
+    description starts at index 0, so its slice is the whole content list and the flag is
+    required. The patch goes through unflagged only when something precedes the section.
+
+    Only the caller's Markdown is converted to ADF. The existing document is never round-tripped
+    through Markdown, which would drop taskItem ids and states, tables, panels, and inline marks.
+    Preserved nodes keep their localIds because they are the same objects; new checklist items
+    are numbered past the highest task localId already in the document, so a spliced list cannot
+    reuse an id that Jira addresses a checkbox by.
+
+    ``include_heading`` applies to ``replace``: with ``True`` the caller's Markdown has to start
+    with the new heading, because the matched heading node is part of the replaced slice; with
+    ``False`` the original heading node stays and only the body below it changes. ``append`` and
+    ``prepend`` always keep the original heading node.
+
+    An ``attrs.level`` that is missing or is not an integer from 1 to 6 is never guessed. On the
+    matched heading it is refused, and below the matched heading it ends the section instead of
+    being skipped. No level outside the slice is consulted at all.
+
+    Returns the rebuilt document together with the counts that show which slice moved.
+    """
+    if mode not in ADF_SECTION_PATCH_MODES:
+        raise ValueError(
+            f"Unknown section patch mode: {mode}. Use one of {', '.join(ADF_SECTION_PATCH_MODES)}."
+        )
+    body = (content or "").strip()
+    if mode == "delete":
+        if body:
+            raise ValueError("Mode delete removes the section and takes no content.")
+    elif not body:
+        raise ValueError(f"Mode {mode} requires the Markdown content of the new section.")
+
+    source = _adf_description_content(description)
+    before = list(source)
+    start, end = _adf_section_bounds(source, section)
+    heading = source[start]
+    heading_text = adf_heading_text(heading).strip()
+    level = _strict_heading_level(heading)
+
+    whole_document = start == 0 and end == len(source)
+    swallowed = [_heading_name(node) for node in source[start + 1 : end] if _is_heading(node)]
+    if mode in {"replace", "delete"}:
+        refusals = []
+        if whole_document and not allow_wide_rewrite:
+            refusals.append(
+                f"Nothing outside the slice would survive: section {heading_text!r} covers all "
+                f"{len(source)} top-level nodes, so mode {mode} rewrites the entire field. Pass "
+                "allow_wide_rewrite to do that deliberately."
+            )
+        named = [name.strip() for name in expect_swallowed_headings or []]
+        if named != swallowed:
+            refusals.append(
+                f"Swallowed-section mismatch: the slice removes {_names(swallowed)} on top of "
+                f"{heading_text!r}, and the call named {_names(named)}. Pass "
+                "expect_swallowed_headings with exactly those names, in that order."
+            )
+        if refusals:
+            raise AdfSectionPatchRefused(
+                " ".join(refusals),
+                swallowed_headings=swallowed,
+                named_headings=named,
+                whole_document=whole_document,
+            )
+
+    if not include_heading and mode != "replace":
+        raise ValueError(
+            f"include_heading applies to mode replace only; mode {mode} always keeps the "
+            "existing heading node."
+        )
+
+    blocks = _markdown_blocks_to_adf(content, task_id_start=_next_task_id(source)) if body else []
+    if mode == "replace" and include_heading and not _is_heading(blocks[0] if blocks else None):
+        raise ValueError(
+            f"Mode replace with include_heading replaces the {heading_text!r} heading node, so "
+            "the content has to start with its own heading. Add the heading to the content, or "
+            "pass include_heading=false to keep the existing heading and change only the body."
+        )
+
+    if mode == "replace":
+        new_nodes = list(blocks) if include_heading else [heading, *blocks]
+    elif mode == "append":
+        new_nodes = [*source[start:end], *blocks]
+    elif mode == "prepend":
+        new_nodes = [heading, *blocks, *source[start + 1 : end]]
+    else:
+        new_nodes = []
+
+    patched = _rebuild_with_section(source, start=start, end=end, new_nodes=new_nodes)
+    if not patched:
+        raise ValueError(
+            f"Mode {mode} on section {heading_text!r} would leave the description with no "
+            "content, and this tool refuses to read such a description back. Replace the "
+            "section with placeholder content instead of removing it."
+        )
+    assert_adf_slice_replacement(
+        before,
+        patched,
+        start=start,
+        end=end,
+        new_nodes=new_nodes,
+        document=description,
+    )
+
+    return {
+        "document": {**description, "content": patched},
+        "heading": heading_text,
+        "level": level,
+        "mode": mode,
+        "start_index": start,
+        "end_index": end,
+        "replaced_node_count": end - start,
+        "new_node_count": len(new_nodes),
+        "preserved_before": start,
+        "preserved_after": len(source) - end,
+        "original_node_count": len(source),
+        "patched_node_count": len(patched),
+        "whole_document": whole_document,
+        "swallowed_headings": swallowed,
+        "new_nodes": new_nodes,
+    }
+
+
+def _rebuild_with_section(
+    source: list[dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+    new_nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build the patched content. Its result is checked, never trusted."""
+    return [*source[:start], *new_nodes, *source[end:]]
+
+
+def assert_adf_slice_replacement(
+    before: list[dict[str, Any]],
+    patched: list[dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+    new_nodes: list[dict[str, Any]],
+    document: Any = None,
+) -> None:
+    """Check a rebuilt content list against the node identities captured before the rebuild.
+
+    A rebuild that re-renders an untouched node, drops or reorders one, works from bounds that
+    are not a slice of the input, or edits the caller's document in place fails here instead of
+    reaching Jira. Pass document to also assert that the input was left alone.
+
+    This checks how the slice was rebuilt. It does not judge how wide the slice is, and it
+    never refuses a patch for being too broad; patch_adf_description_section decides that
+    separately from the extent of the slice.
+    """
+    if not 0 <= start <= end <= len(before):
+        raise AdfPatchInvariantError(
+            f"Slice bounds {start}..{end} are not a slice of {len(before)} top-level nodes."
+        )
+
+    if document is not None:
+        current = document.get("content") if isinstance(document, dict) else None
+        if (
+            not isinstance(current, list)
+            or len(current) != len(before)
+            or any(node is not original for node, original in zip(current, before, strict=True))
+        ):
+            raise AdfPatchInvariantError(
+                "Slice replacement changed the document it was given instead of building a new one."
+            )
+
+    expected_count = len(before) - (end - start) + len(new_nodes)
+    if len(patched) != expected_count:
+        raise AdfPatchInvariantError(
+            f"Slice replacement produced {len(patched)} top-level nodes instead of "
+            f"{expected_count}."
+        )
+
+    kept_after = len(before) - end
+    if any(
+        node is not original for node, original in zip(patched[:start], before[:start], strict=True)
+    ):
+        raise AdfPatchInvariantError(
+            f"Slice replacement rebuilt one of the {start} top-level node(s) before the slice."
+        )
+    if any(
+        node is not original
+        for node, original in zip(patched[len(patched) - kept_after :], before[end:], strict=True)
+    ):
+        raise AdfPatchInvariantError(
+            f"Slice replacement rebuilt one of the {kept_after} top-level node(s) after the slice."
+        )
+    if any(
+        node is not original
+        for node, original in zip(
+            patched[start : len(patched) - kept_after], new_nodes, strict=True
+        )
+    ):
+        raise AdfPatchInvariantError(
+            "Slice replacement did not place the new nodes in the matched slice."
+        )
+
+
+def _adf_description_content(description: Any) -> list[dict[str, Any]]:
+    if description is None:
+        raise ValueError("The issue has no description, so no section can be patched.")
+    if not isinstance(description, dict) or description.get("type") != "doc":
+        raise ValueError(
+            "The issue description is not an ADF doc node, so no section can be patched."
+        )
+    content = description.get("content")
+    if not isinstance(content, list) or not content:
+        raise ValueError("The issue description is empty, so no section can be patched.")
+    return list(content)
+
+
+def find_adf_section_bounds(
+    content: list[dict[str, Any]],
+    section: str,
+) -> tuple[int, int] | None:
+    """Return the [start, end) top-level slice of one section, or None when it is absent.
+
+    The heading is matched the way markdown_section matches one: leading hashes optional, case
+    insensitive, whitespace-trimmed. An ambiguous heading and a matched heading without a usable
+    level are refused, and an unreadable level further down ends the section.
+    """
+    wanted = _normalized_section_name(section)
+    matches = [
+        index
+        for index, node in enumerate(content)
+        if _is_heading(node) and adf_heading_text(node).strip().casefold() == wanted
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Description section is ambiguous: {section}")
+    if not matches:
+        return None
+
+    start = matches[0]
+    level = _strict_heading_level(content[start])
+    end = start + 1
+    while end < len(content):
+        node = content[end]
+        if _is_heading(node):
+            boundary = _heading_level(node)
+            if boundary is None or boundary <= level:
+                break
+        end += 1
+    return start, end
+
+
+def _adf_section_bounds(content: list[dict[str, Any]], section: str) -> tuple[int, int]:
+    bounds = find_adf_section_bounds(content, section)
+    if bounds is None:
+        headings = [adf_heading_text(node).strip() for node in content if _is_heading(node)]
+        raise ValueError(
+            f"Description section not found: {section}. "
+            f"Existing headings: {', '.join(headings) if headings else 'none'}"
+        )
+    return bounds
+
+
+def _normalized_section_name(section: str) -> str:
+    wanted = re.sub(r"^#{1,6}\s+", "", section.strip()).strip().casefold()
+    if not wanted:
+        raise ValueError("A section heading is required.")
+    return wanted
+
+
+_TASK_LOCAL_ID = re.compile(r"^task(?:-list)?-(\d+)$")
+
+
+def _next_task_id(nodes: Iterable[Any]) -> int:
+    """Return a task localId number that cannot collide with one already in the document.
+
+    _markdown_blocks_to_adf numbers taskList and taskItem localIds from a shared counter that
+    starts at 1. Content spliced into a description that already holds task-1 would repeat it,
+    and Jira addresses a checkbox by its localId, so new content starts past the highest number
+    present anywhere in the document.
+    """
+    highest = 0
+    stack = list(nodes)
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attrs")
+        if isinstance(attrs, dict):
+            match = _TASK_LOCAL_ID.match(str(attrs.get("localId") or ""))
+            if match:
+                highest = max(highest, int(match.group(1)))
+        children = node.get("content")
+        if isinstance(children, list):
+            stack.extend(children)
+    return highest + 1
+
+
+UNTITLED_HEADING = "<untitled>"
+
+
+def _heading_name(node: Any) -> str:
+    """Name one heading for the swallowed list. A heading with no text is still nameable."""
+    return adf_heading_text(node).strip() or UNTITLED_HEADING
+
+
+def _names(headings: list[str]) -> str:
+    """Render a heading list as a JSON array, in full.
+
+    Never truncate and never join bare: the caller has to copy this back, so a name containing a
+    comma has to stay one name, and an empty list has to be distinguishable from a list holding
+    the word that would otherwise describe it.
+    """
+    return json.dumps(headings, ensure_ascii=False)
+
+
+def _is_heading(node: Any) -> bool:
+    return isinstance(node, dict) and node.get("type") == "heading"
+
+
+def _strict_heading_level(node: dict[str, Any]) -> int:
+    level = _heading_level(node)
+    if level is None:
+        raise ValueError(
+            f"Heading {adf_heading_text(node).strip()!r} has no usable attrs.level between 1 "
+            "and 6, so the extent of its section cannot be determined."
+        )
+    return level
+
+
+def _heading_level(node: Any) -> int | None:
+    """Return an ADF heading level, or None when it is missing or unusable.
+
+    No caller may guess a level. The matched heading is refused and an unreadable heading below
+    it ends the section, so a malformed level can never widen the slice a patch rewrites.
+    """
+    attrs = node.get("attrs") if isinstance(node, dict) else None
+    level = attrs.get("level") if isinstance(attrs, dict) else None
+    if isinstance(level, bool) or not isinstance(level, int):
+        return None
+    return level if level in ADF_HEADING_LEVELS else None
+
+
+def adf_heading_text(node: Any) -> str:
+    """Return the readable text of one ADF node, including inline nodes that hide it in attrs."""
+    if not isinstance(node, dict):
+        return ""
+    node_type = str(node.get("type") or "")
+    if node_type == "text":
+        return str(node.get("text") or "")
+    attrs = node.get("attrs")
+    if isinstance(attrs, dict):
+        for key in _ADF_INLINE_TEXT_ATTRS.get(node_type, ()):
+            value = attrs.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return "".join(adf_heading_text(child) for child in node.get("content") or [])
+
+
+def _markdown_blocks_to_adf(text: str, *, task_id_start: int = 1) -> list[dict[str, Any]]:
     lines = text.splitlines() or [""]
     blocks: list[dict[str, Any]] = []
     index = 0
-    task_index = 1
+    task_index = task_id_start
 
     while index < len(lines):
         line = lines[index]

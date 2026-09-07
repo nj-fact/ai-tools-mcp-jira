@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import io
+import json
+
+from rich.console import Console
 from typer.testing import CliRunner
 
 from jira_agent import cli
@@ -81,3 +85,367 @@ def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -
     assert result.exit_code == 0, result.output
     assert "Embedded 1 Mermaid diagram(s)." in result.output
     assert calls["embed"]["issue_key"] == "FC-123"
+
+
+def _patch_description() -> dict[str, object]:
+    """Indices: 0 h1, 1 h2 Observed, 2 paragraph, 3 h2 Acceptance criteria, 4 taskList."""
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "heading",
+                "attrs": {"level": 1},
+                "content": [{"type": "text", "text": "Description wipe"}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Observed"}],
+            },
+            {
+                "type": "paragraph",
+                "content": [{"type": "text", "text": "The payload replaced the whole field."}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Acceptance criteria"}],
+            },
+            {
+                "type": "taskList",
+                "attrs": {"localId": "task-list-1"},
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"localId": "task-1", "state": "TODO"},
+                        "content": [{"type": "text", "text": "Keep every other section"}],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _install_patch_cli(monkeypatch, tmp_path) -> list[dict[str, object]]:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    writes: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {
+                "key": issue_key,
+                "fields": {"project": {"key": "FC"}, "description": _patch_description()},
+            }
+
+        def edit_issue_adf_description(self, issue_key, description):
+            writes.append({"issue": issue_key, "description": description})
+            return {"updated": True}
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+    return writes
+
+
+def test_patch_description_section_cli_dry_run_shows_counts_and_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Acceptance criteria",
+            "--content",
+            "## Acceptance criteria\n\n- [ ] Only the section changes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would patch one description section" in result.output
+    assert '"preserved_before": 3' in result.output
+    assert '"original_node_count": 5' in result.output
+    assert writes == []
+
+
+def test_patch_description_section_cli_execute_keeps_the_untouched_nodes(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nThe dry run showed a one-bullet payload.",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = writes[0]["description"]
+    assert written["content"][3:] == _patch_description()["content"][3:]
+    assert written["content"][0] == _patch_description()["content"][0]
+
+
+def test_patch_description_section_cli_refuses_a_wide_rewrite(tmp_path, monkeypatch) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet survives",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Swallowed-section mismatch" in result.output
+    assert "allow_wide_rewrite" in result.output
+    assert writes == []
+
+
+def test_patch_description_section_cli_allows_a_wide_rewrite_on_request(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet survives",
+            "--expect-swallowed-heading",
+            "Observed",
+            "--expect-swallowed-heading",
+            "Acceptance criteria",
+            "--allow-wide-rewrite",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(writes[0]["description"]["content"]) == 2
+
+
+def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
+    tmp_path, monkeypatch
+) -> None:
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet",
+            "--allow-wide-rewrite",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output[result.output.index("{") :])
+    assert payload == {
+        "error_type": "section_patch_refused",
+        "swallowed_headings": ["Observed", "Acceptance criteria"],
+        "expect_swallowed_headings": [],
+        "whole_document": True,
+    }
+    assert writes == []
+
+
+MARKUP_HOSTILE_NAMES = [
+    "Costs [in EUR/m2]",
+    "[wip] Detail",
+    "[open] Risks",
+    "[#1234] Rework",
+    "[/red] Detail",
+    "L" * 120,
+]
+
+
+def _print_json_output(payload: object) -> str:
+    with cli.data_console.capture() as captured:
+        cli._print_json(payload)
+    return captured.get()
+
+
+def test_print_json_is_byte_exact_for_every_caller_of_the_shared_helper() -> None:
+    """34 commands print JSON through this helper, so pin it here and not per command."""
+    for name in MARKUP_HOSTILE_NAMES:
+        payload = {"summary": name, "nested": [{"heading": name}]}
+        output = _print_json_output(payload)
+
+        assert json.loads(output) == payload
+        assert output.rstrip("\n") == json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def _patch_cli_document(name: str) -> dict[str, object]:
+    return {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Preamble."}]},
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Scope"}],
+            },
+            {
+                "type": "heading",
+                "attrs": {"level": 3},
+                "content": [{"type": "text", "text": name}],
+            },
+            {"type": "paragraph", "content": [{"type": "text", "text": "body"}]},
+            {
+                "type": "heading",
+                "attrs": {"level": 2},
+                "content": [{"type": "text", "text": "Next"}],
+            },
+        ],
+    }
+
+
+def test_patch_description_section_cli_payload_survives_a_markup_hostile_heading(
+    tmp_path, monkeypatch
+) -> None:
+    """The refusal payload is the correction, so the channel must not rewrite the names."""
+    for name in MARKUP_HOSTILE_NAMES:
+        config = JiraConfig.model_validate(
+            {
+                "JIRA_SITE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_WRITE_PROJECT_KEYS": "FC",
+                "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+            }
+        )
+        document = _patch_cli_document(name)
+
+        class FakeClient:
+            def __init__(self, _config, _document=document):
+                self.document = _document
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def get_issue(self, issue_key, **_kwargs):
+                return {
+                    "key": issue_key,
+                    "fields": {"project": {"key": "FC"}, "description": self.document},
+                }
+
+            def edit_issue_adf_description(self, issue_key, description):
+                raise AssertionError("must not write")
+
+        monkeypatch.setattr(cli, "load_config", lambda _config=config: _config)
+        monkeypatch.setattr(cli, "JiraClient", FakeClient)
+        monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+
+        result = CliRunner().invoke(
+            cli.app,
+            [
+                "patch-description-section",
+                "FC-385",
+                "--section",
+                "Scope",
+                "--content",
+                "## Scope\n\nnew",
+                "--execute",
+            ],
+        )
+
+        assert result.exit_code == 2, f"{name!r}: {result.output}"
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        payload = json.loads(result.output[result.output.index("{") :])
+        assert payload["swallowed_headings"] == [name], f"{name!r} came back altered"
+        assert payload["error_type"] == "section_patch_refused"
+
+
+def _on_a_terminal(console: Console) -> Console:
+    """Rebuild a console with its own settings, forced to behave as a terminal.
+
+    Highlighting and colour only appear on a terminal, so a capture in a test would never see
+    them. Reading the settings off the real console keeps this honest: loosen any of the three
+    on the module object and this probe loosens with it.
+    """
+    return Console(
+        file=io.StringIO(),
+        force_terminal=True,
+        width=80,
+        markup=console._markup,
+        highlight=console._highlight,
+        soft_wrap=console.soft_wrap,
+    )
+
+
+def test_structured_output_adds_no_ansi_when_stdout_is_a_terminal() -> None:
+    """A copy out of a real terminal has to be the same bytes as a copy out of a pipe."""
+    text = json.dumps({"swallowed_headings": ["Costs [in EUR/m2]", "L" * 120]}, indent=2)
+    probe = _on_a_terminal(cli.data_console)
+
+    probe.print(text)
+    written = probe.file.getvalue()
+
+    assert "\x1b" not in written
+    assert written.rstrip("\n") == text
+
+
+def test_a_table_cell_keeps_jira_text_that_looks_like_markup() -> None:
+    """Same defect class as the JSON channel, display only: rich reads markup in table cells."""
+    issues = [
+        {
+            "key": "FC-385",
+            "fields": {
+                "summary": "Costs [in EUR/m2]",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Ada"},
+            },
+        }
+    ]
+
+    with cli.table_console.capture() as captured:
+        cli._print_issues_table(issues)
+
+    assert "Costs [in EUR/m2]" in captured.get()
