@@ -4,6 +4,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from jira_agent.client import (
+    adf_heading_text,
+    assert_adf_slice_replacement,
+    find_adf_section_bounds,
+)
+
 
 def newest_attachments_by_filename(
     attachments: list[dict[str, Any]],
@@ -102,33 +108,41 @@ def upsert_top_level_section(
     blocks: list[dict[str, Any]],
     before_heading: str | None = None,
 ) -> dict[str, Any]:
-    content = list(adf.get("content") or [])
-    start = _heading_index(content, title)
-    if start is not None:
-        level = int((content[start].get("attrs") or {}).get("level", 3))
-        end = start + 1
-        while end < len(content):
-            node = content[end]
-            if (
-                node.get("type") == "heading"
-                and int((node.get("attrs") or {}).get("level", 6)) <= level
-            ):
-                break
-            end += 1
-        content[start:end] = blocks
+    """Replace the named section, or insert it before before_heading, or append it.
+
+    The section extent comes from the shared ADF helper, so an ambiguous title and a heading
+    without a usable level are refused here for the same reason a section patch refuses them,
+    and the result passes the same slice-replacement check. Insertion is the degenerate slice
+    start == end, so both paths are covered by it.
+    """
+    source = adf.get("content")
+    before = list(source) if isinstance(source, list) else []
+    content = list(before)
+    bounds = find_adf_section_bounds(content, title)
+    if bounds is not None:
+        start, end = bounds
     else:
         insert_at = _heading_index(content, before_heading) if before_heading else None
-        if insert_at is None:
-            insert_at = len(content)
-        content[insert_at:insert_at] = blocks
+        start = end = len(content) if insert_at is None else insert_at
+    content[start:end] = blocks
+    assert_adf_slice_replacement(
+        before,
+        content,
+        start=start,
+        end=end,
+        new_nodes=blocks,
+        document=adf if isinstance(source, list) else None,
+    )
     return {**adf, "type": "doc", "version": 1, "content": content}
 
 
 def _heading_index(content: list[dict[str, Any]], title: str | None) -> int | None:
+    """Return the first heading with this text. An insertion anchor, not a section."""
     if not title:
         return None
+    wanted = title.strip().casefold()
     for index, node in enumerate(content):
-        if node.get("type") == "heading" and _node_text(node).strip() == title:
+        if node.get("type") == "heading" and adf_heading_text(node).strip().casefold() == wanted:
             return index
     return None
 
@@ -136,14 +150,6 @@ def _heading_index(content: list[dict[str, Any]], title: str | None) -> int | No
 def _attachment_sort_key(attachment: dict[str, Any]) -> tuple[int, str]:
     identifier = str(attachment.get("id", ""))
     return (int(identifier) if identifier.isdigit() else -1, identifier)
-
-
-def _node_text(node: dict[str, Any]) -> str:
-    return "".join(
-        str(child.get("text", ""))
-        for child in node.get("content") or []
-        if child.get("type") == "text"
-    )
 
 
 def _heading(text: str, *, level: int) -> dict[str, Any]:
