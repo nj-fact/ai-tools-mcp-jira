@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from jira_agent.audit import audit_write
@@ -54,6 +55,15 @@ app = typer.Typer(
 )
 console = Console()
 error_console = Console(stderr=True)
+# Structured output is data, not presentation. A markup interpreter rewrites a name containing
+# [...], word-wrap injects newlines into long values, and highlighting adds ANSI on a terminal;
+# all three silently change bytes a caller is expected to copy back. This console opts out of
+# every one of them in one named place instead of at each call site.
+data_console = Console(markup=False, highlight=False, soft_wrap=True)
+# Table cells hold Jira text too, and rich reads markup in them: a summary "Costs [in EUR/m2]"
+# renders as "Costs". Tables still need width handling, so this console keeps wrapping and only
+# drops the interpretation.
+table_console = Console(markup=False, highlight=False)
 
 DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated"]
 
@@ -62,7 +72,7 @@ def _client() -> JiraClient:
     try:
         config = load_config()
     except Exception as exc:
-        error_console.print(f"[red]Config error:[/red] {exc}")
+        _print_error("Config error:", exc)
         raise typer.Exit(2) from exc
     return JiraClient(config)
 
@@ -71,12 +81,22 @@ def _config():
     try:
         return load_config()
     except Exception as exc:
-        error_console.print(f"[red]Config error:[/red] {exc}")
+        _print_error("Config error:", exc)
         raise typer.Exit(2) from exc
 
 
 def _print_json(data: Any) -> None:
-    console.print(json.dumps(data, indent=2, ensure_ascii=False))
+    """Print structured output byte-exactly. Never through a formatter."""
+    data_console.print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _print_error(label: str, detail: object) -> None:
+    """Print a labelled error without letting the detail be read as markup.
+
+    Every detail here is untrusted: exception text carries Jira heading and issue text, and a
+    name like "[/red] Detail" raises MarkupError inside the handler that was meant to report it.
+    """
+    error_console.print(f"[red]{label}[/red] {escape(str(detail))}")
 
 
 def _field_list(value: str | None) -> list[str] | None:
@@ -119,7 +139,7 @@ def _print_issues_table(issues: list[dict[str, Any]]) -> None:
     for issue in issues:
         row = _issue_row(issue)
         table.add_row(row["key"], row["status"], row["assignee"], row["summary"])
-    console.print(table)
+    table_console.print(table)
 
 
 def _print_create_metadata(data: dict[str, Any]) -> None:
@@ -142,7 +162,7 @@ def _print_create_metadata(data: dict[str, Any]) -> None:
                 str(issue_type.get("id") or ""),
                 ", ".join(required),
             )
-    console.print(table)
+    table_console.print(table)
 
 
 def _adf_to_text(node: Any) -> str:
@@ -150,7 +170,9 @@ def _adf_to_text(node: Any) -> str:
 
 
 def _print_agent_report(report: dict[str, Any]) -> None:
-    console.print(f"[bold]{report['key']}[/bold] {report.get('summary') or ''}")
+    console.print(
+        f"[bold]{escape(str(report['key']))}[/bold] {escape(str(report.get('summary') or ''))}"
+    )
     console.print(report["url"])
     console.print(f"status: {(report.get('status') or {}).get('name')}")
     assignee = report.get("assignee") or {}
@@ -195,7 +217,7 @@ def _print_agent_report(report: dict[str, Any]) -> None:
                 str(transition.get("name") or ""),
                 str(target.get("name") or ""),
             )
-        console.print(table)
+        table_console.print(table)
     else:
         console.print("No transitions returned.")
 
@@ -236,7 +258,7 @@ def _print_users_table(users: list[dict[str, Any]]) -> None:
             str(user.get("accountId") or ""),
             str(user.get("active")),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 def _read_audit_records(path: str, limit: int) -> list[dict[str, Any]]:
@@ -383,7 +405,7 @@ def comments(
             str(comment.get("created") or ""),
             _adf_to_text(comment.get("body")).strip(),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 @app.command()
@@ -788,7 +810,7 @@ def create_issue(
             else None
         )
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Description error:[/red] {exc}")
+        _print_error("Description error:", exc)
         raise typer.Exit(2) from exc
 
     try:
@@ -804,7 +826,7 @@ def create_issue(
             story_points_field=config.story_points_field,
         )
     except ValueError as exc:
-        error_console.print(f"[red]Create error:[/red] {exc}")
+        _print_error("Create error:", exc)
         raise typer.Exit(2) from exc
     description_adf = payload["fields"].get("description")
     diagram_count = (
@@ -915,7 +937,9 @@ def render_mermaid(
             }
             sources = mermaid_sources_from_adf(description_adf)
             if not sources:
-                error_console.print(f"[yellow]No Mermaid code blocks found on {key}.[/yellow]")
+                error_console.print(
+                    f"[yellow]No Mermaid code blocks found on {escape(str(key))}.[/yellow]"
+                )
                 raise typer.Exit(1)
 
             runtime = discover_mermaid_runtime()
@@ -968,7 +992,7 @@ def render_mermaid(
     except JiraApiError as exc:
         _exit_api_error(exc)
     except (OSError, RuntimeError, ValueError) as exc:
-        error_console.print(f"[red]Mermaid error:[/red] {exc}")
+        _print_error("Mermaid error:", exc)
         raise typer.Exit(1) from exc
 
     if json_output:
@@ -1158,7 +1182,7 @@ def human_brief(
         body = read_text_source(text, file_path)
         payload = edit_issue_payload(description=body)
     except ValueError as exc:
-        error_console.print(f"[red]Human brief error:[/red] {exc}")
+        _print_error("Human brief error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
@@ -1273,7 +1297,7 @@ def factory_contract(
         except JiraApiError as exc:
             _exit_api_error(exc)
         except ValueError as exc:
-            error_console.print(f"[red]Factory Contract error:[/red] {exc}")
+            _print_error("Factory Contract error:", exc)
             raise typer.Exit(2) from exc
 
     console.print(f"Added Factory Contract comment to {issue_key}.")
@@ -1400,7 +1424,7 @@ def drift_labels(
         except JiraApiError as exc:
             _exit_api_error(exc)
         except ValueError as exc:
-            error_console.print(f"[red]Drift label error:[/red] {exc}")
+            _print_error("Drift label error:", exc)
             raise typer.Exit(2) from exc
 
     console.print(f"Updated drift labels on {issue_key}.")
@@ -1485,7 +1509,7 @@ def edit_issue(
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Edit error:[/red] {exc}")
+        _print_error("Edit error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
@@ -1604,7 +1628,7 @@ def patch_description_section(
         else:
             body = read_text_source(content, content_file)
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Patch error:[/red] {exc}")
+        _print_error("Patch error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
@@ -1621,7 +1645,7 @@ def patch_description_section(
                 allow_wide_rewrite=allow_wide_rewrite,
             )
         except AdfSectionPatchRefused as exc:
-            error_console.print(f"[red]Patch refused:[/red] {exc}")
+            _print_error("Patch refused:", exc)
             _print_json(
                 {
                     "error_type": "section_patch_refused",
@@ -1632,10 +1656,10 @@ def patch_description_section(
             )
             raise typer.Exit(2) from exc
         except (OSError, ValueError) as exc:
-            error_console.print(f"[red]Patch error:[/red] {exc}")
+            _print_error("Patch error:", exc)
             raise typer.Exit(2) from exc
         except AdfPatchInvariantError as exc:
-            error_console.print(f"[red]Patch invariant error:[/red] {exc}")
+            _print_error("Patch invariant error:", exc)
             raise typer.Exit(2) from exc
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
@@ -1741,7 +1765,7 @@ def smoke_write(
                         f"({selected.get('id')}) -> {target.get('name')}"
                     )
                 else:
-                    error_console.print(f"[red]No transition found for:[/red] {transition_name}")
+                    _print_error("No transition found for:", transition_name)
                     raise typer.Exit(1)
 
             if not execute:
@@ -2132,7 +2156,7 @@ def embed_diagram(
     try:
         width, height = png_dimensions(file_path)
     except ValueError as exc:
-        error_console.print(f"[red]Diagram error:[/red] {exc}")
+        _print_error("Diagram error:", exc)
         raise typer.Exit(2) from exc
 
     delete_names = set(_csv_list(delete_filename) or [])
@@ -2226,7 +2250,7 @@ def upsert_image_gallery(
     try:
         manifest = load_image_gallery_manifest(manifest_path)
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Gallery manifest error:[/red] {exc}")
+        _print_error("Gallery manifest error:", exc)
         raise typer.Exit(2) from exc
 
     filenames = {str(row["file"]) for section in manifest["sections"] for row in section["rows"]}
@@ -2285,7 +2309,7 @@ def upsert_image_gallery(
                 result=result,
             )
         except ValueError as exc:
-            error_console.print(f"[red]Gallery error:[/red] {exc}")
+            _print_error("Gallery error:", exc)
             raise typer.Exit(2) from exc
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
@@ -2366,7 +2390,7 @@ def audit_log(
             str(record.get("action")),
             str(record.get("issue_key")),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 @app.command()
@@ -2404,7 +2428,7 @@ def transitions(
             str(transition.get("name") or ""),
             str(target.get("name") or ""),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 @app.command()
@@ -2429,7 +2453,7 @@ def transition(
             transition_data = client.get_transitions(key)
             selected = select_transition(transition_data, transition_name_or_id)
             if selected is None:
-                error_console.print(f"[red]No transition found for:[/red] {transition_name_or_id}")
+                _print_error("No transition found for:", transition_name_or_id)
                 raise typer.Exit(1)
 
             if not execute:
@@ -2495,14 +2519,14 @@ def _run_search(
 
 
 def _exit_api_error(exc: JiraApiError) -> None:
-    error_console.print(f"[red]Jira API error:[/red] {exc}")
+    _print_error("Jira API error:", exc)
     if exc.details:
         error_console.print(json.dumps(exc.details, indent=2, ensure_ascii=False))
     raise typer.Exit(1) from exc
 
 
 def _exit_safety_error(exc: JiraWriteSafetyError) -> None:
-    error_console.print(f"[red]Write safety error:[/red] {exc}")
+    _print_error("Write safety error:", exc)
     raise typer.Exit(3) from exc
 
 
