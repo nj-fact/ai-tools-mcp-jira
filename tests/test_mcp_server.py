@@ -381,6 +381,53 @@ def test_jira_delete_issue_link_dry_run_resolves_but_does_not_delete(tmp_path, m
     assert client.deleted_link_ids == []
 
 
+class LinkCreateFakeClient:
+    def __init__(self, _config) -> None:
+        self.created: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        assert fields == ["project"]
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def link_issues(self, **kwargs):
+        self.created.append(kwargs)
+        return {}
+
+
+def test_jira_link_issue_keeps_fc_350_blocks_fc_352_business_direction(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = LinkCreateFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+
+    dry_run = mcp_server.jira_link_issue("FC-350", "FC-352", link_type="Blocks")
+    executed = mcp_server.jira_link_issue("FC-350", "FC-352", link_type="Blocks", execute=True)
+
+    assert dry_run["payload"] == {
+        "type": {"name": "Blocks"},
+        "inwardIssue": {"key": "FC-350"},
+        "outwardIssue": {"key": "FC-352"},
+    }
+    assert client.created == [
+        {
+            "outward_issue_key": "FC-350",
+            "inward_issue_key": "FC-352",
+            "link_type": "Blocks",
+            "comment": None,
+        }
+    ]
+    assert executed == {"ok": True, "outward_key": "FC-350", "inward_key": "FC-352"}
+
+
 def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
     tmp_path, monkeypatch
 ) -> None:

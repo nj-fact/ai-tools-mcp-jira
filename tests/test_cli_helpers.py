@@ -369,6 +369,49 @@ def test_delete_issue_link_cli_dry_run_resolves_without_delete(tmp_path, monkeyp
     assert client.deleted == []
 
 
+class LinkCreateCliFakeClient:
+    def __init__(self, _config) -> None:
+        self.created: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        assert fields == ["project"]
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def link_issues(self, **kwargs):
+        self.created.append(kwargs)
+        return {}
+
+
+def test_link_issue_cli_dry_run_maps_fc_350_blocks_fc_352_to_jira_direction(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = LinkCreateCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(cli.app, ["link-issue", "FC-350", "FC-352", "--type", "Blocks"])
+
+    assert result.exit_code == 0, result.output
+    assert '"inwardIssue": {' in result.output
+    assert '"key": "FC-350"' in result.output
+    assert client.created == []
+
+
 def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
     tmp_path, monkeypatch
 ) -> None:

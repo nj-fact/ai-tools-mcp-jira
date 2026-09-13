@@ -1226,7 +1226,11 @@ def jira_link_issue(
     comment: str | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Link two Jira issues. Defaults to dry-run."""
+    """Link two Jira issues by business direction. Defaults to dry-run.
+
+    outward_key displays the link type's outward label (for example, "blocks"); inward_key
+    displays its inward label (for example, "is blocked by").
+    """
     config = load_config()
     payload = issue_link_payload(
         outward_issue_key=outward_key,

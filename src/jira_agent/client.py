@@ -1337,10 +1337,15 @@ def issue_link_payload(
     link_type: str = "Relates",
     comment: str | None = None,
 ) -> dict[str, Any]:
+    """Build Jira's inverse REST representation of the requested business direction.
+
+    ``outward_issue_key`` is the work item that displays the link type's outward label (for
+    example, "blocks"). Jira's create endpoint names the *other* endpoint ``outwardIssue``.
+    """
     payload: dict[str, Any] = {
         "type": {"name": link_type},
-        "outwardIssue": {"key": outward_issue_key},
-        "inwardIssue": {"key": inward_issue_key},
+        "inwardIssue": {"key": outward_issue_key},
+        "outwardIssue": {"key": inward_issue_key},
     }
     if comment:
         payload["comment"] = {"body": text_to_adf(comment)}
