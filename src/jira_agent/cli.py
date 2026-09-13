@@ -1968,22 +1968,32 @@ def assign_user(
 
 @app.command("link-issue")
 def link_issue(
-    outward_key: Annotated[str, typer.Argument(help="Outward issue key.")],
-    inward_key: Annotated[str, typer.Argument(help="Inward issue key.")],
+    outward_key: Annotated[
+        str,
+        typer.Argument(
+            help="Issue displaying the link type's outward label, for example 'blocks'."
+        ),
+    ],
+    inward_key: Annotated[
+        str,
+        typer.Argument(
+            help="Issue displaying the link type's inward label, for example 'is blocked by'."
+        ),
+    ],
     link_type: Annotated[
         str,
         typer.Option("--type", help="Jira issue link type name."),
     ] = "Relates",
     comment: Annotated[
         str | None,
-        typer.Option("--comment", help="Optional comment on the outward issue."),
+        typer.Option("--comment", help="Optional comment sent with the Jira link."),
     ] = None,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually create the issue link in Jira."),
     ] = False,
 ) -> None:
-    """Link two Jira issues. Defaults to dry-run."""
+    """Link two Jira issues by their business direction. Defaults to dry-run."""
     config = _config()
     payload = issue_link_payload(
         outward_issue_key=outward_key,

@@ -577,8 +577,8 @@ def test_issue_link_payload_supports_optional_comment() -> None:
         comment="Related work",
     ) == {
         "type": {"name": "Relates"},
-        "outwardIssue": {"key": "FC-107"},
-        "inwardIssue": {"key": "FC-101"},
+        "inwardIssue": {"key": "FC-107"},
+        "outwardIssue": {"key": "FC-101"},
         "comment": {
             "body": {
                 "type": "doc",
@@ -613,8 +613,20 @@ def test_link_issues_posts_issue_link_payload() -> None:
     assert client.link_issues(outward_issue_key="FC-107", inward_issue_key="FC-101") == {}
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issueLink"
     assert seen["json"] == (
-        '{"type":{"name":"Relates"},"outwardIssue":{"key":"FC-107"},"inwardIssue":{"key":"FC-101"}}'
+        '{"type":{"name":"Relates"},"inwardIssue":{"key":"FC-107"},"outwardIssue":{"key":"FC-101"}}'
     )
+
+
+def test_issue_link_payload_maps_fc_350_blocks_fc_352_to_jira_rest_direction() -> None:
+    assert issue_link_payload(
+        outward_issue_key="FC-350",
+        inward_issue_key="FC-352",
+        link_type="Blocks",
+    ) == {
+        "type": {"name": "Blocks"},
+        "inwardIssue": {"key": "FC-350"},
+        "outwardIssue": {"key": "FC-352"},
+    }
 
 
 def test_delete_issue_link_uses_issue_link_endpoint() -> None:

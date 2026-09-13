@@ -262,6 +262,20 @@ After an executed deletion the tool rereads both issues and refuses success if e
 that link id. Both operations retain the configured project/issue write allowlists and write an
 audit record after an execution attempt.
 
+For directional Jira link types, `link-issue OUTWARD_KEY INWARD_KEY --type TYPE` uses business
+direction: `OUTWARD_KEY` displays the type's outward label and `INWARD_KEY` displays its inward
+label. For example, the work item which blocks another is supplied first:
+
+```bash
+uv run jira-agent link-issue FC-350 FC-352 --type Blocks
+```
+
+Jira's create REST payload uses the inverse field names (`inwardIssue: FC-350`,
+`outwardIssue: FC-352`) to produce that display. This corrects earlier releases, which sent the
+two fields in the intuitive but wrong order and therefore created directional links reversed.
+Existing directional links are not migrated; inspect and reconcile them deliberately with the
+dry-run `delete-issue-link` command before recreating them.
+
 ## Current Scope
 
 - Read current Jira user with `myself`
