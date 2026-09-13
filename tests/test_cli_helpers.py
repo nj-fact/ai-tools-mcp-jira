@@ -412,6 +412,79 @@ def test_link_issue_cli_dry_run_maps_fc_350_blocks_fc_352_to_jira_direction(
     assert client.created == []
 
 
+class ExistingPngCliFakeClient:
+    def __init__(self, _config) -> None:
+        self.edits: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["description", "attachment"]
+        return {
+            "key": issue_key,
+            "fields": {
+                "description": {"type": "doc", "version": 1, "content": []},
+                "attachment": [
+                    {
+                        "id": "170501",
+                        "filename": "fc349-disbursement-flow.png",
+                        "mimeType": "image/png",
+                    }
+                ],
+            },
+        }
+
+    def attachment_media_id(self, attachment_id, *, issue_key):
+        assert (attachment_id, issue_key) == ("170501", "FC-349")
+        return "media-fc349"
+
+    def edit_issue_adf_description(self, issue_key, description):
+        self.edits.append(description)
+        return {}
+
+
+def test_embed_existing_png_cli_dry_run_resolves_exact_existing_attachment(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ExistingPngCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "embed-existing-png",
+            "FC-349",
+            "--filename",
+            "fc349-disbursement-flow.png",
+            "--width",
+            "1600",
+            "--height",
+            "900",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would embed existing PNG attachment" in result.output
+    assert '"attachment_id": "170501"' in result.output
+    assert client.edits == []
+
+
 def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
     tmp_path, monkeypatch
 ) -> None:

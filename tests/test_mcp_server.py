@@ -428,6 +428,92 @@ def test_jira_link_issue_keeps_fc_350_blocks_fc_352_business_direction(
     assert executed == {"ok": True, "outward_key": "FC-350", "inward_key": "FC-352"}
 
 
+class ExistingPngFakeClient:
+    def __init__(self, _config) -> None:
+        self.description = {"type": "doc", "version": 1, "content": []}
+        self.edits: list[dict[str, object]] = []
+        self.attachment = {
+            "id": "170501",
+            "filename": "fc349-disbursement-flow.png",
+            "mimeType": "image/png",
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["description", "attachment"]
+        return {
+            "key": issue_key,
+            "fields": {"description": self.description, "attachment": [self.attachment]},
+        }
+
+    def attachment_media_id(self, attachment_id, *, issue_key):
+        assert attachment_id == "170501"
+        assert issue_key == "FC-349"
+        return "media-fc349"
+
+    def edit_issue_adf_description(self, issue_key, description):
+        assert issue_key == "FC-349"
+        self.edits.append(description)
+        self.description = description
+        return {}
+
+
+def test_jira_embed_existing_png_attachment_dry_run_then_reuses_existing_attachment(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+
+    dry_run = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png", key="FC-349", width=1600, height=900
+    )
+    executed = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png", key="FC-349", width=1600, height=900, execute=True
+    )
+
+    assert dry_run["ok"] is True
+    assert dry_run["dry_run"] is True
+    assert dry_run["payload"]["attachment_id"] == "170501"
+    assert dry_run["payload"]["media_id"] == "media-fc349"
+    assert client.edits == [
+        {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "mediaSingle",
+                    "attrs": {"layout": "center"},
+                    "content": [
+                        {
+                            "type": "media",
+                            "attrs": {
+                                "id": "media-fc349",
+                                "type": "file",
+                                "collection": "",
+                                "alt": "Architecture diagram",
+                                "width": 1600,
+                                "height": 900,
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+    assert executed["ok"] is True
+    assert executed["media_id"] == "media-fc349"
+
+
 def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
     tmp_path, monkeypatch
 ) -> None:
