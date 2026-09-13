@@ -15,13 +15,13 @@ def _link_issue(*, key: str, link: dict[str, object]) -> dict[str, object]:
     return {"key": key, "fields": {"issuelinks": [link]}}
 
 
-def test_resolve_directed_issue_link_requires_one_fresh_matching_view_per_endpoint() -> None:
+def test_resolve_directed_issue_link_matches_jira_endpoint_representation() -> None:
     outward = _link_issue(
         key="FC-354",
         link={
             "id": "10001",
             "type": {"name": "Relates"},
-            "inwardIssue": {"key": "FC-356"},
+            "outwardIssue": {"key": "FC-356"},
         },
     )
     inward = _link_issue(
@@ -29,7 +29,7 @@ def test_resolve_directed_issue_link_requires_one_fresh_matching_view_per_endpoi
         link={
             "id": "10001",
             "type": {"name": "Relates"},
-            "outwardIssue": {"key": "FC-354"},
+            "inwardIssue": {"key": "FC-354"},
         },
     )
 
@@ -53,14 +53,14 @@ def test_resolve_directed_issue_link_refuses_ambiguity_and_mismatched_id() -> No
         link={
             "id": "10001",
             "type": {"name": "Relates"},
-            "inwardIssue": {"key": "FC-356"},
+            "outwardIssue": {"key": "FC-356"},
         },
     )
     outward["fields"]["issuelinks"].append(  # type: ignore[index]
         {
             "id": "10002",
             "type": {"name": "Relates"},
-            "inwardIssue": {"key": "FC-356"},
+            "outwardIssue": {"key": "FC-356"},
         }
     )
     inward = _link_issue(
@@ -68,7 +68,7 @@ def test_resolve_directed_issue_link_refuses_ambiguity_and_mismatched_id() -> No
         link={
             "id": "10001",
             "type": {"name": "Relates"},
-            "outwardIssue": {"key": "FC-354"},
+            "inwardIssue": {"key": "FC-354"},
         },
     )
 

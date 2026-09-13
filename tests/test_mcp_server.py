@@ -311,7 +311,7 @@ class LinkParentFakeClient:
             {
                 "id": "10001",
                 "type": {"name": "Relates"},
-                "inwardIssue": {"key": "FC-356"},
+                "outwardIssue": {"key": "FC-356"},
             }
         ]
         if duplicate_link:
@@ -319,14 +319,14 @@ class LinkParentFakeClient:
                 {
                     "id": "10002",
                     "type": {"name": "Relates"},
-                    "inwardIssue": {"key": "FC-356"},
+                    "outwardIssue": {"key": "FC-356"},
                 }
             )
         self.inward_links = [
             {
                 "id": "10001",
                 "type": {"name": "Relates"},
-                "outwardIssue": {"key": "FC-354"},
+                "inwardIssue": {"key": "FC-354"},
             }
         ]
 

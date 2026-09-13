@@ -329,7 +329,7 @@ class DeleteLinkCliFakeClient:
                 {
                     "id": "10001",
                     "type": {"name": "Relates"},
-                    "inwardIssue": {"key": "FC-356"},
+                    "outwardIssue": {"key": "FC-356"},
                 }
             ]
         else:
@@ -337,7 +337,7 @@ class DeleteLinkCliFakeClient:
                 {
                     "id": "10001",
                     "type": {"name": "Relates"},
-                    "outwardIssue": {"key": "FC-354"},
+                    "inwardIssue": {"key": "FC-354"},
                 }
             ]
         return {"key": issue_key, "fields": {"issuelinks": links}}

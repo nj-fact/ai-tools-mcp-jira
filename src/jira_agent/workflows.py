@@ -21,19 +21,19 @@ def resolve_directed_issue_link(
     """Resolve one directed Jira issue link from fresh reads of both endpoints.
 
     Jira returns a link relative to the issue being read: the outward endpoint lists the other
-    issue as ``inwardIssue`` and the inward endpoint lists it as ``outwardIssue``.  Requiring
+    issue as ``outwardIssue`` and the inward endpoint lists it as ``inwardIssue``. Requiring
     both views prevents a stale or mismatched id from deleting a different link.
     """
     outward_candidates = _directed_link_candidates(
         outward_issue,
         other_key=inward_key,
-        other_side="inwardIssue",
+        other_side="outwardIssue",
         link_type=link_type,
     )
     inward_candidates = _directed_link_candidates(
         inward_issue,
         other_key=outward_key,
-        other_side="outwardIssue",
+        other_side="inwardIssue",
         link_type=link_type,
     )
 
