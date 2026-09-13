@@ -260,6 +260,115 @@ def test_patch_description_section_cli_allows_a_wide_rewrite_on_request(
     assert len(writes[0]["description"]["content"]) == 2
 
 
+class ClearParentCliFakeClient:
+    def __init__(self, _config) -> None:
+        self.parent = {"key": "FC-300"}
+        self.writes = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["parent"]
+        return {"key": issue_key, "fields": {"parent": self.parent}}
+
+    def edit_issue(self, issue_key, *, clear_parent=False, **_kwargs):
+        assert issue_key == "FC-359"
+        assert clear_parent is True
+        self.writes += 1
+        self.parent = None
+        return {}
+
+
+def test_clear_parent_cli_is_dry_run_by_default_and_verifies_execute(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ClearParentCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+
+    dry_run = CliRunner().invoke(cli.app, ["clear-parent", "FC-359"])
+    executed = CliRunner().invoke(cli.app, ["clear-parent", "FC-359", "--execute"])
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "would clear issue parent" in dry_run.output
+    assert client.writes == 1
+    assert executed.exit_code == 0, executed.output
+    assert "Cleared parent of FC-359." in executed.output
+
+
+class DeleteLinkCliFakeClient:
+    def __init__(self, _config) -> None:
+        self.deleted: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["issuelinks"]
+        if issue_key == "FC-354":
+            links = [
+                {
+                    "id": "10001",
+                    "type": {"name": "Relates"},
+                    "inwardIssue": {"key": "FC-356"},
+                }
+            ]
+        else:
+            links = [
+                {
+                    "id": "10001",
+                    "type": {"name": "Relates"},
+                    "outwardIssue": {"key": "FC-354"},
+                }
+            ]
+        return {"key": issue_key, "fields": {"issuelinks": links}}
+
+    def delete_issue_link(self, link_id, *, issue_key):
+        self.deleted.append(link_id)
+        return {}
+
+
+def test_delete_issue_link_cli_dry_run_resolves_without_delete(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = DeleteLinkCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(cli.app, ["delete-issue-link", "FC-354", "FC-356"])
+
+    assert result.exit_code == 0, result.output
+    assert "would delete issue link" in result.output
+    assert '"id": "10001"' in result.output
+    assert client.deleted == []
+
+
 def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
     tmp_path, monkeypatch
 ) -> None:

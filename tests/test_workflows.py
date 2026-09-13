@@ -6,8 +6,89 @@ from jira_agent.workflows import (
     markdown_section,
     normalize_drift_label,
     read_text_source,
+    resolve_directed_issue_link,
     update_drift_labels,
 )
+
+
+def _link_issue(*, key: str, link: dict[str, object]) -> dict[str, object]:
+    return {"key": key, "fields": {"issuelinks": [link]}}
+
+
+def test_resolve_directed_issue_link_requires_one_fresh_matching_view_per_endpoint() -> None:
+    outward = _link_issue(
+        key="FC-354",
+        link={
+            "id": "10001",
+            "type": {"name": "Relates"},
+            "inwardIssue": {"key": "FC-356"},
+        },
+    )
+    inward = _link_issue(
+        key="FC-356",
+        link={
+            "id": "10001",
+            "type": {"name": "Relates"},
+            "outwardIssue": {"key": "FC-354"},
+        },
+    )
+
+    assert resolve_directed_issue_link(
+        outward_issue=outward,
+        inward_issue=inward,
+        outward_key="FC-354",
+        inward_key="FC-356",
+        link_type="Relates",
+    ) == {
+        "id": "10001",
+        "type": "Relates",
+        "outward_key": "FC-354",
+        "inward_key": "FC-356",
+    }
+
+
+def test_resolve_directed_issue_link_refuses_ambiguity_and_mismatched_id() -> None:
+    outward = _link_issue(
+        key="FC-354",
+        link={
+            "id": "10001",
+            "type": {"name": "Relates"},
+            "inwardIssue": {"key": "FC-356"},
+        },
+    )
+    outward["fields"]["issuelinks"].append(  # type: ignore[index]
+        {
+            "id": "10002",
+            "type": {"name": "Relates"},
+            "inwardIssue": {"key": "FC-356"},
+        }
+    )
+    inward = _link_issue(
+        key="FC-356",
+        link={
+            "id": "10001",
+            "type": {"name": "Relates"},
+            "outwardIssue": {"key": "FC-354"},
+        },
+    )
+
+    for link_id, message in [
+        (None, "found 2 from FC-354 and 1 from FC-356."),
+        ("10002", "found 1 from FC-354 and 0 from FC-356."),
+    ]:
+        try:
+            resolve_directed_issue_link(
+                outward_issue=outward,
+                inward_issue=inward,
+                outward_key="FC-354",
+                inward_key="FC-356",
+                link_type="Relates",
+                link_id=link_id,
+            )
+        except ValueError as exc:
+            assert str(exc).endswith(message)
+        else:
+            raise AssertionError("Expected ValueError")
 
 
 def test_read_text_source_can_select_one_markdown_section(tmp_path) -> None:
