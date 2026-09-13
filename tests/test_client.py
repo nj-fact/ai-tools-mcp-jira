@@ -427,6 +427,17 @@ def test_edit_issue_payload_supports_parent_and_priority() -> None:
     }
 
 
+def test_edit_issue_payload_omits_parent_unless_set_or_explicitly_cleared() -> None:
+    assert "parent" not in edit_issue_payload(summary="Updated")["fields"]
+    assert edit_issue_payload(clear_parent=True)["fields"] == {"parent": None}
+    try:
+        edit_issue_payload(parent_key="FC-900", clear_parent=True)
+    except ValueError as exc:
+        assert str(exc) == "Use either parent_key or clear_parent, not both"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_create_issue_payload_sets_one_fix_version() -> None:
     payload = create_issue_payload(
         project_key="FC",
@@ -604,6 +615,29 @@ def test_link_issues_posts_issue_link_payload() -> None:
     assert seen["json"] == (
         '{"type":{"name":"Relates"},"outwardIssue":{"key":"FC-107"},"inwardIssue":{"key":"FC-101"}}'
     )
+
+
+def test_delete_issue_link_uses_issue_link_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.delete_issue_link("10001", issue_key="FC-107") == {}
+    assert seen == {
+        "method": "DELETE",
+        "url": "https://example.atlassian.net/rest/api/3/issueLink/10001",
+    }
 
 
 def test_get_changelog_uses_paginated_endpoint() -> None:

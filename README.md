@@ -113,6 +113,8 @@ uv run jira-agent drift-labels --add needs-review --remove resolved
 uv run jira-agent edit-issue --labels jira-agent,test
 uv run jira-agent assign-user Norman
 uv run jira-agent link-issue FC-107 FC-101 --type Relates
+uv run jira-agent delete-issue-link FC-354 FC-356 --type Relates
+uv run jira-agent clear-parent FC-359
 uv run jira-agent attach --file ./some-report.txt
 uv run jira-agent delete-attachment FC-107 --attachment-id 12345
 uv run jira-agent embed-diagram FC-107 --file ./architecture.png --delete-filename old.svg
@@ -232,6 +234,34 @@ to `customfield_10028`. That numeric id differs per Jira site: look yours up und
 `/rest/api/3/field` and set the variable in `.env` if it is not the default. Whole values are sent as
 integers, halves such as `0.5` are preserved, and `edit-issue` takes the same option.
 
+## Safe parent and issue-link reconciliation
+
+`edit-issue` leaves an issue parent unchanged when `--parent` is omitted and sets a parent when
+`--parent FC-123` is supplied. Clearing is deliberately a separate operation so an omitted value
+can never be interpreted as removal:
+
+```bash
+uv run jira-agent clear-parent FC-359
+uv run jira-agent clear-parent FC-359 --execute
+```
+
+The command first reads the current parent, defaults to a dry run, and after `--execute` rereads
+the issue and refuses a success result unless the parent is `null`.
+
+`delete-issue-link` also defaults to dry run. It reads both endpoints freshly and resolves exactly
+one directed link with the requested type before deletion. The endpoint records must agree on the
+same Jira link id; missing, mismatched, or duplicate matches are refused. Pass `--link-id` when a
+specific id is already known to pin the resolution further:
+
+```bash
+uv run jira-agent delete-issue-link FC-354 FC-356 --type Relates
+uv run jira-agent delete-issue-link FC-354 FC-356 --type Relates --link-id 10001 --execute
+```
+
+After an executed deletion the tool rereads both issues and refuses success if either still lists
+that link id. Both operations retain the configured project/issue write allowlists and write an
+audit record after an execution attempt.
+
 ## Current Scope
 
 - Read current Jira user with `myself`
@@ -251,12 +281,14 @@ integers, halves such as `0.5` are preserved, and `edit-issue` takes the same op
 - Post Drift Reconcile comments with `drift-reconcile-comment`
 - Set or remove `drift-*` labels with `drift-labels`
 - Edit summary, description, labels, parent, priority, and story points with `edit-issue`
+- Clear an issue parent explicitly with `clear-parent`, with a post-write reread
 - Rewrite one section of an existing description with `patch-description-section`, which
   replaces, appends to, prepends to, or deletes the matched section and carries every top-level
   node outside it over unchanged; any further section the slice removes has to be named with
   `--expect-swallowed-heading`, and a slice that is the whole field needs `--allow-wide-rewrite`
 - Search assignable users with `user-search` and assign by query with `assign-user`
-- Link issues with `link-issue`
+- Link issues with `link-issue` and delete one freshly resolved, direction-validated link with
+  `delete-issue-link`
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
@@ -315,6 +347,7 @@ Available MCP tools:
 - `jira_assign_issue`
 - `jira_agent_report`
 - `jira_edit_issue`
+- `jira_clear_issue_parent`
 - `jira_patch_description_section`
 - `jira_agent_plan_comment`
 - `jira_write_human_brief`
@@ -328,6 +361,7 @@ Available MCP tools:
 - `jira_update_comment`
 - `jira_list_transitions`
 - `jira_link_issue`
+- `jira_delete_issue_link`
 - `jira_attach_file`
 - `jira_delete_attachment`
 - `jira_embed_diagram`

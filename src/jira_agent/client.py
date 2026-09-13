@@ -246,6 +246,7 @@ class JiraClient:
         labels: list[str] | None = None,
         fix_versions: list[str] | None = None,
         parent_key: str | None = None,
+        clear_parent: bool = False,
         priority: str | None = None,
         story_points: float | None = None,
     ) -> dict[str, Any]:
@@ -258,6 +259,7 @@ class JiraClient:
                 labels=labels,
                 fix_versions=fix_versions,
                 parent_key=parent_key,
+                clear_parent=clear_parent,
                 priority=priority,
                 story_points=story_points,
                 story_points_field=self.config.story_points_field,
@@ -296,6 +298,14 @@ class JiraClient:
             ),
             key=outward_issue_key,
         )
+
+    def delete_issue_link(self, link_id: str, *, issue_key: str) -> dict[str, Any]:
+        """Delete one already-resolved issue link.
+
+        Callers must validate the link against fresh issue reads before invoking this endpoint.
+        ``issue_key`` only selects the correct per-project credential set.
+        """
+        return self._request("DELETE", f"/issueLink/{link_id}", key=issue_key)
 
     def add_attachment(self, issue_key: str, file_path: str | Path) -> list[dict[str, Any]]:
         path = Path(file_path)
@@ -1291,10 +1301,13 @@ def edit_issue_payload(
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
     parent_key: str | None = None,
+    clear_parent: bool = False,
     priority: str | None = None,
     story_points: float | None = None,
     story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
+    if clear_parent and parent_key is not None:
+        raise ValueError("Use either parent_key or clear_parent, not both")
     fields: dict[str, Any] = {}
     if summary is not None:
         fields["summary"] = summary
@@ -1304,7 +1317,9 @@ def edit_issue_payload(
         fields["labels"] = labels
     if fix_versions is not None:
         fields["fixVersions"] = [{"name": version} for version in fix_versions]
-    if parent_key is not None:
+    if clear_parent:
+        fields["parent"] = None
+    elif parent_key is not None:
         fields["parent"] = {"key": parent_key}
     if priority is not None:
         fields["priority"] = {"name": priority}

@@ -43,7 +43,9 @@ from jira_agent.safety import (
 from jira_agent.workflows import (
     drift_reconcile_comment_body,
     factory_contract_comment_body,
+    issue_contains_link_id,
     read_text_source,
+    resolve_directed_issue_link,
     update_drift_labels,
 )
 
@@ -546,6 +548,64 @@ def jira_edit_issue(
         return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
+
+
+@mcp.tool
+def jira_clear_issue_parent(
+    key: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Clear an issue parent explicitly. Defaults to dry-run and verifies the reread."""
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    payload = edit_issue_payload(clear_parent=True, story_points_field=config.story_points_field)
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            current = client.get_issue(issue_key, fields=["parent"])
+            before = (current.get("fields") or {}).get("parent")
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "before": before,
+                    "payload": payload,
+                    "safety": safety,
+                    "write_scope": write_scope_summary(config),
+                    "message": "Pass execute=true to clear this issue parent in Jira.",
+                }
+
+            result = client.edit_issue(issue_key, clear_parent=True)
+            verified = client.get_issue(issue_key, fields=["parent"])
+            after = (verified.get("fields") or {}).get("parent")
+            audit_write(
+                config,
+                action="clear_parent",
+                issue_key=issue_key,
+                payload={"before": before, "payload": payload},
+                result={"edit": result, "verified_parent": after},
+            )
+            if after is not None:
+                return {
+                    "ok": False,
+                    "message": f"Parent clear was not verified for {issue_key}: {after!r}",
+                    "issue": issue_key,
+                    "verified_parent": after,
+                }
+            return {"ok": True, "issue": issue_key, "verified_parent": None}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 _PATCH_SUMMARY_KEYS = (
@@ -1206,6 +1266,75 @@ def jira_link_issue(
         return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
+
+
+@mcp.tool
+def jira_delete_issue_link(
+    outward_key: str,
+    inward_key: str,
+    link_type: str = "Relates",
+    link_id: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Delete one validated directed issue link. Defaults to dry-run.
+
+    Fresh reads of both endpoints must identify one link with the requested type and direction.
+    Pass link_id to additionally pin the expected Jira id; otherwise ambiguity is refused.
+    """
+    config = load_config()
+    try:
+        with JiraClient(config) as client:
+            outward_safety = ensure_issue_write_allowed(config, client, outward_key)
+            inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            outward_issue = client.get_issue(outward_key, fields=["issuelinks"])
+            inward_issue = client.get_issue(inward_key, fields=["issuelinks"])
+            resolved = resolve_directed_issue_link(
+                outward_issue=outward_issue,
+                inward_issue=inward_issue,
+                outward_key=outward_key,
+                inward_key=inward_key,
+                link_type=link_type,
+                link_id=link_id,
+            )
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "resolved_link": resolved,
+                    "outward_safety": outward_safety,
+                    "inward_safety": inward_safety,
+                    "write_scope": write_scope_summary(config),
+                    "message": "Pass execute=true to delete this exact issue link in Jira.",
+                }
+
+            result = client.delete_issue_link(resolved["id"], issue_key=outward_key)
+            verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
+            verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
+            still_present = {
+                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
+                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
+            }
+            audit_write(
+                config,
+                action="delete_issue_link",
+                issue_key=outward_key,
+                payload={"resolved_link": resolved},
+                result={"delete": result, "still_present": still_present},
+            )
+            if any(still_present.values()):
+                return {
+                    "ok": False,
+                    "message": f"Issue-link deletion was not verified for {resolved['id']}.",
+                    "resolved_link": resolved,
+                    "still_present": still_present,
+                }
+            return {"ok": True, "resolved_link": resolved, "still_present": still_present}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @mcp.tool

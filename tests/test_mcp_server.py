@@ -299,6 +299,152 @@ def test_jira_patch_description_section_delete_removes_the_slice_and_rejects_con
     assert client.writes[0]["description"]["content"] == description_document()["content"][:3]
 
 
+class LinkParentFakeClient:
+    def __init__(
+        self, _config, *, duplicate_link: bool = False, verify_delete: bool = True
+    ) -> None:
+        self.deleted_link_ids: list[str] = []
+        self.clear_parent_calls = 0
+        self.parent = {"key": "FC-300"}
+        self.verify_delete = verify_delete
+        self.outward_links = [
+            {
+                "id": "10001",
+                "type": {"name": "Relates"},
+                "inwardIssue": {"key": "FC-356"},
+            }
+        ]
+        if duplicate_link:
+            self.outward_links.append(
+                {
+                    "id": "10002",
+                    "type": {"name": "Relates"},
+                    "inwardIssue": {"key": "FC-356"},
+                }
+            )
+        self.inward_links = [
+            {
+                "id": "10001",
+                "type": {"name": "Relates"},
+                "outwardIssue": {"key": "FC-354"},
+            }
+        ]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        if fields == ["parent"]:
+            return {"key": issue_key, "fields": {"parent": self.parent}}
+        if fields == ["issuelinks"]:
+            links = self.outward_links if issue_key == "FC-354" else self.inward_links
+            if self.deleted_link_ids and self.verify_delete:
+                links = [link for link in links if link["id"] not in self.deleted_link_ids]
+            return {"key": issue_key, "fields": {"issuelinks": links}}
+        raise AssertionError(f"Unexpected fields: {fields}")
+
+    def edit_issue(self, issue_key, *, clear_parent=False, **_kwargs):
+        assert issue_key == "FC-359"
+        assert clear_parent is True
+        self.clear_parent_calls += 1
+        self.parent = None
+        return {}
+
+    def delete_issue_link(self, link_id, *, issue_key):
+        assert issue_key == "FC-354"
+        self.deleted_link_ids.append(link_id)
+        return {}
+
+
+def _install_link_parent_client(monkeypatch, tmp_path, **kwargs) -> LinkParentFakeClient:
+    config = make_config(tmp_path)
+    client = LinkParentFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+    return client
+
+
+def test_jira_delete_issue_link_dry_run_resolves_but_does_not_delete(tmp_path, monkeypatch) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_delete_issue_link("FC-354", "FC-356")
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["resolved_link"]["id"] == "10001"
+    assert client.deleted_link_ids == []
+
+
+def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_delete_issue_link("FC-354", "FC-356", execute=True)
+
+    assert result == {
+        "ok": True,
+        "resolved_link": {
+            "id": "10001",
+            "type": "Relates",
+            "outward_key": "FC-354",
+            "inward_key": "FC-356",
+        },
+        "still_present": {"FC-354": False, "FC-356": False},
+    }
+    assert client.deleted_link_ids == ["10001"]
+
+
+def test_jira_delete_issue_link_refuses_ambiguous_or_mismatched_target_without_delete(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path, duplicate_link=True)
+
+    ambiguous = mcp_server.jira_delete_issue_link("FC-354", "FC-356", execute=True)
+    mismatch = mcp_server.jira_delete_issue_link(
+        "FC-354", "FC-356", link_id="10002", execute=True
+    )
+
+    assert ambiguous["ok"] is False
+    assert "Expected exactly one directed" in ambiguous["message"]
+    assert mismatch["ok"] is False
+    assert "Expected exactly one directed" in mismatch["message"]
+    assert client.deleted_link_ids == []
+
+
+def test_jira_delete_issue_link_refuses_success_when_the_reread_still_has_the_link(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path, verify_delete=False)
+
+    result = mcp_server.jira_delete_issue_link("FC-354", "FC-356", execute=True)
+
+    assert result["ok"] is False
+    assert result["still_present"] == {"FC-354": True, "FC-356": True}
+    assert client.deleted_link_ids == ["10001"]
+
+
+def test_jira_clear_issue_parent_is_explicit_dry_run_then_verified_execute(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+
+    dry_run = mcp_server.jira_clear_issue_parent("FC-359")
+    executed = mcp_server.jira_clear_issue_parent("FC-359", execute=True)
+
+    assert dry_run["dry_run"] is True
+    assert dry_run["before"] == {"key": "FC-300"}
+    assert dry_run["payload"] == {"fields": {"parent": None}}
+    assert client.clear_parent_calls == 1
+    assert executed == {"ok": True, "issue": "FC-359", "verified_parent": None}
+
+
 def test_jira_patch_description_section_refuses_an_unnamed_swallowed_section(
     tmp_path, monkeypatch
 ) -> None:

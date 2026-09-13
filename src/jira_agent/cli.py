@@ -44,7 +44,9 @@ from jira_agent.safety import (
 from jira_agent.workflows import (
     drift_reconcile_comment_body,
     factory_contract_comment_body,
+    issue_contains_link_id,
     read_text_source,
+    resolve_directed_issue_link,
     update_drift_labels,
 )
 
@@ -1527,6 +1529,70 @@ def edit_issue(
     console.print(f"Edited {issue_key}.")
 
 
+@app.command("clear-parent")
+def clear_parent(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually clear the issue parent in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the verified Jira JSON response."),
+    ] = False,
+) -> None:
+    """Clear an issue parent explicitly. Defaults to dry-run and verifies the reread."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+
+    payload = edit_issue_payload(clear_parent=True, story_points_field=config.story_points_field)
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            current = client.get_issue(issue_key, fields=["parent"])
+            before = (current.get("fields") or {}).get("parent")
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would clear issue parent")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                _print_json({"before": before, "payload": payload})
+                console.print("Pass --execute to clear the parent in Jira.")
+                return
+
+            result = client.edit_issue(issue_key, clear_parent=True)
+            verified = client.get_issue(issue_key, fields=["parent"])
+            after = (verified.get("fields") or {}).get("parent")
+            audit_write(
+                config,
+                action="clear_parent",
+                issue_key=issue_key,
+                payload={"before": before, "payload": payload},
+                result={"edit": result, "verified_parent": after},
+            )
+            if after is not None:
+                raise ValueError(f"Parent clear was not verified for {issue_key}: {after!r}")
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+        except ValueError as exc:
+            error_console.print(f"[red]Parent clear error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    if json_output:
+        _print_json(verified)
+        return
+    console.print(f"Cleared parent of {issue_key}.")
+
+
 @app.command("patch-description-section")
 def patch_description_section(
     key: Annotated[str, typer.Argument(help="Jira issue key.")],
@@ -1956,6 +2022,81 @@ def link_issue(
             _exit_api_error(exc)
 
     console.print(f"Linked {outward_key} to {inward_key} with {link_type}.")
+
+
+@app.command("delete-issue-link")
+def delete_issue_link(
+    outward_key: Annotated[str, typer.Argument(help="Expected outward issue key.")],
+    inward_key: Annotated[str, typer.Argument(help="Expected inward issue key.")],
+    link_type: Annotated[
+        str,
+        typer.Option("--type", help="Exact Jira issue link type name."),
+    ] = "Relates",
+    link_id: Annotated[
+        str | None,
+        typer.Option(
+            "--link-id",
+            help="Optional exact Jira link id. Omit only when the fresh reads identify one link.",
+        ),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually delete the validated issue link in Jira."),
+    ] = False,
+) -> None:
+    """Delete one validated directed issue link. Defaults to dry-run."""
+    config = _config()
+    with JiraClient(config) as client:
+        try:
+            outward_safety = ensure_issue_write_allowed(config, client, outward_key)
+            inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            outward_issue = client.get_issue(outward_key, fields=["issuelinks"])
+            inward_issue = client.get_issue(inward_key, fields=["issuelinks"])
+            resolved = resolve_directed_issue_link(
+                outward_issue=outward_issue,
+                inward_issue=inward_issue,
+                outward_key=outward_key,
+                inward_key=inward_key,
+                link_type=link_type,
+                link_id=link_id,
+            )
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would delete issue link")
+                console.print(f"outward safety: {outward_safety}")
+                console.print(f"inward safety: {inward_safety}")
+                _print_json({"resolved_link": resolved})
+                console.print("Pass --execute to delete this exact link in Jira.")
+                return
+
+            result = client.delete_issue_link(resolved["id"], issue_key=outward_key)
+            verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
+            verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
+            still_present = {
+                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
+                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
+            }
+            audit_write(
+                config,
+                action="delete_issue_link",
+                issue_key=outward_key,
+                payload={"resolved_link": resolved},
+                result={"delete": result, "still_present": still_present},
+            )
+            if any(still_present.values()):
+                raise ValueError(
+                    f"Issue-link deletion was not verified for {resolved['id']}: {still_present}"
+                )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+        except ValueError as exc:
+            error_console.print(f"[red]Issue-link deletion error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    console.print(
+        f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}."
+    )
 
 
 @app.command("attach")
