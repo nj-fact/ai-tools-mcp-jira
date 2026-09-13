@@ -12,6 +12,7 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
@@ -46,6 +47,7 @@ from jira_agent.workflows import (
     issue_contains_link_id,
     read_text_source,
     resolve_directed_issue_link,
+    resolve_png_attachment,
     update_drift_labels,
 )
 
@@ -1659,6 +1661,143 @@ def jira_embed_diagram(
         return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
+
+
+@mcp.tool
+def jira_embed_existing_png_attachment(
+    filename: str,
+    key: str | None = None,
+    attachment_id: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    alt: str = "Architecture diagram",
+    replace_existing: bool = False,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Embed one existing PNG attachment without uploading a duplicate. Defaults to dry-run.
+
+    filename must identify exactly one current PNG attachment unless attachment_id pins the match.
+    width and height are required because display dimensions are never guessed. When
+    replace_existing is true, exactly one inline media item must belong to an attachment with the
+    same filename; no unrelated media is replaced.
+    """
+    config = load_config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        return {
+            "ok": False,
+            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+    if width is None or height is None or width < 1 or height < 1:
+        return {"ok": False, "message": "width and height must both be positive integers."}
+
+    try:
+        with JiraClient(config) as client:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            attachment = resolve_png_attachment(
+                issue, filename=filename, attachment_id=attachment_id
+            )
+            resolved_id = str(attachment["id"])
+            media_id = client.attachment_media_id(resolved_id, issue_key=issue_key)
+            existing_description = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            replace_media_id: str | None = None
+            if replace_existing:
+                same_filename = [
+                    item
+                    for item in issue.get("fields", {}).get("attachment") or []
+                    if isinstance(item, dict) and item.get("filename") == filename
+                ]
+                embedded_ids = [
+                    client.attachment_media_id(str(item["id"]), issue_key=issue_key)
+                    for item in same_filename
+                    if item.get("id") is not None
+                ]
+                matches = [
+                    item_id
+                    for item_id in embedded_ids
+                    if adf_contains_media_id(existing_description, item_id)
+                ]
+                if len(matches) != 1:
+                    return {
+                        "ok": False,
+                        "message": (
+                            "Expected exactly one embedded media item from attachments named "
+                            f"{filename!r}; found {len(matches)}."
+                        ),
+                    }
+                replace_media_id = matches[0]
+
+            payload = {
+                "attachment_id": resolved_id,
+                "filename": filename,
+                "media_id": media_id,
+                "dimensions": {"width": width, "height": height},
+                "replace_media_id": replace_media_id,
+            }
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": issue_key,
+                    "attachment": attachment,
+                    "payload": payload,
+                    "safety": safety,
+                    "write_scope": write_scope_summary(config),
+                    "message": "Pass execute=true to embed this existing attachment in Jira.",
+                }
+
+            description = replace_diagram_with_media(
+                existing_description,
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+                replace_media_id=replace_media_id,
+            )
+            result = client.edit_issue_adf_description(issue_key, description)
+            verified = client.get_issue(issue_key, fields=["description", "attachment"])
+            verified_attachment = resolve_png_attachment(
+                verified, filename=filename, attachment_id=resolved_id
+            )
+            verified_description = (verified.get("fields") or {}).get("description") or {}
+            embedded = adf_contains_media_id(verified_description, media_id)
+            audit_write(
+                config,
+                action="embed_existing_png",
+                issue_key=issue_key,
+                payload=payload,
+                result={
+                    "edit": result,
+                    "verified_attachment_id": verified_attachment["id"],
+                    "embedded": embedded,
+                },
+            )
+            if not embedded:
+                return {
+                    "ok": False,
+                    "message": (
+                        f"Existing attachment {resolved_id} was not found inline after reread."
+                    ),
+                    "attachment_id": resolved_id,
+                }
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "attachment": verified_attachment,
+                "media_id": media_id,
+                "embedded": True,
+            }
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @mcp.tool

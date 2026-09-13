@@ -12,6 +12,7 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    adf_contains_media_id,
     adf_heading_text,
     create_issue_payload,
     edit_issue_payload,
@@ -922,6 +923,38 @@ def test_replace_diagram_with_media_handles_multiple_mermaid_blocks_in_order() -
     media = [block for block in second["content"] if block["type"] == "mediaSingle"]
     assert [block["content"][0]["attrs"]["id"] for block in media] == ["media-1", "media-2"]
     assert not any(block["type"] == "codeBlock" for block in second["content"])
+
+
+def test_replace_diagram_with_media_can_target_one_existing_media_id() -> None:
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{"type": "media", "attrs": {"id": "old-media"}}],
+            },
+            {
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{"type": "media", "attrs": {"id": "keep-media"}}],
+            },
+        ],
+    }
+
+    replaced = replace_diagram_with_media(
+        adf,
+        media_id="new-media",
+        alt="Updated diagram",
+        width=1600,
+        height=900,
+        replace_media_id="old-media",
+    )
+
+    assert adf_contains_media_id(replaced, "new-media")
+    assert adf_contains_media_id(replaced, "keep-media")
+    assert not adf_contains_media_id(replaced, "old-media")
 
 
 def test_image_gallery_blocks_build_linked_tables() -> None:

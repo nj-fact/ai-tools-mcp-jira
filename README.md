@@ -118,6 +118,7 @@ uv run jira-agent clear-parent FC-359
 uv run jira-agent attach --file ./some-report.txt
 uv run jira-agent delete-attachment FC-107 --attachment-id 12345
 uv run jira-agent embed-diagram FC-107 --file ./architecture.png --delete-filename old.svg
+uv run jira-agent embed-existing-png FC-349 --filename fc349-disbursement-flow.png --width <WIDTH> --height <HEIGHT>
 uv run jira-agent changelog --limit 5
 uv run jira-agent audit-log --limit 10
 uv run jira-agent smoke-write
@@ -276,6 +277,23 @@ two fields in the intuitive but wrong order and therefore created directional li
 Existing directional links are not migrated; inspect and reconcile them deliberately with the
 dry-run `delete-issue-link` command before recreating them.
 
+To restore an inline diagram without uploading a second copy, `embed-existing-png` resolves an
+existing attachment by its exact PNG filename. A duplicate filename is refused unless
+`--attachment-id` pins one current attachment, and the MIME type must be `image/png`. Display
+dimensions are explicit because they are never guessed:
+
+```bash
+uv run jira-agent embed-existing-png FC-349 \
+  --filename fc349-disbursement-flow.png --width <WIDTH> --height <HEIGHT>
+uv run jira-agent embed-existing-png FC-349 \
+  --filename fc349-disbursement-flow.png --width <WIDTH> --height <HEIGHT> --execute
+```
+
+The command resolves and validates Jira's media id before its dry run, uses the same normal
+diagram placement behavior as `embed-diagram`, and rereads the description after execution to
+prove that exact media id is inline. `--replace-existing` is stricter: it replaces only one media
+item that belongs to an attachment of the same filename; zero or multiple candidates are refused.
+
 ## Current Scope
 
 - Read current Jira user with `myself`
@@ -306,6 +324,7 @@ dry-run `delete-issue-link` command before recreating them.
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
+- Embed an existing, exact PNG attachment without reuploading it using `embed-existing-png`
 - Automatically render and embed Mermaid blocks after `create-issue` (disable with
   `--no-render-mermaid`) and retrofit an existing issue with `render-mermaid`
 - Insert or replace a linked screenshot gallery from existing attachments with
@@ -379,6 +398,7 @@ Available MCP tools:
 - `jira_attach_file`
 - `jira_delete_attachment`
 - `jira_embed_diagram`
+- `jira_embed_existing_png_attachment`
 - `jira_upsert_image_gallery`
 - `jira_render_mermaid_diagrams`
 - `jira_changelog`

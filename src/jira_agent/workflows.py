@@ -9,6 +9,56 @@ class IssueLinkResolutionError(ValueError):
     """The fresh Jira reads did not identify exactly the directed link requested."""
 
 
+class AttachmentResolutionError(ValueError):
+    """The fresh Jira attachment list did not identify exactly one requested PNG."""
+
+
+def resolve_png_attachment(
+    issue: dict[str, Any],
+    *,
+    filename: str,
+    attachment_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve one exact, attached PNG from a fresh issue response.
+
+    A duplicated filename is refused unless the caller pins the attachment id, and a pinned id
+    must still belong to that filename. The Jira attachment MIME type is checked rather than
+    trusting the filename suffix alone.
+    """
+    path = Path(filename)
+    if path.name != filename or path.suffix.lower() != ".png":
+        raise AttachmentResolutionError(
+            f"Attachment filename must be a plain PNG filename: {filename}"
+        )
+
+    attachments = (issue.get("fields") or {}).get("attachment") or []
+    if not isinstance(attachments, list):
+        attachments = []
+    matches = [
+        attachment
+        for attachment in attachments
+        if isinstance(attachment, dict) and attachment.get("filename") == filename
+    ]
+    if attachment_id is not None:
+        matches = [item for item in matches if str(item.get("id")) == str(attachment_id)]
+    if len(matches) != 1:
+        pin = f" with id {attachment_id}" if attachment_id is not None else ""
+        raise AttachmentResolutionError(
+            f"Expected exactly one attachment named {filename!r}{pin}; found {len(matches)}."
+        )
+
+    attachment = matches[0]
+    mime_type = str(attachment.get("mimeType") or "")
+    if mime_type.casefold() != "image/png":
+        raise AttachmentResolutionError(
+            f"Attachment {attachment.get('id')} named {filename!r} is not a PNG "
+            f"(mimeType={mime_type!r})."
+        )
+    if attachment.get("id") is None:
+        raise AttachmentResolutionError(f"Attachment {filename!r} has no Jira attachment id.")
+    return attachment
+
+
 def resolve_directed_issue_link(
     *,
     outward_issue: dict[str, Any],

@@ -485,32 +485,74 @@ def replace_diagram_with_media(
     alt: str,
     width: int,
     height: int,
+    replace_media_id: str | None = None,
 ) -> dict[str, Any]:
     replacement = media_single_adf(media_id=media_id, alt=alt, width=width, height=height)
     content = list(adf.get("content") or [])
-    mermaid_index = next(
-        (
-            index
-            for index, block in enumerate(content)
-            if block.get("type") == "codeBlock"
-            and (block.get("attrs") or {}).get("language") == "mermaid"
-        ),
-        None,
-    )
-
-    if mermaid_index is not None:
-        content[mermaid_index] = replacement
+    if replace_media_id is not None:
+        media_index = _media_single_index(content, replace_media_id)
+        if media_index is None:
+            raise ValueError(f"Description does not contain media id {replace_media_id!r}")
+        content[media_index] = replacement
     else:
-        media_index = next(
-            (index for index, block in enumerate(content) if block.get("type") == "mediaSingle"),
+        mermaid_index = next(
+            (
+                index
+                for index, block in enumerate(content)
+                if block.get("type") == "codeBlock"
+                and (block.get("attrs") or {}).get("language") == "mermaid"
+            ),
             None,
         )
-        if media_index is not None:
-            content[media_index] = replacement
+
+        if mermaid_index is not None:
+            content[mermaid_index] = replacement
         else:
-            content.append(replacement)
+            media_index = next(
+                (
+                    index
+                    for index, block in enumerate(content)
+                    if block.get("type") == "mediaSingle"
+                ),
+                None,
+            )
+            if media_index is not None:
+                content[media_index] = replacement
+            else:
+                content.append(replacement)
 
     return {**adf, "content": content}
+
+
+def adf_contains_media_id(adf: Any, media_id: str) -> bool:
+    """Return whether a Jira ADF description contains an inline media item with this id."""
+    content = adf.get("content") if isinstance(adf, dict) else None
+    return _media_single_index(content if isinstance(content, list) else [], media_id) is not None
+
+
+def adf_media_ids(adf: Any) -> list[str]:
+    """Return the inline media ids from top-level mediaSingle nodes in document order."""
+    content = adf.get("content") if isinstance(adf, dict) else None
+    if not isinstance(content, list):
+        return []
+    result: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "mediaSingle":
+            continue
+        for media in block.get("content") or []:
+            media_id = ((media.get("attrs") or {}).get("id") if isinstance(media, dict) else None)
+            if media_id is not None:
+                result.append(str(media_id))
+    return result
+
+
+def _media_single_index(content: list[Any], media_id: str) -> int | None:
+    for index, block in enumerate(content):
+        if not isinstance(block, dict) or block.get("type") != "mediaSingle":
+            continue
+        if str(media_id) in adf_media_ids({"content": [block]}):
+            return index
+    return None
 
 
 ADF_SECTION_PATCH_MODES = ("replace", "append", "prepend", "delete")

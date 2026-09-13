@@ -15,6 +15,7 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
@@ -47,6 +48,7 @@ from jira_agent.workflows import (
     issue_contains_link_id,
     read_text_source,
     resolve_directed_issue_link,
+    resolve_png_attachment,
     update_drift_labels,
 )
 
@@ -2350,6 +2352,160 @@ def embed_diagram(
         f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
         f"deleted {len(deleted)} old attachment(s)."
     )
+
+
+@app.command("embed-existing-png")
+def embed_existing_png(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        typer.Option("--filename", help="Exact existing PNG attachment filename."),
+    ] = None,
+    attachment_id: Annotated[
+        str | None,
+        typer.Option("--attachment-id", help="Pin an exact attachment id when filenames repeat."),
+    ] = None,
+    width: Annotated[
+        int | None,
+        typer.Option("--width", min=1, help="Verified PNG display width in pixels."),
+    ] = None,
+    height: Annotated[
+        int | None,
+        typer.Option("--height", min=1, help="Verified PNG display height in pixels."),
+    ] = None,
+    alt: Annotated[
+        str,
+        typer.Option("--alt", help="Alt text for the embedded diagram."),
+    ] = "Architecture diagram",
+    replace_existing: Annotated[
+        bool,
+        typer.Option(
+            "--replace-existing",
+            help=(
+                "Replace exactly one currently embedded media item from an attachment of this "
+                "filename."
+            ),
+        ),
+    ] = False,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually embed the existing attachment in Jira."),
+    ] = False,
+) -> None:
+    """Embed one existing PNG attachment without uploading a duplicate. Defaults to dry-run."""
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if not filename:
+        error_console.print("[red]--filename is required.[/red]")
+        raise typer.Exit(2)
+    if width is None or height is None:
+        error_console.print(
+            "[red]--width and --height are required; dimensions are never guessed.[/red]"
+        )
+        raise typer.Exit(2)
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            attachment = resolve_png_attachment(
+                issue, filename=filename, attachment_id=attachment_id
+            )
+            resolved_id = str(attachment["id"])
+            media_id = client.attachment_media_id(resolved_id, issue_key=issue_key)
+            existing_description = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            replace_media_id: str | None = None
+            if replace_existing:
+                same_filename = [
+                    item
+                    for item in issue.get("fields", {}).get("attachment") or []
+                    if isinstance(item, dict) and item.get("filename") == filename
+                ]
+                embedded_ids = [
+                    client.attachment_media_id(str(item["id"]), issue_key=issue_key)
+                    for item in same_filename
+                    if item.get("id") is not None
+                ]
+                matches = [
+                    item_id
+                    for item_id in embedded_ids
+                    if adf_contains_media_id(existing_description, item_id)
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "Expected exactly one embedded media item from attachments named "
+                        f"{filename!r}; "
+                        f"found {len(matches)}."
+                    )
+                replace_media_id = matches[0]
+
+            payload = {
+                "attachment_id": resolved_id,
+                "filename": filename,
+                "media_id": media_id,
+                "dimensions": {"width": width, "height": height},
+                "replace_media_id": replace_media_id,
+            }
+            if not execute:
+                console.print("[yellow]Dry run:[/yellow] would embed existing PNG attachment")
+                console.print(f"issue: {issue_key}")
+                console.print(f"safety: {safety}")
+                _print_json(payload)
+                console.print("Pass --execute to embed this existing attachment in Jira.")
+                return
+
+            description = replace_diagram_with_media(
+                existing_description,
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+                replace_media_id=replace_media_id,
+            )
+            result = client.edit_issue_adf_description(issue_key, description)
+            verified = client.get_issue(issue_key, fields=["description", "attachment"])
+            verified_attachment = resolve_png_attachment(
+                verified, filename=filename, attachment_id=resolved_id
+            )
+            verified_description = (verified.get("fields") or {}).get("description") or {}
+            embedded = adf_contains_media_id(verified_description, media_id)
+            audit_write(
+                config,
+                action="embed_existing_png",
+                issue_key=issue_key,
+                payload=payload,
+                result={
+                    "edit": result,
+                    "verified_attachment_id": verified_attachment["id"],
+                    "embedded": embedded,
+                },
+            )
+            if not embedded:
+                raise ValueError(
+                    f"Existing attachment {resolved_id} was not found inline after rereading "
+                    f"{issue_key}."
+                )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+        except ValueError as exc:
+            error_console.print(f"[red]Existing PNG embed error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    console.print(f"Embedded existing {filename} ({resolved_id}) into {issue_key}.")
 
 
 @app.command("upsert-image-gallery")

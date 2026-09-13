@@ -7,8 +7,62 @@ from jira_agent.workflows import (
     normalize_drift_label,
     read_text_source,
     resolve_directed_issue_link,
+    resolve_png_attachment,
     update_drift_labels,
 )
+
+
+def test_resolve_png_attachment_requires_one_exact_current_png() -> None:
+    issue = {
+        "fields": {
+            "attachment": [
+                {
+                    "id": "170501",
+                    "filename": "fc349-disbursement-flow.png",
+                    "mimeType": "image/png",
+                },
+                {
+                    "id": "170502",
+                    "filename": "fc349-disbursement-flow.png",
+                    "mimeType": "image/png",
+                },
+            ]
+        }
+    }
+
+    try:
+        resolve_png_attachment(issue, filename="fc349-disbursement-flow.png")
+    except ValueError as exc:
+        assert str(exc).endswith("found 2.")
+    else:
+        raise AssertionError("Expected ValueError")
+
+    assert resolve_png_attachment(
+        issue,
+        filename="fc349-disbursement-flow.png",
+        attachment_id="170502",
+    )["id"] == "170502"
+
+
+def test_resolve_png_attachment_rejects_non_png_mime_and_non_plain_filename() -> None:
+    issue = {
+        "fields": {
+            "attachment": [
+                {"id": "170501", "filename": "flow.png", "mimeType": "image/jpeg"},
+            ]
+        }
+    }
+
+    for filename, message in [
+        ("flow.png", "is not a PNG"),
+        ("nested/flow.png", "must be a plain PNG filename"),
+    ]:
+        try:
+            resolve_png_attachment(issue, filename=filename)
+        except ValueError as exc:
+            assert message in str(exc)
+        else:
+            raise AssertionError("Expected ValueError")
 
 
 def _link_issue(*, key: str, link: dict[str, object]) -> dict[str, object]:
