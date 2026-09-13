@@ -1443,6 +1443,13 @@ def edit_issue(
         str | None,
         typer.Option("--labels", help="Comma-separated labels to set."),
     ] = None,
+    fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--fix-version",
+            help="Fix version name to set. Repeat to set several; pass none to leave unchanged.",
+        ),
+    ] = None,
     parent: Annotated[
         str | None,
         typer.Option("--parent", help="New parent issue key."),
@@ -1483,6 +1490,7 @@ def edit_issue(
             summary=summary,
             description=body,
             labels=_csv_list(labels),
+            fix_versions=fix_version,
             parent_key=parent,
             priority=priority,
             story_points=story_points,
@@ -1508,6 +1516,7 @@ def edit_issue(
                 summary=summary,
                 description=body,
                 labels=_csv_list(labels),
+                fix_versions=fix_version,
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
