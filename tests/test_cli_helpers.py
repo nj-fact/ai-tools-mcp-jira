@@ -513,3 +513,109 @@ def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
         "whole_document": True,
     }
     assert writes == []
+
+
+def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    audited: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+        def edit_issue(self, issue_key, **kwargs):
+            audited.append({"issue": issue_key, "kwargs": kwargs})
+            return {"key": issue_key, "fields": {"fixVersions": [{"name": "FCL-MVP"}]}}
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-380", "--fix-version", "FCL-MVP", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert audited == [
+        {
+            "issue": "FC-380",
+            "kwargs": {
+                "summary": None,
+                "description": None,
+                "labels": None,
+                "fix_versions": ["FCL-MVP"],
+                "parent_key": None,
+                "priority": None,
+                "story_points": None,
+            },
+        }
+    ]
+
+
+def test_edit_issue_cli_dry_run_shows_several_fix_versions_in_payload(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "edit-issue",
+            "FC-380",
+            "--fix-version",
+            "FCL-MVP",
+            "--fix-version",
+            "FCL-1.1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Dry run" in result.output
+    json_start = result.output.index("{\n")
+    payload, _ = json.JSONDecoder().raw_decode(result.output[json_start:])
+    assert payload["fields"]["fixVersions"] == [
+        {"name": "FCL-MVP"},
+        {"name": "FCL-1.1"},
+    ]
