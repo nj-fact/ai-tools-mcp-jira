@@ -19,6 +19,7 @@ finding class itself.
 
 from __future__ import annotations
 
+import ast
 import inspect
 
 from jira_agent import cli, mcp_server
@@ -99,3 +100,98 @@ def test_search_all_issues_docstring_matches_its_own_contract() -> None:
     assert "never carries a" in doc and "`total`" in doc
     assert "`None`" in doc, "must document that a missing signal reports unknown, not complete"
     assert "nextPageToken" in doc
+
+
+# --- G8: a mechanical guard against the next unguarded whole-field rewrite -------------------
+#
+# G2 found five MCP tools that read a description (or labels/attachment set), transformed it,
+# and wrote the whole field back with no `expect_updated` at all — the guard this round exists
+# for, simply absent from the surface AI agents actually call. This file's own parity test
+# passed clean while that gap existed: its assertions pinned three literals that happened to
+# drift once, not the shape of the defect itself. A guard that reads as coverage but cannot fail
+# is worse than none. This enumerates every call, mechanically, so a new one is caught by the
+# suite instead of by the next adversarial review.
+
+_GUARDED_EDIT_METHODS = frozenset({"edit_issue", "edit_issue_adf_description"})
+
+# (module label, enclosing function name, client method name) -> why this specific call is
+# deliberately unguarded. A call landing here is a decision, recorded once, not an oversight;
+# see the matching docstring/comment at the call site itself for the same reasoning.
+_NO_GUARD_ALLOWLIST: dict[tuple[str, str, str], str] = {
+    ("cli", "clear_parent", "edit_issue"): (
+        "Sets one relationship field (parent) to a single, specific, verified target state "
+        "(null) rather than reading and rewriting a whole computed field; the post-write reread "
+        "independently confirms that target state regardless of what a concurrent editor did to "
+        "parent in between."
+    ),
+    ("mcp_server", "jira_clear_issue_parent", "edit_issue"): (
+        "Same reasoning as cli.clear_parent: a single-field clear verified by reread, not a "
+        "read-transform-whole-field rewrite."
+    ),
+}
+
+
+class _EditCallVisitor(ast.NodeVisitor):
+    """Collect every `<expr>.edit_issue(...)` / `<expr>.edit_issue_adf_description(...)` call in
+    a module, tagged with the name of its innermost enclosing function and whether it passes
+    `expect_updated` as a keyword argument. Deliberately does not look at the receiver expression
+    (it is always some spelling of the Jira client), only the attribute name and the call's own
+    keywords, since that is exactly what `_guarded_issue_put` gates on at runtime.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bool]] = []
+        self._stack: list[str] = []
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self._stack.append(node.name)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _GUARDED_EDIT_METHODS:
+            guarded = any(kw.arg == "expect_updated" for kw in node.keywords)
+            function_name = self._stack[-1] if self._stack else "<module>"
+            self.calls.append((function_name, node.func.attr, guarded))
+        self.generic_visit(node)
+
+
+def _edit_calls(source: str) -> list[tuple[str, str, bool]]:
+    visitor = _EditCallVisitor()
+    visitor.visit(ast.parse(source))
+    return visitor.calls
+
+
+def test_every_edit_issue_call_is_guarded_or_on_the_named_allowlist() -> None:
+    """A new call to `edit_issue` / `edit_issue_adf_description` that omits `expect_updated`
+    must fail this test, not pass silently the way G2's five missing guards did. Verified by
+    deliberately introducing an unguarded call during remediation and confirming this test (and
+    only this test in this class) catches it before reverting.
+    """
+    modules = {"cli": inspect.getsource(cli), "mcp_server": inspect.getsource(mcp_server)}
+    unresolved: list[str] = []
+    seen_allowlist_keys: set[tuple[str, str, str]] = set()
+
+    for module_name, source in modules.items():
+        for function_name, method_name, guarded in _edit_calls(source):
+            if guarded:
+                continue
+            key = (module_name, function_name, method_name)
+            if key in _NO_GUARD_ALLOWLIST:
+                seen_allowlist_keys.add(key)
+                continue
+            unresolved.append(f"{module_name}.{function_name} calls .{method_name}(...) unguarded")
+
+    assert not unresolved, (
+        "unguarded whole-field rewrite call(s) found; pass expect_updated or add a named, "
+        "justified entry to _NO_GUARD_ALLOWLIST:\n" + "\n".join(unresolved)
+    )
+
+    stale = set(_NO_GUARD_ALLOWLIST) - seen_allowlist_keys
+    assert not stale, f"allowlist entries no longer match any unguarded call: {sorted(stale)}"

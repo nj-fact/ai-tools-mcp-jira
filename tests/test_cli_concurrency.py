@@ -22,7 +22,11 @@ from typing import Any
 from typer.testing import CliRunner
 
 from jira_agent import cli
-from jira_agent.client import JiraConcurrentEditError
+from jira_agent.client import (
+    JiraConcurrentEditError,
+    JiraMissingConcurrencyTokenError,
+    adf_contains_media_id,
+)
 from jira_agent.config import JiraConfig
 
 ISSUE_KEY = "FC-1"
@@ -376,6 +380,118 @@ def test_patch_description_section_docstring_no_longer_claims_no_optimistic_conc
     assert "there is no optimistic concurrency" not in doc
     assert "concurrency" in doc
     assert "no-concurrency-guard" in doc
+
+
+# --- G6: all four --json error documents share the same envelope -----------------------------
+
+
+def _no_allowlist_config(tmp_path: Path) -> JiraConfig:
+    """A config with a project allowlist but no issue-key allowlist, so `assign FC-1` actually
+    reaches the project check instead of short-circuiting through `_config`'s own
+    `JIRA_WRITE_ISSUE_KEYS` allowlist for FC-1.
+    """
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+
+def test_all_four_json_error_documents_share_the_same_envelope_keys(tmp_path, monkeypatch) -> None:
+    """G6 regression: `_exit_concurrent_edit_error`'s JSON document was the only one of the four
+    without `"ok": false` -- the others (`_exit_api_error`, `_exit_safety_error`,
+    `_exit_missing_concurrency_token_error`) already carried it. A caller doing `data["ok"]`,
+    which the README invites, got a KeyError exactly when a write was refused for a lost-update
+    race. Pins that all four now share at least `{"ok": False, "error_type": <str>}`.
+    """
+    from jira_agent.client import JiraApiError
+
+    concurrent_client, _ = _make_patch_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+    concurrent_result = _run(
+        monkeypatch,
+        tmp_path,
+        concurrent_client,
+        [
+            "patch-description-section",
+            ISSUE_KEY,
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nNew body.",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    missing_client, _ = _make_patch_fake_client(read_updated=None, server_updated=READ_UPDATED)
+    missing_result = _run(
+        monkeypatch,
+        tmp_path,
+        missing_client,
+        [
+            "patch-description-section",
+            ISSUE_KEY,
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nNew body.",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    class ApiErrorClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> ApiErrorClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get_issue(self, issue_key: str, **_kwargs: Any):
+            raise JiraApiError(f"Issue does not exist: {issue_key}", status_code=404)
+
+    api_result = _run(monkeypatch, tmp_path, ApiErrorClient, ["issue", "FC-999", "--json"])
+
+    class SafetyErrorClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> SafetyErrorClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def myself(self):
+            return {"accountId": "acc-1", "displayName": "Ada"}
+
+        def get_issue(self, issue_key: str, **_kwargs: Any):
+            return {"key": issue_key, "fields": {"project": {"key": "OTHER"}}}
+
+    monkeypatch.setattr(cli, "load_config", lambda: _no_allowlist_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", SafetyErrorClient)
+    safety_result = CliRunner().invoke(cli.app, ["assign", "FC-1", "--execute", "--json"])
+
+    documents = {
+        "concurrent_edit": json.loads(concurrent_result.stdout),
+        "concurrency_guard_unavailable": json.loads(missing_result.stdout),
+        "jira_api_error": json.loads(api_result.stdout),
+        "write_safety_error": json.loads(safety_result.stdout),
+    }
+    for name, payload in documents.items():
+        assert payload["ok"] is False, f"{name}: {payload}"
+        assert isinstance(payload.get("error_type"), str) and payload["error_type"], (
+            f"{name}: {payload}"
+        )
 
 
 # --- edit-issue ------------------------------------------------------------------------------
@@ -784,12 +900,12 @@ def test_human_brief_no_concurrency_guard_writes_despite_change(tmp_path, monkey
     assert writes[0]["expect_updated"] is None
 
 
-# A minimal valid PNG header (signature + IHDR), reused from tests/test_client.py's own
-# png_dimensions fixture: decodes to (774, 70).
-_PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x03\x06\x00\x00\x00F\x08\x02\x00\x00\x00"
+# --- drift-labels: G8 surfaced this whole-array read-transform-write had no guard at all -----
 
 
-def _make_embed_diagram_fake_client(*, read_updated: str, server_updated: str) -> tuple[type, list]:
+def _make_drift_labels_fake_client(
+    *, read_updated: str, server_updated: str
+) -> tuple[type, list]:
     writes: list[dict[str, Any]] = []
 
     class FakeClient:
@@ -802,24 +918,16 @@ def _make_embed_diagram_fake_client(*, read_updated: str, server_updated: str) -
         def __exit__(self, *_args: object) -> None:
             return None
 
-        def get_issue(self, issue_key: str, *, fields=None, expand=None):
-            assert fields == ["description", "attachment", "updated"], fields
+        def get_issue(self, issue_key: str, *, fields: list[str] | None = None, **_kwargs: Any):
+            assert fields == ["labels", "updated"], fields
             return {
                 "key": issue_key,
-                "fields": {
-                    "description": {"type": "doc", "version": 1, "content": []},
-                    "attachment": [],
-                    "updated": read_updated,
-                },
+                "fields": {"labels": ["drift-open"], "updated": read_updated},
             }
 
-        def add_attachment(self, issue_key: str, file_path):
-            return [{"id": "9001", "filename": Path(file_path).name}]
-
-        def attachment_media_id(self, attachment_id: str, *, issue_key: str) -> str:
-            return "media-diagram-1"
-
-        def edit_issue_adf_description(self, issue_key: str, description, *, expect_updated=None):
+        def edit_issue(
+            self, issue_key: str, *, labels=None, expect_updated: str | None = None, **_kw: Any
+        ) -> dict[str, Any]:
             if expect_updated is not None and expect_updated != server_updated:
                 raise JiraConcurrentEditError(
                     f"Issue {issue_key} changed since it was read: expected updated="
@@ -827,6 +935,171 @@ def _make_embed_diagram_fake_client(*, read_updated: str, server_updated: str) -
                     issue_key=issue_key,
                     expected_updated=expect_updated,
                     found_updated=server_updated,
+                )
+            writes.append({"issue": issue_key, "labels": labels, "expect_updated": expect_updated})
+            return {"key": issue_key, "fields": {}}
+
+    return FakeClient, writes
+
+
+def test_drift_labels_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_drift_labels_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert writes == []
+
+
+def test_drift_labels_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_drift_labels_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert set(writes[0]["labels"]) == {"drift-open", "drift-reviewed"}
+
+
+def test_drift_labels_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_drift_labels_fake_client(
+        read_updated=None, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert "Concurrency guard unavailable" in result.stderr
+    assert writes == []
+
+
+def test_drift_labels_no_concurrency_guard_writes_despite_missing_token(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes = _make_drift_labels_fake_client(
+        read_updated=None, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "drift-labels",
+            ISSUE_KEY,
+            "--add",
+            "drift-reviewed",
+            "--no-concurrency-guard",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] is None
+
+
+# A minimal valid PNG header (signature + IHDR), reused from tests/test_client.py's own
+# png_dimensions fixture: decodes to (774, 70).
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x03\x06\x00\x00\x00F\x08\x02\x00\x00\x00"
+
+
+def _make_embed_diagram_fake_client(
+    *, after_upload_updated: str | None, at_put_time_updated: str | None = None
+) -> tuple[type, list]:
+    """Fake client for embed-diagram.
+
+    Models Jira's real behaviour: uploading an attachment moves the issue's own `updated` on
+    the server. G1's pre-fix code read its guard token from the SAME `get_issue` call that ran
+    before the upload; a fake whose `add_attachment` left that reading undisturbed could never
+    reproduce the bug it was meant to catch, because it verified the test rather than the thing.
+
+    `add_attachment` bumps this fake's live `updated` state to `after_upload_updated` (`None`
+    models Jira still returning no usable timestamp after the upload). `issue_version` -- the
+    guard's own dedicated, late read -- reports that live state, raising
+    `JiraMissingConcurrencyTokenError` when it is unusable, exactly like the real client.
+    `at_put_time_updated` is the ground truth `edit_issue_adf_description`'s own guard finds
+    immediately before its PUT: it defaults to `after_upload_updated` (nothing but this
+    process's own upload happened) and only needs overriding to model a genuine third party
+    editing the issue in the narrow window that remains after the late read.
+    """
+    writes: list[dict[str, Any]] = []
+    state: dict[str, str | None] = {"updated": "T-before-upload"}
+    resolved_at_put_time = (
+        at_put_time_updated if at_put_time_updated is not None else after_upload_updated
+    )
+
+    class FakeClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get_issue(self, issue_key: str, *, fields=None, expand=None):
+            # Deliberately lenient about the exact fields list (only "description" and
+            # "attachment" are required): the pre-fix code also asked for "updated" here, and
+            # asserting the fixed code's narrower list would mask the actual regression this
+            # fake exists to reproduce behind an unrelated AssertionError.
+            assert fields is not None and "description" in fields and "attachment" in fields, (
+                fields
+            )
+            return {
+                "key": issue_key,
+                "fields": {
+                    "description": {"type": "doc", "version": 1, "content": []},
+                    "attachment": [],
+                    # Present even though the fixed code no longer requests or reads it from
+                    # this early call; the pre-fix code did read its (stale-by-construction)
+                    # guard token from exactly this value.
+                    "updated": state["updated"],
+                },
+            }
+
+        def add_attachment(self, issue_key: str, file_path):
+            state["updated"] = after_upload_updated
+            return [{"id": "9001", "filename": Path(file_path).name}]
+
+        def attachment_media_id(self, attachment_id: str, *, issue_key: str) -> str:
+            return "media-diagram-1"
+
+        def issue_version(self, issue_key: str) -> str:
+            current = state["updated"]
+            if not isinstance(current, str) or not current:
+                raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
+            return current
+
+        def edit_issue_adf_description(self, issue_key: str, description, *, expect_updated=None):
+            if expect_updated is not None and expect_updated != resolved_at_put_time:
+                raise JiraConcurrentEditError(
+                    f"Issue {issue_key} changed since it was read: expected updated="
+                    f"{expect_updated!r}, found {resolved_at_put_time!r}. Re-read the issue and "
+                    "retry.",
+                    issue_key=issue_key,
+                    expected_updated=expect_updated,
+                    found_updated=resolved_at_put_time,
                 )
             writes.append(
                 {"issue": issue_key, "description": description, "expect_updated": expect_updated}
@@ -840,8 +1113,9 @@ def _make_embed_diagram_fake_client(*, read_updated: str, server_updated: str) -
 
 
 def test_embed_diagram_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    """A genuine third-party edit landing after the late read must still refuse."""
     FakeClient, writes = _make_embed_diagram_fake_client(
-        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+        after_upload_updated=READ_UPDATED, at_put_time_updated=CHANGED_UPDATED
     )
     png = tmp_path / "diagram.png"
     png.write_bytes(_PNG_BYTES)
@@ -858,9 +1132,7 @@ def test_embed_diagram_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch)
 
 
 def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
-    FakeClient, writes = _make_embed_diagram_fake_client(
-        read_updated=READ_UPDATED, server_updated=READ_UPDATED
-    )
+    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
     png = tmp_path / "diagram.png"
     png.write_bytes(_PNG_BYTES)
 
@@ -878,9 +1150,7 @@ def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch
 def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
     """F2's lesson carried to embed-diagram: a missing `updated` with the guard on must refuse,
     not silently write unguarded."""
-    FakeClient, writes = _make_embed_diagram_fake_client(
-        read_updated=None, server_updated=READ_UPDATED
-    )
+    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=None)
     png = tmp_path / "diagram.png"
     png.write_bytes(_PNG_BYTES)
 
@@ -894,6 +1164,33 @@ def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monke
     assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
     assert "Concurrency guard unavailable" in result.stderr
     assert writes == []
+
+
+def test_embed_diagram_execute_succeeds_despite_upload_moving_updated_no_orphan(
+    tmp_path, monkeypatch
+) -> None:
+    """G1 regression. embed-diagram's own attachment upload moves the issue's `updated` on the
+    Jira side. Before the fix, the guard token was captured BEFORE that upload from the initial
+    `get_issue` read, so it was stale by construction: this exact scenario -- no external editor
+    at all -- refused every guarded execution, after the attachment had already been uploaded,
+    orphaning it with no description referencing it. This must succeed, and the written
+    description must actually embed the uploaded attachment's media.
+    """
+    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+    assert adf_contains_media_id(writes[0]["description"], "media-diagram-1")
 
 
 def _make_embed_existing_png_fake_client(

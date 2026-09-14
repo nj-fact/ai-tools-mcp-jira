@@ -1,8 +1,21 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
 from jira_agent import mcp_server
-from jira_agent.client import JiraApiError, JiraConcurrentEditError, text_to_adf
+from jira_agent.client import (
+    JiraApiError,
+    JiraConcurrentEditError,
+    JiraMissingConcurrencyTokenError,
+    text_to_adf,
+)
 from jira_agent.config import JiraConfig
+
+# A minimal valid PNG header (signature + IHDR), reused from tests/test_client.py's own
+# png_dimensions fixture: decodes to (774, 70).
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x03\x06\x00\x00\x00F\x08\x02\x00\x00\x00"
 
 
 def make_config(tmp_path) -> JiraConfig:
@@ -458,14 +471,17 @@ def test_jira_link_issue_keeps_fc_350_blocks_fc_352_business_direction(
 
 
 class ExistingPngFakeClient:
-    def __init__(self, _config) -> None:
+    def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
         self.description = {"type": "doc", "version": 1, "content": []}
         self.edits: list[dict[str, object]] = []
+        self.expect_updated_calls: list[str | None] = []
         self.attachment = {
             "id": "170501",
             "filename": "fc349-disbursement-flow.png",
             "mimeType": "image/png",
         }
+        self.updated = updated
+        self.server_updated = server_updated if server_updated is not None else updated
 
     def __enter__(self):
         return self
@@ -476,10 +492,16 @@ class ExistingPngFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
-        assert fields == ["description", "attachment"]
+        # The initial read includes "updated" (the guard token); the post-write verification
+        # reread does not need it.
+        assert fields is not None and "description" in fields and "attachment" in fields, fields
         return {
             "key": issue_key,
-            "fields": {"description": self.description, "attachment": [self.attachment]},
+            "fields": {
+                "description": self.description,
+                "attachment": [self.attachment],
+                "updated": self.updated,
+            },
         }
 
     def attachment_media_id(self, attachment_id, *, issue_key):
@@ -487,8 +509,18 @@ class ExistingPngFakeClient:
         assert issue_key == "FC-349"
         return "media-fc349"
 
-    def edit_issue_adf_description(self, issue_key, description):
+    def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
         assert issue_key == "FC-349"
+        self.expect_updated_calls.append(expect_updated)
+        if expect_updated is not None and expect_updated != self.server_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.server_updated!r}. Re-read the issue and "
+                "retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.server_updated,
+            )
         self.edits.append(description)
         self.description = description
         return {}
@@ -541,6 +573,71 @@ def test_jira_embed_existing_png_attachment_dry_run_then_reuses_existing_attachm
     ]
     assert executed["ok"] is True
     assert executed["media_id"] == "media-fc349"
+
+
+def test_jira_embed_existing_png_attachment_refuses_on_concurrent_edit(
+    tmp_path, monkeypatch
+) -> None:
+    """G2 regression: this tool had no guard at all before this fix, so a concurrent edit
+    landing between the read and the write was silently reverted."""
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(
+        config,
+        updated="2026-01-01T00:00:00.000+0000",
+        server_updated="2026-01-01T00:05:00.000+0000",
+    )
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+
+    result = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png", key="FC-349", width=1600, height=900, execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.edits == []
+
+
+def test_jira_embed_existing_png_attachment_refuses_when_updated_missing(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(config, updated=None)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+
+    result = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png", key="FC-349", width=1600, height=900, execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.edits == []
+    assert client.expect_updated_calls == []
+
+
+def test_jira_embed_existing_png_attachment_guard_false_ignores_missing_updated(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(config, updated=None)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+
+    result = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png",
+        key="FC-349",
+        width=1600,
+        height=900,
+        guard_concurrent_edit=False,
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert client.expect_updated_calls == [None]
 
 
 def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
@@ -753,7 +850,12 @@ def test_jira_patch_description_section_refuses_when_guard_requested_but_updated
     """F2-adjacent: the CLI's patch-description-section has this same defect (a same-request
     read that silently passes expect_updated=None when Jira's response omits `updated`, leaving
     the write completely unguarded while the caller believes it is protected). This must refuse
-    instead, and must not issue a second read to try to recover a token."""
+    instead, and must not issue a second read to try to recover a token.
+
+    The message now comes from the shared `JiraMissingConcurrencyTokenError`, the same one
+    `require_concurrency_token` raises for every other guarded command's read, rather than a
+    copy this tool used to build inline -- see G9: one condition, one outcome, on both surfaces.
+    """
     client = _install_patch_client(monkeypatch, tmp_path, omit_updated=True)
 
     result = mcp_server.jira_patch_description_section(
@@ -769,8 +871,8 @@ def test_jira_patch_description_section_refuses_when_guard_requested_but_updated
         "issue": "FC-385",
         "message": result["message"],
     }
-    assert "omitted" in result["message"] or "did not return" in result["message"]
-    assert "guard_concurrent_edit=false" in result["message"]
+    assert "usable" in result["message"] and "updated" in result["message"]
+    assert "guard" in result["message"]
     assert client.writes == []
     assert client.expect_updated_calls == []
 
@@ -789,6 +891,34 @@ def test_jira_patch_description_section_refuses_at_dry_run_too_when_guard_unavai
     assert result["ok"] is False
     assert result["error_type"] == "concurrent_edit_guard_unavailable"
     assert client.writes == []
+
+
+def test_jira_patch_description_section_refuses_when_updated_is_empty_string(
+    tmp_path, monkeypatch
+) -> None:
+    """G9 regression: `updated` can be present but an empty string, not merely absent. The old
+    inline check only tested `read_updated is None`, so `updated: ""` slipped through as
+    `expect_updated=""`, which then compared unequal to whatever the write's guard found and
+    raised a misleading "concurrent_edit" refusal (blaming a concurrent editor that does not
+    exist) instead of "concurrent_edit_guard_unavailable". require_concurrency_token treats an
+    empty string the same as a missing one; this must produce the same guard-unavailable
+    refusal `omit_updated=True` does, not a phantom concurrent-edit refusal.
+    """
+    client = _install_patch_client(
+        monkeypatch, tmp_path, updated="", server_updated="2026-09-01T00:00:00.000+0000"
+    )
+
+    result = mcp_server.jira_patch_description_section(
+        key="FC-385",
+        section="Observed",
+        content="## Observed\n\nGuarded write.",
+        execute=True,
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+    assert client.expect_updated_calls == []
 
 
 def test_jira_patch_description_section_guard_false_ignores_missing_updated(
@@ -1820,3 +1950,615 @@ def test_jira_move_issues_to_backlog_refuses_an_empty_list(tmp_path, monkeypatch
     result = mcp_server.jira_move_issues_to_backlog([])
 
     assert result == {"ok": False, "message": "issue_keys must not be empty."}
+
+
+# --- G2: the concurrency guard threaded through five previously-unguarded MCP tools ----------
+#
+# jira_write_human_brief, jira_render_mermaid_diagrams, jira_embed_diagram,
+# jira_embed_existing_png_attachment (covered above, next to its own fake), and
+# jira_upsert_image_gallery each read a description (or attachment set), transform it, and
+# write the whole field back with no guard at all before this fix: a concurrent edit landing
+# between the read and the write was silently reverted and the tool still returned
+# {"ok": True}. These tests pin the guard on the remaining four.
+
+
+class HumanBriefFakeClient:
+    def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
+        self.updated = updated
+        self.server_updated = server_updated if server_updated is not None else updated
+        self.writes: list[dict[str, object]] = []
+        self.expect_updated_calls: list[str | None] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["updated"], fields
+        return {"key": issue_key, "fields": {"updated": self.updated}}
+
+    def edit_issue(self, issue_key, *, description=None, expect_updated=None, **_kwargs):
+        self.expect_updated_calls.append(expect_updated)
+        if expect_updated is not None and expect_updated != self.server_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.server_updated!r}. Re-read the issue and "
+                "retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.server_updated,
+            )
+        self.writes.append(
+            {"issue": issue_key, "description": description, "expect_updated": expect_updated}
+        )
+        return {"key": issue_key, "fields": {}}
+
+
+def _install_human_brief_client(monkeypatch, tmp_path, **kwargs) -> HumanBriefFakeClient:
+    config = make_config(tmp_path)
+    client = HumanBriefFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_a, **_k: None)
+    return client
+
+
+def test_jira_write_human_brief_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    client = _install_human_brief_client(
+        monkeypatch,
+        tmp_path,
+        updated="2026-01-01T00:00:00.000+0000",
+        server_updated="2026-01-01T00:05:00.000+0000",
+    )
+
+    result = mcp_server.jira_write_human_brief("FC-1", key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+
+
+def test_jira_write_human_brief_executes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    client = _install_human_brief_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_write_human_brief("Brief text.", key="FC-1", execute=True)
+
+    assert result == {"ok": True, "issue": "FC-1"}
+    assert len(client.writes) == 1
+
+
+def test_jira_write_human_brief_refuses_when_updated_missing(tmp_path, monkeypatch) -> None:
+    client = _install_human_brief_client(monkeypatch, tmp_path, updated=None)
+
+    result = mcp_server.jira_write_human_brief("Brief text.", key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+    assert client.expect_updated_calls == []
+
+
+def test_jira_write_human_brief_guard_false_ignores_missing_updated(tmp_path, monkeypatch) -> None:
+    client = _install_human_brief_client(monkeypatch, tmp_path, updated=None)
+
+    result = mcp_server.jira_write_human_brief(
+        "Brief text.", key="FC-1", guard_concurrent_edit=False, execute=True
+    )
+
+    assert result == {"ok": True, "issue": "FC-1"}
+    assert client.expect_updated_calls == [None]
+
+
+class DriftLabelsFakeClient:
+    def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
+        self.updated = updated
+        self.server_updated = server_updated if server_updated is not None else updated
+        self.existing_labels = ["drift-open"]
+        self.writes: list[dict[str, object]] = []
+        self.expect_updated_calls: list[str | None] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["labels", "updated"], fields
+        return {
+            "key": issue_key,
+            "fields": {"labels": self.existing_labels, "updated": self.updated},
+        }
+
+    def edit_issue(self, issue_key, *, labels=None, expect_updated=None, **_kwargs):
+        self.expect_updated_calls.append(expect_updated)
+        if expect_updated is not None and expect_updated != self.server_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.server_updated!r}. Re-read the issue and "
+                "retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.server_updated,
+            )
+        self.writes.append({"issue": issue_key, "labels": labels})
+        return {"key": issue_key, "fields": {"labels": labels}}
+
+
+def _install_drift_labels_client(monkeypatch, tmp_path, **kwargs) -> DriftLabelsFakeClient:
+    config = make_config(tmp_path)
+    client = DriftLabelsFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_a, **_k: None)
+    return client
+
+
+def test_jira_update_drift_labels_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    """G2 regression: a whole-array read-transform-write, exactly like the description
+    rewrites, had no guard at all before this fix."""
+    client = _install_drift_labels_client(
+        monkeypatch,
+        tmp_path,
+        updated="2026-01-01T00:00:00.000+0000",
+        server_updated="2026-01-01T00:05:00.000+0000",
+    )
+
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+
+
+def test_jira_update_drift_labels_executes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    client = _install_drift_labels_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
+
+    assert result["ok"] is True
+    assert set(result["labels"]) == {"drift-open", "drift-reviewed"}
+    assert len(client.writes) == 1
+
+
+def test_jira_update_drift_labels_refuses_when_updated_missing(tmp_path, monkeypatch) -> None:
+    client = _install_drift_labels_client(monkeypatch, tmp_path, updated=None)
+
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+
+
+def test_jira_update_drift_labels_guard_false_ignores_missing_updated(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_drift_labels_client(monkeypatch, tmp_path, updated=None)
+
+    result = mcp_server.jira_update_drift_labels(
+        "FC-1", add=["drift-reviewed"], guard_concurrent_edit=False, execute=True
+    )
+
+    assert result["ok"] is True
+    assert client.expect_updated_calls == [None]
+
+
+def _gallery_manifest(tmp_path: Path) -> Path:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "title": "Screenshots",
+                "sections": [
+                    {
+                        "heading": "Flow",
+                        "rows": [
+                            {
+                                "file": "diagram.png",
+                                "title": "Step one",
+                                "description": "The first step.",
+                                "alt": "Step one screenshot",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+class GalleryFakeClient:
+    def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
+        self.updated = updated
+        self.server_updated = server_updated if server_updated is not None else updated
+        self.attachment = {
+            "id": "170501",
+            "filename": "diagram.png",
+            "content": "https://example.atlassian.net/attachments/170501",
+        }
+        self.writes: list[dict[str, object]] = []
+        self.expect_updated_calls: list[str | None] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["description", "attachment", "updated"], fields
+        return {
+            "key": issue_key,
+            "fields": {
+                "description": {"type": "doc", "version": 1, "content": []},
+                "attachment": [self.attachment],
+                "updated": self.updated,
+            },
+        }
+
+    def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
+        self.expect_updated_calls.append(expect_updated)
+        if expect_updated is not None and expect_updated != self.server_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.server_updated!r}. Re-read the issue and "
+                "retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.server_updated,
+            )
+        self.writes.append({"issue": issue_key, "description": description})
+        return {"id": "1"}
+
+
+def _install_gallery_client(monkeypatch, tmp_path, **kwargs) -> GalleryFakeClient:
+    config = make_config(tmp_path)
+    client = GalleryFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_a, **_k: None)
+    return client
+
+
+def test_jira_upsert_image_gallery_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    client = _install_gallery_client(
+        monkeypatch,
+        tmp_path,
+        updated="2026-01-01T00:00:00.000+0000",
+        server_updated="2026-01-01T00:05:00.000+0000",
+    )
+    manifest_path = _gallery_manifest(tmp_path)
+
+    result = mcp_server.jira_upsert_image_gallery(
+        str(manifest_path), key="FC-1", execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+
+
+def test_jira_upsert_image_gallery_executes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    client = _install_gallery_client(monkeypatch, tmp_path)
+    manifest_path = _gallery_manifest(tmp_path)
+
+    result = mcp_server.jira_upsert_image_gallery(
+        str(manifest_path), key="FC-1", execute=True
+    )
+
+    assert result["ok"] is True
+    assert len(client.writes) == 1
+
+
+def test_jira_upsert_image_gallery_refuses_when_updated_missing(tmp_path, monkeypatch) -> None:
+    client = _install_gallery_client(monkeypatch, tmp_path, updated=None)
+    manifest_path = _gallery_manifest(tmp_path)
+
+    result = mcp_server.jira_upsert_image_gallery(
+        str(manifest_path), key="FC-1", execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+
+
+class EmbedDiagramMcpFakeClient:
+    """Mirrors tests/test_cli_concurrency.py's `_make_embed_diagram_fake_client`: models Jira's
+    real behaviour where uploading an attachment moves the issue's own `updated`, so
+    `add_attachment` bumps this fake's live state and `issue_version` -- the guard's dedicated
+    late read -- reports it.
+    """
+
+    def __init__(self, _config, *, after_upload_updated, at_put_time_updated=None):
+        self.state = {"updated": "T-before-upload"}
+        self.after_upload_updated = after_upload_updated
+        self.at_put_time_updated = (
+            at_put_time_updated if at_put_time_updated is not None else after_upload_updated
+        )
+        self.writes: list[dict[str, object]] = []
+        self.deleted: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields is not None and "description" in fields and "attachment" in fields, fields
+        return {
+            "key": issue_key,
+            "fields": {
+                "description": {"type": "doc", "version": 1, "content": []},
+                "attachment": [],
+                "updated": self.state["updated"],
+            },
+        }
+
+    def add_attachment(self, issue_key, file_path):
+        self.state["updated"] = self.after_upload_updated
+        return [{"id": "9001", "filename": Path(file_path).name}]
+
+    def attachment_media_id(self, attachment_id, *, issue_key):
+        return "media-diagram-1"
+
+    def issue_version(self, issue_key):
+        current = self.state["updated"]
+        if not isinstance(current, str) or not current:
+            raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
+        return current
+
+    def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
+        if expect_updated is not None and expect_updated != self.at_put_time_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.at_put_time_updated!r}. Re-read the issue "
+                "and retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.at_put_time_updated,
+            )
+        self.writes.append({"issue": issue_key, "description": description})
+        return {"id": "1"}
+
+    def delete_attachment(self, attachment_id, *, issue_key):
+        self.deleted.append(attachment_id)
+        return {}
+
+
+def _install_embed_diagram_mcp_client(
+    monkeypatch, tmp_path, **kwargs
+) -> EmbedDiagramMcpFakeClient:
+    config = make_config(tmp_path)
+    client = EmbedDiagramMcpFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_a, **_k: None)
+    return client
+
+
+def test_jira_embed_diagram_succeeds_despite_the_upload_moving_updated(
+    tmp_path, monkeypatch
+) -> None:
+    """G1, carried to the MCP surface while adding G2's guard: the upload itself moves
+    `updated`, so the token must be read after it, not from the initial combined read."""
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is True, result
+    assert len(client.writes) == 1
+
+
+def test_jira_embed_diagram_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        at_put_time_updated="2026-01-01T00:05:00.000+0000",
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+
+
+def test_jira_embed_diagram_refuses_when_guard_on_and_updated_missing(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_embed_diagram_mcp_client(monkeypatch, tmp_path, after_upload_updated=None)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+
+
+def test_jira_embed_diagram_guard_false_ignores_missing_updated(tmp_path, monkeypatch) -> None:
+    client = _install_embed_diagram_mcp_client(monkeypatch, tmp_path, after_upload_updated=None)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(
+        str(png), key="FC-1", guard_concurrent_edit=False, execute=True
+    )
+
+    assert result["ok"] is True
+    assert len(client.writes) == 1
+
+
+class MermaidFakeClient:
+    """Fake for jira_render_mermaid_diagrams. Each `add_attachment` call (one per rendered
+    diagram) bumps the live `updated` state, modelling Jira's real behaviour; `issue_version`
+    reports it, exactly like `EmbedDiagramMcpFakeClient` above.
+    """
+
+    def __init__(self, _config, *, after_upload_updated, at_put_time_updated=None):
+        self.state = {"updated": "T-before-upload"}
+        self.after_upload_updated = after_upload_updated
+        self.at_put_time_updated = (
+            at_put_time_updated if at_put_time_updated is not None else after_upload_updated
+        )
+        self.description = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "codeBlock",
+                    "attrs": {"language": "mermaid"},
+                    "content": [{"type": "text", "text": "graph TD; A-->B;"}],
+                }
+            ],
+        }
+        self.writes: list[dict[str, object]] = []
+        self.uploaded: list[str] = []
+        self.deleted: list[str] = []
+        self._next_id = 9200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        return {
+            "key": issue_key,
+            "fields": {"description": self.description, "attachment": []},
+        }
+
+    def add_attachment(self, issue_key, path):
+        self._next_id += 1
+        attachment_id = str(self._next_id)
+        self.uploaded.append(attachment_id)
+        self.state["updated"] = self.after_upload_updated
+        return [{"id": attachment_id, "filename": Path(path).name}]
+
+    def attachment_media_id(self, attachment_id, *, issue_key):
+        return f"media-{attachment_id}"
+
+    def issue_version(self, issue_key):
+        current = self.state["updated"]
+        if not isinstance(current, str) or not current:
+            raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
+        return current
+
+    def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
+        if expect_updated is not None and expect_updated != self.at_put_time_updated:
+            raise JiraConcurrentEditError(
+                f"Issue {issue_key} changed since it was read: expected updated="
+                f"{expect_updated!r}, found {self.at_put_time_updated!r}. Re-read the issue "
+                "and retry.",
+                issue_key=issue_key,
+                expected_updated=expect_updated,
+                found_updated=self.at_put_time_updated,
+            )
+        self.writes.append({"issue": issue_key, "description": description})
+        return {"id": "1"}
+
+    def delete_attachment(self, attachment_id, *, issue_key):
+        self.deleted.append(attachment_id)
+        return {}
+
+
+def _install_mermaid_client(monkeypatch, tmp_path, **kwargs) -> MermaidFakeClient:
+    config = make_config(tmp_path)
+    client = MermaidFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        mcp_server,
+        "discover_mermaid_runtime",
+        lambda *_a, **_k: SimpleNamespace(
+            node=Path("node"), cli=Path("mmdc"), browser=Path("chromium")
+        ),
+    )
+
+    def _fake_render(_source, path, *, runtime):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(_PNG_BYTES)
+
+    monkeypatch.setattr(mcp_server, "render_mermaid_png", _fake_render)
+    return client
+
+
+def test_jira_render_mermaid_diagrams_succeeds_despite_the_upload_moving_updated(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is True, result
+    assert len(client.writes) == 1
+    assert client.deleted == []
+
+
+def test_jira_render_mermaid_diagrams_refuses_on_genuine_concurrent_edit_and_cleans_up_upload(
+    tmp_path, monkeypatch
+) -> None:
+    """A real race must still refuse -- and, unlike embed-diagram, this tool already cleans up
+    attachments it uploaded in the same call when the write that would reference them fails."""
+    client = _install_mermaid_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        at_put_time_updated="2026-01-01T00:05:00.000+0000",
+    )
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+    assert client.deleted == client.uploaded
+    assert len(client.uploaded) == 1
+
+
+def test_jira_render_mermaid_diagrams_refuses_when_guard_on_and_updated_missing(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(monkeypatch, tmp_path, after_upload_updated=None)
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+    assert client.deleted == client.uploaded

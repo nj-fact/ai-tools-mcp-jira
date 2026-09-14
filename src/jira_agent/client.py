@@ -518,16 +518,21 @@ class JiraClient:
         Jira Cloud exposes no ETag or other conditional-write token on the issue resource, so
         `updated` is the closest thing available: any field write moves it, including one made by
         another user, automation rule, or workflow post-function the caller never saw.
+
+        Raises `JiraMissingConcurrencyTokenError`, not a bare `JiraApiError`, when the response
+        carries no usable token. `require_concurrency_token` raises the same type for the same
+        condition on every other guarded command's read; a caller that gets its token through
+        this method instead (`human-brief`, `edit-issue`, `issue-type` on the CLI, and their MCP
+        equivalents) deserves the identical `concurrent_edit_guard_unavailable` outcome, not a
+        generic "Jira API error" exit that the other guarded commands do not produce for the
+        same condition.
         """
         data = self._request(
             "GET", f"/issue/{issue_key}", params={"fields": "updated"}, key=issue_key
         )
         updated = (data.get("fields") or {}).get("updated")
         if not isinstance(updated, str) or not updated:
-            raise JiraApiError(
-                f"Issue {issue_key} response did not include a usable updated timestamp",
-                details=data,
-            )
+            raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
         return updated
 
     def _guarded_issue_put(

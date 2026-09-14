@@ -15,6 +15,7 @@ from jira_agent.client import (
     JiraApiError,
     JiraClient,
     JiraConcurrentEditError,
+    JiraMissingConcurrencyTokenError,
     adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
@@ -23,6 +24,7 @@ from jira_agent.client import (
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
+    require_concurrency_token,
     select_transition,
 )
 from jira_agent.config import load_config
@@ -114,6 +116,40 @@ def _concurrent_edit_error(exc: JiraConcurrentEditError) -> dict[str, Any]:
         "issue": exc.issue_key,
         "expected_updated": exc.expected_updated,
         "found_updated": exc.found_updated,
+    }
+
+
+def _cleanup_uploaded_attachments(
+    config: Any, issue_key: str, attachment_ids: list[str]
+) -> None:
+    """Best-effort delete of attachments a call uploaded when the write that would have
+    referenced them never happened. Shared by jira_render_mermaid_diagrams's guard-refusal
+    paths and its pre-existing generic-failure path, so a refused concurrency guard leaves the
+    issue exactly as it stood before the call, the same way a transport failure already did.
+    """
+    if not attachment_ids:
+        return
+    try:
+        with JiraClient(config) as cleanup_client:
+            for attachment_id in attachment_ids:
+                cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
+    except JiraApiError:
+        pass
+
+
+def _guard_unavailable_error(exc: JiraMissingConcurrencyTokenError) -> dict[str, Any]:
+    """Shape a JiraMissingConcurrencyTokenError as the one `concurrent_edit_guard_unavailable`
+    outcome every guarded tool returns for "no usable token to guard with", whichever call site
+    raised it: `require_concurrency_token` on a same-request read, or `issue_version` on a
+    dedicated one. `jira_patch_description_section` built this document inline before this
+    shared helper existed; every guarded tool added since routes through it instead, so the
+    condition cannot drift back to being tested three different ways across the file.
+    """
+    return {
+        "ok": False,
+        "error_type": "concurrent_edit_guard_unavailable",
+        "issue": exc.issue_key,
+        "message": str(exc),
     }
 
 
@@ -629,7 +665,10 @@ def jira_edit_issue(
     guard_concurrent_edit defaults to true: the issue's `updated` timestamp is read right before
     the write and passed back as a concurrency guard, so a change that lands between that read
     and this write is refused with error_type "concurrent_edit" naming both timestamps, instead
-    of being silently overwritten. Pass false to skip the guard.
+    of being silently overwritten. When that dedicated read itself carries no usable `updated`,
+    this refuses with error_type "concurrent_edit_guard_unavailable" instead of a generic error,
+    the same outcome every other guarded tool produces for the same condition. Pass false to
+    skip the guard.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -695,6 +734,8 @@ def jira_edit_issue(
             return {"ok": True, "issue": issue_key}
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -706,7 +747,18 @@ def jira_clear_issue_parent(
     key: str | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Clear an issue parent explicitly. Defaults to dry-run and verifies the reread."""
+    """Clear an issue parent explicitly. Defaults to dry-run and verifies the reread.
+
+    G2 decision: this deliberately carries no concurrency guard. The whole-field rewrites the
+    guard protects (description, labels) read an existing value, transform it, and write the
+    transformed whole field back, so an unrelated concurrent change to that same field is
+    silently discarded when the stale read overwrites it. Clearing a parent is not that shape:
+    it sets one relationship field to a single, specific, verified target state (null) rather
+    than folding a read into a computed replacement, and the reread below independently confirms
+    that target state was reached regardless of what any concurrent editor did to `parent` in
+    between. A guard would only add a refusal for a condition this command already tolerates by
+    construction and already verifies.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -876,20 +928,14 @@ def jira_patch_description_section(
             issue = client.get_issue(key, fields=["description", "updated"])
             issue_fields = issue.get("fields") or {}
             read_updated = issue_fields.get("updated")
-            if guard_concurrent_edit and read_updated is None:
-                return {
-                    "ok": False,
-                    "error_type": "concurrent_edit_guard_unavailable",
-                    "issue": key,
-                    "message": (
-                        "guard_concurrent_edit is true, but the same-request read that fetched "
-                        "the description did not return `updated`, so no concurrency-guard "
-                        "token is available. Refusing to write unguarded rather than falling "
-                        "back to a second read or an unconditional overwrite. Pass "
-                        "guard_concurrent_edit=false to opt out and write without the guard."
-                    ),
-                }
-            expect_updated = read_updated if guard_concurrent_edit else None
+            # require_concurrency_token treats anything that is not a non-empty string as "no
+            # usable token" -- not just None. A bare `read_updated is None` check let
+            # `updated: ""` (a falsy but non-None value) through as `expect_updated=""`, which
+            # then compared unequal to whatever the pre-PUT reread found and raised a misleading
+            # "concurrent_edit" refusal instead of this guard-unavailable one.
+            expect_updated = require_concurrency_token(
+                key, read_updated, guard_enabled=guard_concurrent_edit
+            )
             patch = patch_adf_description_section(
                 issue_fields.get("description"),
                 section=section,
@@ -946,6 +992,8 @@ def jira_patch_description_section(
         return {"ok": False, "message": str(exc), "error_type": "patch_invariant"}
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1015,9 +1063,18 @@ def jira_agent_plan_comment(
 def jira_write_human_brief(
     body: str,
     key: str | None = None,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Write a Human Brief into the Jira description. Defaults to dry-run."""
+    """Write a Human Brief into the Jira description. Defaults to dry-run.
+
+    This replaces the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. guard_concurrent_edit defaults to true: the issue's
+    `updated` timestamp is read right before the write and passed back as a concurrency guard,
+    matching jira_edit_issue. A change landing between that read and the write is refused with
+    error_type "concurrent_edit"; a read with no usable `updated` refuses with error_type
+    "concurrent_edit_guard_unavailable". Pass false to skip the guard.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1038,15 +1095,27 @@ def jira_write_human_brief(
                     "safety": safety,
                     "message": "Pass execute=true to write the Human Brief.",
                 }
-            result = client.edit_issue(issue_key, description=body)
+            expect_updated = None
+            if guard_concurrent_edit:
+                read_updated = client.get_issue(issue_key, fields=["updated"])
+                expect_updated = require_concurrency_token(
+                    issue_key,
+                    (read_updated.get("fields") or {}).get("updated"),
+                    guard_enabled=True,
+                )
+            result = client.edit_issue(issue_key, description=body, expect_updated=expect_updated)
             audit_write(
                 config,
                 action="human_brief",
                 issue_key=issue_key,
-                payload=payload,
+                payload={**payload, "guard_concurrent_edit": guard_concurrent_edit},
                 result=result,
             )
             return {"ok": True, "issue": issue_key}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1170,9 +1239,20 @@ def jira_update_drift_labels(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     clear: bool = False,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Set or remove drift-* labels. Defaults to dry-run."""
+    """Set or remove drift-* labels. Defaults to dry-run.
+
+    G2 decision: unlike jira_clear_issue_parent, this DOES need the guard. It reads the whole
+    `labels` array, computes a new whole array from add/remove/clear, and PUTs that array back
+    -- the same read-transform-whole-field-rewrite shape as the description rewrites this round
+    exists to protect, just for a list field instead of a document. A label a concurrent editor
+    added after this read is silently dropped when the stale array overwrites it, which a
+    single-target-value operation like clearing a parent cannot do to unrelated data.
+    guard_concurrent_edit defaults to true: the same read that fetches `labels` also fetches
+    `updated`, so the guard token belongs to that read; pass false to skip it.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1183,8 +1263,12 @@ def jira_update_drift_labels(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["labels"])
-            existing = (issue.get("fields") or {}).get("labels") or []
+            issue = client.get_issue(issue_key, fields=["labels", "updated"])
+            issue_fields = issue.get("fields") or {}
+            expect_updated = require_concurrency_token(
+                issue_key, issue_fields.get("updated"), guard_enabled=guard_concurrent_edit
+            )
+            existing = issue_fields.get("labels") or []
             labels = update_drift_labels(existing, add=add, remove=remove, clear=clear)
             payload = edit_issue_payload(labels=labels)
             if not execute:
@@ -1197,15 +1281,23 @@ def jira_update_drift_labels(
                     "payload": payload,
                     "safety": safety,
                 }
-            result = client.edit_issue(issue_key, labels=labels)
+            result = client.edit_issue(issue_key, labels=labels, expect_updated=expect_updated)
             audit_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
-                payload={"before": existing, "after": labels},
+                payload={
+                    "before": existing,
+                    "after": labels,
+                    "guard_concurrent_edit": guard_concurrent_edit,
+                },
                 result=result,
             )
             return {"ok": True, "issue": issue_key, "labels": labels}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1667,9 +1759,18 @@ def jira_render_mermaid_diagrams(
     filenames: list[str] | None = None,
     alt_texts: list[str] | None = None,
     output_dir: str | None = None,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Render Mermaid code blocks locally, upload PNGs, and embed them. Defaults to dry-run."""
+    """Render Mermaid code blocks locally, upload PNGs, and embed them. Defaults to dry-run.
+
+    This rewrites the whole description field. guard_concurrent_edit defaults to true, but like
+    jira_embed_diagram, the token cannot come from the initial read: uploading each rendered PNG
+    is itself a write that moves this issue's own `updated` on the Jira side (see G1), so a
+    token read before the uploads would be stale by construction. The token is instead read with
+    `issue_version` immediately before the write, after every upload. A refused write cleans up
+    the attachments already uploaded in this call, the same way a transport failure already did.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1761,7 +1862,13 @@ def jira_render_mermaid_diagrams(
                     height=height,
                 )
 
-            result = client.edit_issue_adf_description(issue_key, updated_description)
+            # Every upload above already changed this issue's `updated` on the Jira side, so a
+            # token read before them (the G1 bug) is stale by construction. Read it here
+            # instead: after the last write that changes the issue, immediately before the PUT.
+            expect_updated = client.issue_version(issue_key) if guard_concurrent_edit else None
+            result = client.edit_issue_adf_description(
+                issue_key, updated_description, expect_updated=expect_updated
+            )
             deleted: list[str] = []
             for attachment_id in sorted(previous_ids - set(uploaded_ids)):
                 client.delete_attachment(attachment_id, issue_key=issue_key)
@@ -1774,6 +1881,7 @@ def jira_render_mermaid_diagrams(
                     "files": [str(path) for path in paths],
                     "attachment_ids": uploaded_ids,
                     "deleted_attachment_ids": deleted,
+                    "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
             )
@@ -1783,19 +1891,24 @@ def jira_render_mermaid_diagrams(
                 "attachments": new_attachments,
                 "deleted_attachment_ids": deleted,
             }
-    except (OSError, RuntimeError, ValueError) as exc:
-        return {"ok": False, "message": str(exc)}
+    # JiraApiError (and every subclass: JiraConcurrentEditError, JiraMissingConcurrencyTokenError,
+    # JiraWriteSafetyError) is itself a RuntimeError, so these Jira-specific clauses must come
+    # BEFORE the generic (OSError, RuntimeError, ValueError) catch-all below. Reversed, that
+    # catch-all would swallow every one of them first, exactly as it did before this fix: the
+    # attachment cleanup on failure was unreachable dead code for any real Jira API failure.
+    except JiraConcurrentEditError as exc:
+        _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
-        if uploaded_ids:
-            try:
-                with JiraClient(config) as cleanup_client:
-                    for attachment_id in uploaded_ids:
-                        cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
-            except JiraApiError:
-                pass
+        _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
         return _error(exc)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"ok": False, "message": str(exc)}
 
 
 @mcp.tool
@@ -1805,9 +1918,19 @@ def jira_embed_diagram(
     alt: str = "Architecture diagram",
     delete_filenames: list[str] | None = None,
     delete_attachment_ids: list[str] | None = None,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run."""
+    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run.
+
+    This rewrites the whole description field. guard_concurrent_edit defaults to true, but
+    unlike jira_embed_existing_png_attachment and jira_upsert_image_gallery, the token cannot
+    come from the same read that fetches the description and attachments: uploading the file is
+    itself a write that moves this issue's own `updated` on the Jira side (see G1), so a token
+    read before the upload would be stale by construction and would refuse every guarded
+    execution after already uploading the attachment, orphaning it. The token is instead read
+    with `issue_version` immediately before the write, after the upload. Pass false to skip it.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1853,7 +1976,13 @@ def jira_embed_diagram(
                 width=width,
                 height=height,
             )
-            result = client.edit_issue_adf_description(issue_key, description)
+            # The upload above already changed this issue's `updated` on the Jira side, so a
+            # token read before it would be stale by construction (G1). Read it here instead:
+            # after the last write that changes the issue, immediately before the PUT it guards.
+            expect_updated = client.issue_version(issue_key) if guard_concurrent_edit else None
+            result = client.edit_issue_adf_description(
+                issue_key, description, expect_updated=expect_updated
+            )
             deleted: list[str] = []
             for item_id in sorted(delete_ids - {attachment_id}):
                 client.delete_attachment(item_id, issue_key=issue_key)
@@ -1868,6 +1997,7 @@ def jira_embed_diagram(
                     "media_id": media_id,
                     "deleted_attachment_ids": deleted,
                     "dimensions": {"width": width, "height": height},
+                    "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
             )
@@ -1878,6 +2008,10 @@ def jira_embed_diagram(
                 "media_id": media_id,
                 "deleted_attachment_ids": deleted,
             }
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1893,6 +2027,7 @@ def jira_embed_existing_png_attachment(
     height: int | None = None,
     alt: str = "Architecture diagram",
     replace_existing: bool = False,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Embed one existing PNG attachment without uploading a duplicate. Defaults to dry-run.
@@ -1901,6 +2036,11 @@ def jira_embed_existing_png_attachment(
     width and height are required because display dimensions are never guessed. When
     replace_existing is true, exactly one inline media item must belong to an attachment with the
     same filename; no unrelated media is replaced.
+
+    This rewrites the whole description field. guard_concurrent_edit defaults to true: unlike
+    jira_embed_diagram, embedding an already-uploaded attachment performs no Jira-changing call
+    between the read and the write, so the same read that fetches the description and
+    attachments also fetches `updated`, and that token guards the write. Pass false to skip it.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -1915,7 +2055,12 @@ def jira_embed_existing_png_attachment(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            issue = client.get_issue(issue_key, fields=["description", "attachment", "updated"])
+            expect_updated = require_concurrency_token(
+                issue_key,
+                (issue.get("fields") or {}).get("updated"),
+                guard_enabled=guard_concurrent_edit,
+            )
             attachment = resolve_png_attachment(
                 issue, filename=filename, attachment_id=attachment_id
             )
@@ -1980,7 +2125,9 @@ def jira_embed_existing_png_attachment(
                 height=height,
                 replace_media_id=replace_media_id,
             )
-            result = client.edit_issue_adf_description(issue_key, description)
+            result = client.edit_issue_adf_description(
+                issue_key, description, expect_updated=expect_updated
+            )
             verified = client.get_issue(issue_key, fields=["description", "attachment"])
             verified_attachment = resolve_png_attachment(
                 verified, filename=filename, attachment_id=resolved_id
@@ -1991,7 +2138,7 @@ def jira_embed_existing_png_attachment(
                 config,
                 action="embed_existing_png",
                 issue_key=issue_key,
-                payload=payload,
+                payload={**payload, "guard_concurrent_edit": guard_concurrent_edit},
                 result={
                     "edit": result,
                     "verified_attachment_id": verified_attachment["id"],
@@ -2013,6 +2160,10 @@ def jira_embed_existing_png_attachment(
                 "media_id": media_id,
                 "embedded": True,
             }
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2027,9 +2178,16 @@ def jira_upsert_image_gallery(
     key: str | None = None,
     documentation_filename: str | None = None,
     before_heading: str = "Child Issues",
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
+    """Insert or replace a linked screenshot gallery using existing Jira attachments.
+
+    This rewrites the whole description field. guard_concurrent_edit defaults to true: this
+    tool performs no Jira-changing call between the read and the write, so the same read that
+    fetches the description and attachments also fetches `updated`, and that token guards the
+    write. Pass false to skip it.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -2041,7 +2199,12 @@ def jira_upsert_image_gallery(
         }
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["description", "attachment"])
+            issue = client.get_issue(issue_key, fields=["description", "attachment", "updated"])
+            expect_updated = require_concurrency_token(
+                issue_key,
+                (issue.get("fields") or {}).get("updated"),
+                guard_enabled=guard_concurrent_edit,
+            )
             attachments = issue.get("fields", {}).get("attachment") or []
             by_name = newest_attachments_by_filename(attachments)
             missing = sorted(filenames - set(by_name))
@@ -2075,7 +2238,9 @@ def jira_upsert_image_gallery(
                     "before_heading": before_heading,
                     "safety": safety,
                 }
-            result = client.edit_issue_adf_description(issue_key, description)
+            result = client.edit_issue_adf_description(
+                issue_key, description, expect_updated=expect_updated
+            )
             audit_write(
                 config,
                 action="upsert_image_gallery",
@@ -2085,12 +2250,17 @@ def jira_upsert_image_gallery(
                     "filenames": sorted(filenames),
                     "documentation_filename": documentation_filename,
                     "before_heading": before_heading,
+                    "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
             )
             return {"ok": True, "issue": issue_key, "screenshot_count": len(filenames)}
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2237,7 +2407,9 @@ def jira_set_issue_type(
     Checks the target issue's editmeta first and refuses immediately when issue_type_name is not
     among its allowed issuetype values, instead of sending a PUT Jira would reject. Guarded by
     the same concurrency check as jira_edit_issue and jira_patch_description_section: pass
-    guard_concurrent_edit=false to skip it.
+    guard_concurrent_edit=false to skip it. A read with no usable `updated` refuses with
+    error_type "concurrent_edit_guard_unavailable", the same outcome every other guarded tool
+    produces for the same condition.
     """
     try:
         with _client() as client:
@@ -2273,6 +2445,8 @@ def jira_set_issue_type(
             return {"ok": True, "issue": key, "issue_type_name": issue_type_name}
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
+    except JiraMissingConcurrencyTokenError as exc:
+        return _guard_unavailable_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
