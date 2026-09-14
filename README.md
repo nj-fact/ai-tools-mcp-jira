@@ -432,3 +432,29 @@ uv run python scripts/smoke_mcp.py --issue FC-107
 ```
 
 The smoke test starts `jira-agent-mcp` over stdio, verifies the expected tool list, and calls `jira_agent_report`.
+
+## Concurrency guard on whole-field rewrites
+
+`edit-issue` and `patch-description-section` each read an issue, then write a whole field back.
+By default both are guarded: the command captures the issue's `updated` timestamp as part of
+its read, then refuses the write with exit code 4 (distinct from the generic API error's 1 and
+the write-safety error's 3) if `updated` no longer matches immediately before the write. The
+refusal names the issue and both timestamps in prose, and, under `--json`, in a JSON document
+carrying `error_type: "concurrent_edit"`, `expected_updated`, `found_updated`, and `dry_run`.
+
+This is a check-then-act narrowing of the race window, not an atomic compare-and-swap: Jira
+Cloud exposes no conditional write (no ETag / If-Match) on the issue resource, so a change that
+lands inside that narrowed window is still silently lost. Pass `--no-concurrency-guard` on
+either command for the previous unguarded behaviour.
+
+Two comment commands fill a gap where only `add-comment` existed:
+
+- `edit-comment <KEY> <COMMENT_ID> --body TEXT | --body-file PATH` replaces one comment's body.
+  Dry run shows the comment's current body next to the proposed replacement, in prose and, under
+  `--json`, as `current_body` / `proposed_body`.
+- `delete-comment <KEY> <COMMENT_ID>` deletes one comment. Since deletion is irreversible, dry
+  run prints the full current body — the only chance to notice a wrong comment id before it is
+  gone for good.
+
+Both default to dry-run behind `--execute`, go through the same write-scope check as every other
+write command, and append to the audit log on execution.

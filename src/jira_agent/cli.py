@@ -527,6 +527,160 @@ def add_comment(
     console.print(f"Added comment {data.get('id')} to {key}.")
 
 
+@app.command("edit-comment")
+def edit_comment(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    comment_id: Annotated[str, typer.Argument(help="Jira comment id.")],
+    body: Annotated[
+        str | None,
+        typer.Option("--body", help="New comment text."),
+    ] = None,
+    body_file: Annotated[
+        Path | None,
+        typer.Option("--body-file", help="UTF-8 Markdown file with the new comment text."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually rewrite the comment in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Replace one comment's body on one Jira issue. Defaults to dry-run.
+
+    Shows the comment's current body next to the proposed replacement, both in the dry-run
+    prose and, under --json, in the JSON document, because a caller correcting a comment needs
+    to see exactly what they are about to overwrite before committing to it.
+    """
+    try:
+        new_body = read_text_source(body, body_file)
+    except (OSError, ValueError) as exc:
+        _print_error("Edit error:", exc)
+        raise typer.Exit(2) from exc
+
+    with _client() as client:
+        try:
+            current = client.get_comment(key, comment_id)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+        current_body = _adf_to_text(current.get("body")).strip()
+
+        if not execute:
+            _say("[yellow]Dry run:[/yellow] would replace this comment", json_mode=json_output)
+            _say(f"issue: {key}", json_mode=json_output)
+            _say(f"comment: {comment_id}", json_mode=json_output)
+            _say("current body:", json_mode=json_output)
+            _say(current_body, json_mode=json_output)
+            _say("proposed body:", json_mode=json_output)
+            _say(new_body, json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "issue": key,
+                        "comment": comment_id,
+                        "current_body": current_body,
+                        "proposed_body": new_body,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
+            return
+
+        try:
+            ensure_issue_write_allowed(client.config, client, key)
+            data = client.update_comment(key, comment_id, new_body)
+            audit_write(
+                client.config,
+                action="edit_comment",
+                issue_key=key,
+                payload={
+                    "comment_id": comment_id,
+                    "previous_body": current_body,
+                    "body": new_body,
+                },
+                result={"id": data.get("id")},
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json({**data, "dry_run": False})
+        return
+
+    console.print(f"Edited comment {comment_id} on {key}.")
+
+
+@app.command("delete-comment")
+def delete_comment(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    comment_id: Annotated[str, typer.Argument(help="Jira comment id.")],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually delete the comment in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Delete one comment from one Jira issue. Defaults to dry-run.
+
+    Deleting a comment is irreversible, so the dry run prints the full current body: it is the
+    only chance the caller gets to notice a wrong comment id before the comment is gone for good.
+    """
+    with _client() as client:
+        try:
+            current = client.get_comment(key, comment_id)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+        current_body = _adf_to_text(current.get("body")).strip()
+
+        if not execute:
+            _say("[yellow]Dry run:[/yellow] would delete this comment", json_mode=json_output)
+            _say(f"issue: {key}", json_mode=json_output)
+            _say(f"comment: {comment_id}", json_mode=json_output)
+            _say("current body:", json_mode=json_output)
+            _say(current_body, json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "issue": key,
+                        "comment": comment_id,
+                        "current_body": current_body,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to delete it from Jira.", json_mode=json_output)
+            return
+
+        try:
+            ensure_issue_write_allowed(client.config, client, key)
+            data = client.delete_comment(key, comment_id)
+            audit_write(
+                client.config,
+                action="delete_comment",
+                issue_key=key,
+                payload={"comment_id": comment_id, "body": current_body},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json({"issue": key, "comment": comment_id, **data, "dry_run": False})
+        return
+
+    console.print(f"Deleted comment {comment_id} from {key}.")
+
+
 @app.command()
 def recent(
     days: Annotated[

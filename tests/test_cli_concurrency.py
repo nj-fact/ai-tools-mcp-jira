@@ -116,6 +116,42 @@ def _make_patch_fake_client(*, read_updated: str, server_updated: str) -> tuple[
     return FakeClient, writes
 
 
+def _make_edit_issue_fake_client(
+    *, read_updated: str, server_updated: str
+) -> tuple[type, list[dict]]:
+    """Fake client for edit-issue. ``writes`` records only completed writes."""
+    writes: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def issue_version(self, issue_key: str) -> str:
+            return read_updated
+
+        def edit_issue(
+            self, issue_key: str, *, expect_updated: str | None = None, **kwargs: Any
+        ) -> dict[str, Any]:
+            if expect_updated is not None and expect_updated != server_updated:
+                raise JiraConcurrentEditError(
+                    f"Issue {issue_key} changed since it was read: expected updated="
+                    f"{expect_updated!r}, found {server_updated!r}. Re-read the issue and retry.",
+                    issue_key=issue_key,
+                    expected_updated=expect_updated,
+                    found_updated=server_updated,
+                )
+            writes.append({"issue": issue_key, "expect_updated": expect_updated, "kwargs": kwargs})
+            return {"key": issue_key, "fields": {}}
+
+    return FakeClient, writes
+
+
 def _run(monkeypatch, tmp_path: Path, fake_client: type, args: list[str], *, audits=None):
     monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
     monkeypatch.setattr(cli, "JiraClient", fake_client)
@@ -255,42 +291,6 @@ def test_patch_description_section_docstring_no_longer_claims_no_optimistic_conc
 # --- edit-issue ------------------------------------------------------------------------------
 
 
-def _make_edit_issue_fake_client(
-    *, read_updated: str, server_updated: str
-) -> tuple[type, list[dict]]:
-    """Fake client for edit-issue. ``writes`` records only completed writes."""
-    writes: list[dict[str, Any]] = []
-
-    class FakeClient:
-        def __init__(self, config: JiraConfig) -> None:
-            self.config = config
-
-        def __enter__(self) -> FakeClient:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-        def issue_version(self, issue_key: str) -> str:
-            return read_updated
-
-        def edit_issue(
-            self, issue_key: str, *, expect_updated: str | None = None, **kwargs: Any
-        ) -> dict[str, Any]:
-            if expect_updated is not None and expect_updated != server_updated:
-                raise JiraConcurrentEditError(
-                    f"Issue {issue_key} changed since it was read: expected updated="
-                    f"{expect_updated!r}, found {server_updated!r}. Re-read the issue and retry.",
-                    issue_key=issue_key,
-                    expected_updated=expect_updated,
-                    found_updated=server_updated,
-                )
-            writes.append({"issue": issue_key, "expect_updated": expect_updated, "kwargs": kwargs})
-            return {"key": issue_key, "fields": {}}
-
-    return FakeClient, writes
-
-
 def test_edit_issue_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
     FakeClient, writes = _make_edit_issue_fake_client(
         read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
@@ -377,3 +377,146 @@ def test_edit_issue_json_refusal_is_one_machine_readable_document(tmp_path, monk
     assert payload["found_updated"] == CHANGED_UPDATED
     assert payload["dry_run"] is False
     assert writes == []
+
+
+# --- edit-comment / delete-comment ----------------------------------------------------------
+
+
+def _make_comment_fake_client(*, current_text: str) -> tuple[type, dict[str, Any]]:
+    state: dict[str, Any] = {"updates": [], "deletes": [], "get_comment_calls": 0}
+    current_comment = {
+        "id": "10099",
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": current_text}]}],
+        },
+    }
+
+    class FakeClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+            state["get_comment_calls"] += 1
+            return current_comment
+
+        def update_comment(self, issue_key: str, comment_id: str, body: str) -> dict[str, Any]:
+            state["updates"].append({"issue": issue_key, "comment_id": comment_id, "body": body})
+            return {
+                "id": comment_id,
+                "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": body}]}],
+                },
+            }
+
+        def delete_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+            state["deletes"].append({"issue": issue_key, "comment_id": comment_id})
+            return {}
+
+    return FakeClient, state
+
+
+def test_edit_comment_dry_run_shows_current_and_proposed_and_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Fehlerhafter deutscher Text.")
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-comment", ISSUE_KEY, "10099", "--body", "Korrigierter deutscher Text."],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Fehlerhafter deutscher Text." in result.stdout
+    assert "Korrigierter deutscher Text." in result.stdout
+    assert state["updates"] == []
+
+
+def test_edit_comment_json_dry_run_carries_current_and_proposed_body(tmp_path, monkeypatch) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Fehlerhafter deutscher Text.")
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-comment", ISSUE_KEY, "10099", "--body", "Korrigierter deutscher Text.", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["current_body"] == "Fehlerhafter deutscher Text."
+    assert payload["proposed_body"] == "Korrigierter deutscher Text."
+    assert payload["dry_run"] is True
+    assert state["updates"] == []
+
+
+def test_edit_comment_execute_calls_update_comment_once_and_audits(tmp_path, monkeypatch) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Fehlerhafter deutscher Text.")
+    audits: list[tuple[tuple, dict]] = []
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "edit-comment",
+            ISSUE_KEY,
+            "10099",
+            "--body",
+            "Korrigierter deutscher Text.",
+            "--execute",
+        ],
+        audits=audits,
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert state["updates"] == [
+        {"issue": ISSUE_KEY, "comment_id": "10099", "body": "Korrigierter deutscher Text."}
+    ]
+    assert len(audits) == 1
+    _, audit_kwargs = audits[0]
+    assert audit_kwargs["action"] == "edit_comment"
+    assert audit_kwargs["issue_key"] == ISSUE_KEY
+
+
+def test_delete_comment_dry_run_prints_current_body_and_writes_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Zu löschender Kommentar.")
+
+    result = _run(monkeypatch, tmp_path, FakeClient, ["delete-comment", ISSUE_KEY, "10099"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "Zu löschender Kommentar." in result.stdout
+    assert state["deletes"] == []
+
+
+def test_delete_comment_execute_calls_delete_comment_once_and_audits(tmp_path, monkeypatch) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Zu löschender Kommentar.")
+    audits: list[tuple[tuple, dict]] = []
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["delete-comment", ISSUE_KEY, "10099", "--execute"],
+        audits=audits,
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert state["deletes"] == [{"issue": ISSUE_KEY, "comment_id": "10099"}]
+    assert len(audits) == 1
+    _, audit_kwargs = audits[0]
+    assert audit_kwargs["action"] == "delete_comment"
+    assert audit_kwargs["issue_key"] == ISSUE_KEY
