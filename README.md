@@ -316,11 +316,15 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   Markdown-to-ADF descriptions; optionally select one Markdown section from a preparation file
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`. `--comments` takes an integer
-  (the newest that many, via `orderBy=-created`) or the literal `all` to page through every
-  comment; the report and its human rendering always state both the true comment count and how
-  many were actually returned, so a caller can tell a short list from a complete one
+  (the newest that many) or the literal `all` to page through every comment; both fetch via
+  `orderBy=-created` and so both return newest first, and the report carries an explicit
+  `comments_order: "newest-first"` key so a reader never has to infer the order from which
+  option was passed. The report and its human rendering always state both the true comment
+  count and how many were actually returned, so a caller can tell a short list from a complete
+  one
 - Prepare standardized agent comments with `agent-plan-comment`
-- Write Human Briefs into Jira descriptions with `human-brief`
+- Write Human Briefs into Jira descriptions with `human-brief`, guarded against a concurrent
+  edit by default the same way `edit-issue` is: an `--no-concurrency-guard` opt-out is available.
 - Store Factory Contracts as comments or attachments with `factory-contract`
 - Post Drift Reconcile comments with `drift-reconcile-comment`
 - Set or remove `drift-*` labels with `drift-labels`
@@ -341,6 +345,11 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   `--no-render-mermaid`) and retrofit an existing issue with `render-mermaid`
 - Insert or replace a linked screenshot gallery from existing attachments with
   `upsert-image-gallery`
+- `embed-diagram`, `embed-existing-png`, and `upsert-image-gallery` each rewrite the whole
+  description field, exactly like `patch-description-section`, and are guarded the same way by
+  default: the same read that fetches the description and attachments also fetches `updated`, so
+  the write refuses (exit code 4) if it no longer matches immediately beforehand.
+  `--no-concurrency-guard` opts out.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
@@ -365,6 +374,14 @@ into `jq` or `json.load` with no slicing. Every other line (dry-run notices, saf
 that JSON document also carries a top-level `dry_run` boolean, `true` when the write was not
 performed and `false` when it was, so a `--json` caller can tell a dry-run preview apart from a
 completed write without having read the (now stderr-only) prose.
+
+This holds on the error paths too: a Jira API failure or a write-safety refusal under `--json`
+still prints its prose to stderr, but stdout is not left empty. It carries one document instead,
+with `ok: false`, an `error_type` (`jira_api_error` or `write_safety_error`), and the failure's
+own detail (a `status_code` where there is one, and the message). Piping a failed `--json`
+invocation into `json.load` used to raise `Expecting value: line 1 column 1` on the empty stream;
+it now parses, so a caller can tell a transport failure apart from a refusal without falling back
+to reading stderr prose.
 
 ## MCP Server
 
@@ -466,9 +483,15 @@ several issues between sprints, and turning a Task into a Bug (previously imposs
 the workaround was creating a duplicate issue and retiring the original).
 
 - `boards [--type scrum|kanban] [--name TEXT] [--max-results N]` — list Jira Agile boards, so a
-  caller can find a board id without opening the UI.
+  caller can find a board id without opening the UI. `--max-results` defaults to 50 and this
+  command never fetches a second page, so both output modes report whether more boards remain:
+  a `returned N; more remain` / `returned N; complete` line in human mode from the response's own
+  `isLast`, and `returned`/`is_last` alongside the raw response under `--json`. No total is
+  fabricated; Jira's own `total`, when the response carries one, is reported and labelled as
+  coming from Jira.
 - `sprints --board ID [--state active|future|closed] [--max-results N]` — list one board's
-  sprints.
+  sprints. Same truncation reporting as `boards`: `--max-results` defaults to 50, and both output
+  modes say whether more sprints remain instead of showing 50 and staying silent.
 - `issue-sprint <KEY>` — read-only, no `--execute`. Reports which sprint(s) an issue is in, and
   renders three distinct states rather than collapsing any two of them: the sprint field absent
   from the Jira response entirely (`sprint_field_present: false`), the field present but an empty
@@ -477,9 +500,10 @@ the workaround was creating a duplicate issue and retiring the original).
 - `sprint-add <SPRINT_ID> <KEY>...` — add one or more issues to a sprint. This is a single
   batched `POST /sprint/{id}/issue` call carrying every key at once, not a per-issue loop, so
   there is no "key 7 of 13 failed, the rest already moved" state to report on the Jira side. The
-  write-safety gate is still checked for every key before that one call is made: a key that fails
-  the gate stops the command before any issue, including earlier ones in the same invocation, is
-  written.
+  write-safety gate is checked for every key before the dry run reports success, not only before
+  `--execute` writes, so a clean dry run predicts what `--execute` does; a key that fails the
+  gate stops the command before any issue, including earlier ones in the same invocation, is
+  written, and the dry run reports the same per-key `safety` result `--execute` would have used.
 - `sprint-remove <KEY>...` — move one or more issues to the backlog, which is how the Jira Agile
   API removes an issue from its sprint. Same single-batched-call and check-every-key-first
   behaviour as `sprint-add`.

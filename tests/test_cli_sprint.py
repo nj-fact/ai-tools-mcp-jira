@@ -40,8 +40,22 @@ def _install(monkeypatch, config, client) -> None:
 
 
 class _BoardsFakeClient:
-    def __init__(self, _config=None) -> None:
+    def __init__(
+        self,
+        _config=None,
+        *,
+        is_last: bool = True,
+        total: int | None = None,
+        values: list[dict[str, object]] | None = None,
+    ) -> None:
         self.calls: list[dict[str, object]] = []
+        self._is_last = is_last
+        self._total = total
+        self._values = (
+            values
+            if values is not None
+            else [{"id": 814, "name": "First Mortgage Loan", "type": "scrum"}]
+        )
 
     def __enter__(self):
         return self
@@ -51,12 +65,15 @@ class _BoardsFakeClient:
 
     def list_boards(self, *, board_type=None, name=None, max_results=50):
         self.calls.append({"board_type": board_type, "name": name, "max_results": max_results})
-        return {
+        response: dict[str, object] = {
             "maxResults": 50,
             "startAt": 0,
-            "isLast": True,
-            "values": [{"id": 814, "name": "First Mortgage Loan", "type": "scrum"}],
+            "isLast": self._is_last,
+            "values": self._values,
         }
+        if self._total is not None:
+            response["total"] = self._total
+        return response
 
 
 def test_boards_cli_renders_probed_shape(tmp_path, monkeypatch) -> None:
@@ -82,20 +99,79 @@ def test_boards_cli_supports_json_and_forwards_filters(tmp_path, monkeypatch) ->
     assert client.calls == [{"board_type": "scrum", "name": "First", "max_results": 50}]
 
 
+def test_boards_cli_reports_more_remain_when_not_last_page(tmp_path, monkeypatch) -> None:
+    """F4 regression: `boards` used to print only `values`, with no signal that more boards
+    exist, even though the Agile response it already holds carries `isLast`. A board with more
+    boards than `--max-results` (default 50) showed 50 and said nothing.
+    """
+    client = _BoardsFakeClient(is_last=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["boards"])
+
+    assert result.exit_code == 0, result.output
+    assert "returned 1 board(s); more remain" in result.stdout
+
+
+def test_boards_cli_reports_complete_when_last_page(tmp_path, monkeypatch) -> None:
+    client = _BoardsFakeClient(is_last=True)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["boards"])
+
+    assert result.exit_code == 0, result.output
+    assert "returned 1 board(s); complete" in result.stdout
+
+
+def test_boards_cli_json_carries_returned_and_is_last(tmp_path, monkeypatch) -> None:
+    client = _BoardsFakeClient(is_last=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["boards", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["returned"] == 1
+    assert payload["is_last"] is False
+
+
+def test_boards_cli_never_fabricates_a_total(tmp_path, monkeypatch) -> None:
+    client = _BoardsFakeClient(is_last=False)  # no "total" in the fake Agile response
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["boards"])
+
+    assert result.exit_code == 0, result.output
+    assert "total" not in result.stdout.lower()
+
+
+def test_boards_cli_reports_a_real_total_when_jira_supplies_one(tmp_path, monkeypatch) -> None:
+    client = _BoardsFakeClient(is_last=False, total=120)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["boards"])
+
+    assert result.exit_code == 0, result.output
+    assert "total: 120" in result.stdout
+    assert "Jira" in result.stdout
+
+
 class _SprintsFakeClient:
-    def __init__(self, _config=None) -> None:
+    def __init__(
+        self,
+        _config=None,
+        *,
+        is_last: bool | None = None,
+        total: int | None = None,
+        values: list[dict[str, object]] | None = None,
+    ) -> None:
         self.calls: list[dict[str, object]] = []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return None
-
-    def list_board_sprints(self, board_id, *, state=None, max_results=50):
-        self.calls.append({"board_id": board_id, "state": state, "max_results": max_results})
-        return {
-            "values": [
+        self._is_last = is_last
+        self._total = total
+        self._values = (
+            values
+            if values is not None
+            else [
                 {
                     "id": 7340,
                     "name": "10 SEPA-Mandate, Disbursement",
@@ -105,7 +181,22 @@ class _SprintsFakeClient:
                     "endDate": "2026-08-15T00:00:00.000Z",
                 }
             ]
-        }
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def list_board_sprints(self, board_id, *, state=None, max_results=50):
+        self.calls.append({"board_id": board_id, "state": state, "max_results": max_results})
+        response: dict[str, object] = {"values": self._values}
+        if self._is_last is not None:
+            response["isLast"] = self._is_last
+        if self._total is not None:
+            response["total"] = self._total
+        return response
 
 
 def test_sprints_cli_renders_probed_shape_and_supports_json(tmp_path, monkeypatch) -> None:
@@ -124,6 +215,53 @@ def test_sprints_cli_renders_probed_shape_and_supports_json(tmp_path, monkeypatc
     assert result_json.exit_code == 0, result_json.stdout + result_json.stderr
     payload = json.loads(result_json.stdout)
     assert payload["values"][0]["name"] == "10 SEPA-Mandate, Disbursement"
+
+
+def test_sprints_cli_reports_more_remain_when_not_last_page(tmp_path, monkeypatch) -> None:
+    """F4 regression: `sprints` used to print only `values`, with no signal that more sprints
+    exist, even though the Agile response it already holds carries `isLast`. A board with more
+    sprints than `--max-results` (default 50) showed 50 and said nothing.
+    """
+    client = _SprintsFakeClient(is_last=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprints", "--board", "814"])
+
+    assert result.exit_code == 0, result.output
+    assert "returned 1 sprint(s); more remain" in result.stdout
+
+
+def test_sprints_cli_reports_complete_when_last_page(tmp_path, monkeypatch) -> None:
+    client = _SprintsFakeClient(is_last=True)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprints", "--board", "814"])
+
+    assert result.exit_code == 0, result.output
+    assert "returned 1 sprint(s); complete" in result.stdout
+
+
+def test_sprints_cli_json_carries_returned_and_is_last(tmp_path, monkeypatch) -> None:
+    client = _SprintsFakeClient(is_last=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprints", "--board", "814", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["returned"] == 1
+    assert payload["is_last"] is False
+
+
+def test_sprints_cli_reports_a_real_total_when_jira_supplies_one(tmp_path, monkeypatch) -> None:
+    client = _SprintsFakeClient(is_last=False, total=42)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprints", "--board", "814"])
+
+    assert result.exit_code == 0, result.output
+    assert "total: 42" in result.stdout
+    assert "Jira" in result.stdout
 
 
 # --- issue-sprint: three distinct states, never collapsed -------------------------------------
@@ -244,9 +382,7 @@ def test_sprint_add_cli_dry_run_writes_nothing_and_names_every_issue(tmp_path, m
     client = _SprintAddFakeClient()
     _install(monkeypatch, _config(tmp_path), client)
 
-    result = CliRunner().invoke(
-        cli.app, ["sprint-add", "7340", "FC-1", "FC-2", "FC-3", "--json"]
-    )
+    result = CliRunner().invoke(cli.app, ["sprint-add", "7340", "FC-1", "FC-2", "FC-3", "--json"])
 
     assert result.exit_code == 0, result.stdout + result.stderr
     assert "FC-1" in result.stdout
@@ -256,6 +392,11 @@ def test_sprint_add_cli_dry_run_writes_nothing_and_names_every_issue(tmp_path, m
     assert payload == {
         "sprint_id": 7340,
         "issue_keys": ["FC-1", "FC-2", "FC-3"],
+        "safety": [
+            {"key": "FC-1", "project": "FC", "allowed_by": "project allowlist"},
+            {"key": "FC-2", "project": "FC", "allowed_by": "project allowlist"},
+            {"key": "FC-3", "project": "FC", "allowed_by": "project allowlist"},
+        ],
         "dry_run": True,
     }
     assert client.add_calls == []
@@ -287,9 +428,7 @@ def test_sprint_add_cli_execute_calls_client_once_with_all_keys_and_audits(
     assert payload["dry_run"] is False
 
 
-def test_sprint_add_cli_safety_gate_rejects_one_key_no_write_for_any(
-    tmp_path, monkeypatch
-) -> None:
+def test_sprint_add_cli_safety_gate_rejects_one_key_no_write_for_any(tmp_path, monkeypatch) -> None:
     # Five keys, the fourth belongs to a project that is not on the write allow-list.
     client = _SprintAddFakeClient(disallowed_project_for="FC-4")
     audited: list[dict[str, object]] = []
@@ -304,6 +443,24 @@ def test_sprint_add_cli_safety_gate_rejects_one_key_no_write_for_any(
     assert result.exit_code == 3, result.stdout + result.stderr
     assert client.add_calls == []
     assert audited == []
+
+
+def test_sprint_add_cli_dry_run_also_catches_the_safety_gate(tmp_path, monkeypatch) -> None:
+    """F9 regression: the dry run used to return before ever opening a client, so it never ran
+    the write-safety gate `--execute` runs. A dry run that reports success for a batch
+    `--execute` would go on to refuse does not predict what `--execute` does, which is the whole
+    point of a dry run.
+    """
+    client = _SprintAddFakeClient(disallowed_project_for="FC-4")
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sprint-add", "7340", "FC-1", "FC-2", "FC-3", "FC-4", "FC-5"],
+    )
+
+    assert result.exit_code == 3, result.stdout + result.stderr
+    assert client.add_calls == []
 
 
 # --- sprint-remove -------------------------------------------------------------------------------
@@ -335,7 +492,14 @@ def test_sprint_remove_cli_dry_run_writes_nothing(tmp_path, monkeypatch) -> None
 
     assert result.exit_code == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
-    assert payload == {"issue_keys": ["FC-1", "FC-2"], "dry_run": True}
+    assert payload == {
+        "issue_keys": ["FC-1", "FC-2"],
+        "safety": [
+            {"key": "FC-1", "project": "FC", "allowed_by": "project allowlist"},
+            {"key": "FC-2", "project": "FC", "allowed_by": "project allowlist"},
+        ],
+        "dry_run": True,
+    }
     assert client.remove_calls == []
 
 
@@ -357,6 +521,45 @@ def test_sprint_remove_cli_execute_moves_to_backlog_and_audits(tmp_path, monkeyp
             "result": {"ok": True},
         }
     ]
+
+
+class _SprintRemoveDisallowedFakeClient:
+    """Like `_SprintRemoveFakeClient`, but one key belongs to a project off the write allow-list,
+    so the safety gate must reject it — this is the fixture the F9 dry-run regression test needs
+    and the plain fake above has no way to express."""
+
+    def __init__(self, _config=None, *, disallowed_project_for: str | None = None) -> None:
+        self.config = _config
+        self._disallowed_project_for = disallowed_project_for
+        self.remove_calls: list[list[str]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        project = "OTHER" if issue_key == self._disallowed_project_for else "FC"
+        return {"key": issue_key, "fields": {"project": {"key": project}}}
+
+    def move_issues_to_backlog(self, issue_keys):
+        self.remove_calls.append(list(issue_keys))
+        return {"ok": True}
+
+
+def test_sprint_remove_cli_dry_run_also_catches_the_safety_gate(tmp_path, monkeypatch) -> None:
+    """F9 regression: the dry run used to return before ever opening a client, so it never ran
+    the write-safety gate `--execute` runs. A dry run that reports success for a batch
+    `--execute` would go on to refuse does not predict what `--execute` does.
+    """
+    client = _SprintRemoveDisallowedFakeClient(disallowed_project_for="FC-2")
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprint-remove", "FC-1", "FC-2"])
+
+    assert result.exit_code == 3, result.stdout + result.stderr
+    assert client.remove_calls == []
 
 
 # --- issue-type -----------------------------------------------------------------------------

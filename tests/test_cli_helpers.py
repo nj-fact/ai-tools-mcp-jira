@@ -441,7 +441,7 @@ class ExistingPngCliFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
-        assert fields == ["description", "attachment"]
+        assert fields == ["description", "attachment", "updated"]
         return {
             "key": issue_key,
             "fields": {
@@ -453,6 +453,7 @@ class ExistingPngCliFakeClient:
                         "mimeType": "image/png",
                     }
                 ],
+                "updated": "2026-09-14T10:00:00.000+0200",
             },
         }
 
@@ -460,7 +461,7 @@ class ExistingPngCliFakeClient:
         assert (attachment_id, issue_key) == ("170501", "FC-349")
         return "media-fc349"
 
-    def edit_issue_adf_description(self, issue_key, description):
+    def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
         self.edits.append(description)
         return {}
 
@@ -517,17 +518,48 @@ def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
             "# Description wipe\n\n- Only this bullet",
             "--allow-wide-rewrite",
             "--execute",
+            "--json",
         ],
     )
 
     assert result.exit_code == 2
-    payload = json.loads(result.output[result.output.index("{") :])
+    payload = json.loads(result.stdout)
     assert payload == {
         "error_type": "section_patch_refused",
         "swallowed_headings": ["Observed", "Acceptance criteria"],
         "expect_swallowed_headings": [],
         "whole_document": True,
+        "dry_run": True,
     }
+    assert writes == []
+
+
+def test_patch_description_section_cli_refusal_prints_no_json_without_the_flag(
+    tmp_path, monkeypatch
+) -> None:
+    """F12 regression: the refusal used to dump a JSON document to stdout unconditionally,
+    even when the caller never passed --json. Without --json, stdout must stay empty and the
+    detail must appear only as prose on stderr, matching every other refusal in this command.
+    """
+    writes = _install_patch_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "patch-description-section",
+            "FC-385",
+            "--section",
+            "Description wipe",
+            "--content",
+            "# Description wipe\n\n- Only this bullet",
+            "--allow-wide-rewrite",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stdout == ""
+    assert "Patch refused:" in result.stderr
     assert writes == []
 
 
@@ -722,10 +754,14 @@ def test_patch_description_section_cli_payload_survives_a_markup_hostile_heading
             def get_issue(self, issue_key, **_kwargs):
                 return {
                     "key": issue_key,
-                    "fields": {"project": {"key": "FC"}, "description": self.document},
+                    "fields": {
+                        "project": {"key": "FC"},
+                        "description": self.document,
+                        "updated": "2026-09-14T10:00:00.000+0200",
+                    },
                 }
 
-            def edit_issue_adf_description(self, issue_key, description):
+            def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
                 raise AssertionError("must not write")
 
         monkeypatch.setattr(cli, "load_config", lambda _config=config: _config)
@@ -742,6 +778,7 @@ def test_patch_description_section_cli_payload_survives_a_markup_hostile_heading
                 "--content",
                 "## Scope\n\nnew",
                 "--execute",
+                "--json",
             ],
         )
 
@@ -839,6 +876,105 @@ def test_click_runner_keeps_stdout_and_stderr_separate_in_this_click_version() -
 
     assert result.stdout == "to stdout\n"
     assert result.stderr == "to stderr\n"
+
+
+def test_issue_cli_json_api_error_emits_a_document_on_stdout_not_empty(
+    tmp_path, monkeypatch
+) -> None:
+    """F5 regression: `_exit_api_error` used to write only to stderr, so `issue X --json`
+    against a 404 exited non-zero with an EMPTY stdout. `json.load`/`jq` on that empty stream
+    raises `Expecting value: line 1 column 1` — exactly the failure an agent hits when it
+    trusts stdout on a --json invocation that failed.
+    """
+    from jira_agent.client import JiraApiError
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            raise JiraApiError(f"Issue does not exist: {issue_key}", status_code=404)
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["issue", "FC-999", "--json"])
+
+    assert result.exit_code == 1
+    assert result.stdout != ""
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "jira_api_error"
+    assert payload["status_code"] == 404
+
+
+def test_issue_cli_no_json_api_error_leaves_stdout_empty(tmp_path, monkeypatch) -> None:
+    """Without --json, the error stays prose-only on stderr; stdout is untouched, exactly the
+    behaviour before `json_mode` existed on `_exit_api_error`.
+    """
+    from jira_agent.client import JiraApiError
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            raise JiraApiError(f"Issue does not exist: {issue_key}", status_code=404)
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["issue", "FC-999"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "Jira API error" in result.stderr
+
+
+def test_assign_cli_json_safety_error_emits_a_document_on_stdout(tmp_path, monkeypatch) -> None:
+    """F5 regression: `_exit_safety_error` had the identical empty-stdout defect for the
+    write-safety refusal path, on every command that both supports --json and is gated by
+    `ensure_issue_write_allowed`.
+    """
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def myself(self):
+            return {"accountId": "acc-1", "displayName": "Ada"}
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {"key": issue_key, "fields": {"project": {"key": "OTHER"}}}
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["assign", "FC-1", "--execute", "--json"])
+
+    assert result.exit_code == 3
+    assert result.stdout != ""
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "write_safety_error"
 
 
 class _EditIssueFakeClient:
@@ -962,7 +1098,7 @@ def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch
     fake_response = {
         "issues": fake_issues,
         "returned": 1,
-        "isLast": False,
+        "is_last": False,
         "nextPageToken": "token-abc-123",
     }
 
@@ -1216,7 +1352,7 @@ def test_search_cli_all_returns_everything_and_overrides_limit(tmp_path, monkeyp
     fake_result = {
         "issues": [{"key": f"FC-{i}", "fields": {"summary": f"s{i}"}} for i in range(7)],
         "returned": 7,
-        "isLast": True,
+        "is_last": True,
     }
     captured: dict[str, object] = {}
 
@@ -1253,7 +1389,7 @@ def test_search_cli_count_reports_an_explicitly_approximate_total(tmp_path, monk
     fake_result = {
         "issues": [{"key": "FC-1", "fields": {"summary": "s"}}],
         "returned": 1,
-        "isLast": True,
+        "is_last": True,
     }
 
     class FakeClient:
@@ -1284,6 +1420,51 @@ def test_search_cli_count_reports_an_explicitly_approximate_total(tmp_path, monk
     human_result = CliRunner().invoke(cli.app, ["search", "project = FC", "--count"])
     assert human_result.exit_code == 0, human_result.stdout + human_result.stderr
     assert "approximate" in human_result.stdout.lower()
+
+
+def test_search_cli_count_reports_a_missing_count_instead_of_dropping_it(
+    tmp_path, monkeypatch
+) -> None:
+    """F7 regression: Jira's approximate-count response can omit `count` (`data.get("count")`
+    is then `None`). The CLI used to test `approximate_total is not None` to decide whether to
+    show the field at all, so a missing count silently disappeared from both --json and human
+    output — `search --count --json` answered nothing about the question it was asked. The fix
+    keys off whether --count was requested, not off whether Jira answered it.
+    """
+    fake_result = {
+        "issues": [{"key": "FC-1", "fields": {"summary": "s"}}],
+        "returned": 1,
+        "is_last": True,
+    }
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_all_issues(self, jql, **_kwargs):
+            return fake_result
+
+        def approximate_issue_count(self, jql, **_kwargs):
+            return None
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    json_result = CliRunner().invoke(cli.app, ["search", "project = FC", "--count", "--json"])
+    assert json_result.exit_code == 0, json_result.stdout + json_result.stderr
+    payload = json.loads(json_result.stdout)
+    assert "approximate_total" in payload
+    assert payload["approximate_total"] is None
+
+    human_result = CliRunner().invoke(cli.app, ["search", "project = FC", "--count"])
+    assert human_result.exit_code == 0, human_result.stdout + human_result.stderr
+    assert "approximate match count: unavailable" in human_result.stdout
 
 
 def test_comments_cli_defaults_newest_first_and_all_pages_everything(tmp_path, monkeypatch) -> None:
