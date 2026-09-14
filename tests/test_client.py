@@ -3304,6 +3304,72 @@ def test_search_all_issues_limit_truncates_and_keeps_next_page_token() -> None:
     assert "total" not in result
 
 
+def test_search_all_issues_missing_is_last_stops_without_looping_and_reports_unknown() -> None:
+    """R1 regression: a page with no `isLast` and no `nextPageToken` must not be read as complete.
+
+    Before the fix, `is_last = bool(page.get("isLast", True))` defaulted the missing signal to
+    `True`, which happened to terminate the loop correctly here but reported false completeness.
+    A more dangerous variant of the same bug is covered by the next test: `if is_last: break` used
+    to be the *only* termination check, and `None` is falsy, so a missing signal with no token to
+    resume with would have looped again with `next_page_token=None`, re-fetching the same first
+    page up to `_MAX_SEARCH_PAGES` times instead of stopping after one request.
+    """
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"issues": [{"key": "FC-1"}]})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC")
+
+    assert request_count == 1
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1"]
+    assert result["returned"] == 1
+    assert result["is_last"] is None
+    assert "isLast" not in result
+    assert "nextPageToken" not in result
+    assert "total" not in result
+
+
+def test_search_all_issues_missing_is_last_with_token_keeps_paging_to_explicit_signal() -> None:
+    """A missing `isLast` with a `nextPageToken` present still has something to resume with, so
+    the walk keeps going (per the documented termination rule) until a page gives an explicit
+    signal — here `isLast: True` on the second page.
+    """
+    pages = [
+        {"issues": [{"key": "FC-1"}], "nextPageToken": "tok-1"},  # isLast absent
+        {"issues": [{"key": "FC-2"}], "isLast": True},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        index = 0 if params.get("nextPageToken") is None else 1
+        return httpx.Response(200, json=pages[index])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC", page_size=1)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2"]
+    assert result["is_last"] is True
+    assert "nextPageToken" not in result
+
+
 def test_approximate_issue_count_posts_jql_and_returns_raw_count() -> None:
     seen: dict[str, object] = {}
 

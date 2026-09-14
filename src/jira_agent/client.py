@@ -23,6 +23,14 @@ AGILE_BASE_PATH = "/rest/agile/1.0"
 # get_issue_sprints.
 DEFAULT_SPRINT_FIELD = "customfield_10020"
 
+# The default field set both the CLI and the MCP server fetch when a caller names none of its
+# own. Defined once here, rather than once per surface, so `cli.py`'s `search --json` and
+# `mcp_server.py`'s `jira_search_issues` can never drift back to reporting different fields for
+# the same query — which is exactly what happened when this list carried `parent` on one surface
+# and not the other. `jira_get_issue` / the CLI's `issue` command add `parent` on top of this for
+# their own single-issue default; see each surface's own default-fields helper.
+DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated", "parent"]
+
 
 class JiraApiError(RuntimeError):
     def __init__(
@@ -219,18 +227,25 @@ class JiraClient:
         The returned dict therefore never carries a `total` key; inventing one here would be
         exactly the kind of fabricated number this method exists to avoid.
 
-        Bounded to `_MAX_SEARCH_PAGES` requests, and stops early on a page that comes back with no
-        issues even if `isLast` has not yet turned true, since there is nothing left to collect.
+        Termination rule: the walk stops on the first page that comes back with no issues (there
+        is nothing left to collect), on a page whose `isLast` is `True` (an explicit completeness
+        signal), on a page carrying no `nextPageToken` (there is nothing left to resume with,
+        whatever `isLast` said), or once `limit`/`_MAX_SEARCH_PAGES` is reached.
 
         The returned dict spells this fact `is_last`, snake_case like every other key this tool's
         own result documents use (`dry_run`, `error_type`, `expected_updated`,
-        `comments_returned`). Only the *read* of the raw Jira page a few lines below keeps Jira's
-        own `isLast` spelling, because that dict is Jira's response, not this method's result;
-        `nextPageToken` is left as-is for the same reason, and because a caller passes it back
-        verbatim as a request parameter.
+        `comments_returned`), and is read from the *last page fetched* rather than defaulted:
+        `True` when that page's `isLast` was `True`, `False` when it was explicitly `False` (the
+        walk stopped early — by `limit` or page cap — while Jira still says more remain), and
+        `None` when that page carried no `isLast` at all, meaning completeness is unknown rather
+        than assumed. A missing signal must never be read as complete; that silent default is the
+        exact defect this method exists to avoid. Only the *read* of the raw Jira page a few lines
+        below keeps Jira's own `isLast` spelling, because that dict is Jira's response, not this
+        method's result; `nextPageToken` is left as-is for the same reason, and because a caller
+        passes it back verbatim as a request parameter.
         """
         issues: list[dict[str, Any]] = []
-        is_last = True
+        is_last: bool | None = None
         next_token: str | None = None
         token: str | None = None
         for _ in range(self._MAX_SEARCH_PAGES):
@@ -246,12 +261,18 @@ class JiraClient:
                 project_key=project_key,
             )
             page_issues = page.get("issues") or []
-            is_last = bool(page.get("isLast", True))
+            raw_is_last = page.get("isLast")
+            is_last = None if raw_is_last is None else bool(raw_is_last)
             next_token = page.get("nextPageToken")
             if not page_issues:
                 break
             issues.extend(page_issues)
             if is_last:
+                # Explicit completeness signal: nothing more to fetch.
+                break
+            if not next_token:
+                # No signal to resume with, regardless of what isLast said (or didn't say).
+                # Looping again would just replay the same page and never terminate itself.
                 break
             token = next_token
 
@@ -426,13 +447,8 @@ class JiraClient:
         sending a PUT that editmeta already shows Jira would reject.
         """
         metadata = self.get_edit_metadata(issue_key)
-        issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
-        allowed = issuetype_field.get("allowedValues") or []
         needle = issue_type_name.strip().casefold()
-        return any(
-            isinstance(value, dict) and str(value.get("name") or "").casefold() == needle
-            for value in allowed
-        )
+        return any(name.casefold() == needle for name in issue_type_allowed_values(metadata))
 
     def create_issue(
         self,
@@ -1786,6 +1802,21 @@ def issue_link_payload(
     if comment:
         payload["comment"] = {"body": text_to_adf(comment)}
     return payload
+
+
+def issue_type_allowed_values(metadata: dict[str, Any]) -> list[str]:
+    """Extract the allowed issue-type names from one `get_edit_metadata` response.
+
+    A single place both the CLI's `issue-type-options` command and the MCP
+    `jira_issue_type_options` tool call, so they report the same list under the same key
+    (`allowed_values`) rather than two names for the one fact `editmeta` gives them.
+    """
+    issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
+    return [
+        str(value.get("name"))
+        for value in issuetype_field.get("allowedValues") or []
+        if isinstance(value, dict) and value.get("name")
+    ]
 
 
 def select_transition(
