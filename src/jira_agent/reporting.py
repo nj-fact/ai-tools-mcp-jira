@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from jira_agent.client import JiraClient
 
@@ -51,6 +51,14 @@ def build_agent_report(
     transitions: dict[str, Any],
     write_scope: str | None = None,
 ) -> dict[str, Any]:
+    """Build the compact agent-facing report from raw Jira issue/comment/transition payloads.
+
+    `comment_count` is always the API's true total comment count (`comments["total"]`), never
+    the number of comments actually attached to the report. `comments_returned` is the length of
+    the `comments` list this report carries, and `comments_truncated` is true whenever
+    `comments_returned` is less than `comment_count` — a reader must never infer the total from
+    how many comments were returned, or the reverse.
+    """
     fields = issue.get("fields") or {}
     status = fields.get("status") or {}
     assignee = fields.get("assignee") or {}
@@ -58,6 +66,11 @@ def build_agent_report(
     issue_type = fields.get("issuetype") or {}
     project = fields.get("project") or {}
     key = str(issue.get("key") or "")
+
+    comment_list = comments.get("comments") or []
+    comment_total = comments.get("total")
+    comments_returned = len(comment_list)
+    comments_truncated = comment_total is not None and comments_returned < comment_total
 
     return {
         "key": key,
@@ -78,8 +91,10 @@ def build_agent_report(
         "labels": fields.get("labels") or [],
         "created": fields.get("created"),
         "updated": fields.get("updated"),
-        "comments": [_comment_summary(comment) for comment in comments.get("comments") or []],
-        "comment_count": comments.get("total"),
+        "comments": [_comment_summary(comment) for comment in comment_list],
+        "comment_count": comment_total,
+        "comments_returned": comments_returned,
+        "comments_truncated": comments_truncated,
         "transitions": [
             _transition_summary(transition) for transition in transitions.get("transitions") or []
         ],
@@ -92,12 +107,24 @@ def fetch_agent_report(
     *,
     issue_key: str,
     site_url: str,
-    comment_limit: int = 5,
+    comment_limit: int | Literal["all"] = 5,
     changelog_limit: int = 0,
     write_scope: str | None = None,
 ) -> dict[str, Any]:
+    """Fetch one issue plus its comments and transitions and build the agent report for it.
+
+    `comment_limit` controls how many comments the report carries, never how many the issue
+    actually has (see `build_agent_report`'s `comment_count`). An integer fetches the *newest*
+    `comment_limit` comments via `orderBy=-created` and returns them newest first — this used to
+    silently return the *oldest* comments while reporting the true total, which read as if a
+    freshly written comment had failed to save. The literal `"all"` pages through every comment
+    with `list_all_comments` and returns them oldest first, the API's natural chronological order.
+    """
     issue = client.get_issue(issue_key, fields=AGENT_REPORT_FIELDS)
-    comments = client.list_comments(issue_key, limit=comment_limit)
+    if comment_limit == "all":
+        comments = client.list_all_comments(issue_key)
+    else:
+        comments = client.list_comments(issue_key, limit=comment_limit, order_by="-created")
     transitions = client.get_transitions(issue_key)
     report = build_agent_report(
         site_url=site_url,
