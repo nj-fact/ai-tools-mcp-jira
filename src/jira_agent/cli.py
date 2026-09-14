@@ -2124,6 +2124,20 @@ def edit_issue(
         )
         raise typer.Exit(2)
 
+    for _option_name, _values in (
+        ("--add-label", add_label),
+        ("--remove-label", remove_label),
+        ("--add-fix-version", add_fix_version),
+        ("--remove-fix-version", remove_fix_version),
+    ):
+        if _values and any(not value.strip() for value in _values):
+            _print_error(
+                "Edit error:",
+                f"{_option_name} must not be empty or whitespace-only. Pass a real label or "
+                "fix version name, or omit the option entirely.",
+            )
+            raise typer.Exit(2)
+
     try:
         body = (
             read_text_source(description, description_file, section=description_section)
@@ -2167,11 +2181,13 @@ def edit_issue(
             # possible (right before the write call below) so the window this narrows — between
             # this read and the client's own immediate re-check before its PUT — stays as small
             # as this process can make it. Skipped entirely when the request carries no
-            # whole-field write at all (`payload["fields"]` empty): atomic-only add/remove
-            # operations need no token to guard with, so there is nothing here worth the read.
+            # whole-field write at all (`payload.get("fields")` empty or absent -- absent is how
+            # edit_issue_payload now represents "nothing to guard", the same way it already
+            # omitted an empty `update`): atomic-only add/remove operations need no token to
+            # guard with, so there is nothing here worth the read.
             expect_updated = (
                 client.issue_version(issue_key)
-                if concurrency_guard and payload["fields"]
+                if concurrency_guard and payload.get("fields")
                 else None
             )
 

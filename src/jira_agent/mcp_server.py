@@ -774,7 +774,7 @@ def jira_edit_issue(
             safety = ensure_issue_write_allowed(config, client, issue_key)
             expect_updated = (
                 client.issue_version(issue_key)
-                if guard_concurrent_edit and payload["fields"]
+                if guard_concurrent_edit and payload.get("fields")
                 else None
             )
             if not execute:
@@ -1355,8 +1355,12 @@ def jira_update_drift_labels(
                 add=add, remove=remove, existing_labels=existing, clear=clear
             )
             if not add_labels and not remove_labels:
+                # Nothing is written either way, but every other early return on this surface
+                # carries `dry_run`, and a caller branching on that key for a byte-identical
+                # execute=True vs. execute=False response would get a KeyError without it.
                 return {
                     "ok": True,
+                    "dry_run": not execute,
                     "issue": issue_key,
                     "labels_added": [],
                     "labels_removed": [],

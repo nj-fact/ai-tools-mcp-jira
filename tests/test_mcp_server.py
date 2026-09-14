@@ -1122,6 +1122,60 @@ def test_jira_edit_issue_refuses_to_combine_whole_array_fix_versions_with_atomic
     assert client.edits == []
 
 
+def test_jira_edit_issue_fix_versions_empty_list_clear_still_takes_the_guard(
+    tmp_path, monkeypatch
+) -> None:
+    """K2 regression: `edit_issue_payload` now omits an entirely EMPTY `fields` dict, but
+    `fix_versions=[]` (an explicit whole-array clear) is not that -- it keys `fields` with an
+    empty list, which is a non-empty dict even though the list inside it is empty. The
+    guard-read decision (`payload.get("fields")`) must still fire for this case, or it collapses
+    into the atomic-only skip path that needs no guard."""
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+    read_calls: list[str] = []
+    original_issue_version = EditIssueFakeClient.issue_version
+
+    def issue_version(self, issue_key):
+        read_calls.append(issue_key)
+        return original_issue_version(self, issue_key)
+
+    client.issue_version = issue_version.__get__(client, EditIssueFakeClient)
+
+    result = mcp_server.jira_edit_issue(key="FC-400", fix_versions=[], execute=True)
+
+    assert result == {"ok": True, "issue": "FC-400"}
+    assert read_calls == ["FC-400"], "fix_versions=[] is a whole-field clear; must take the guard"
+    assert client.edits[0]["fix_versions"] == []
+
+
+def test_jira_edit_issue_refuses_a_blank_labels_add_value(tmp_path, monkeypatch) -> None:
+    """K4: an empty or whitespace-only atomic value is refused locally, naming the parameter,
+    rather than sent to Jira for it to reject."""
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(key="FC-400", labels_add=["  "], execute=True)
+
+    assert result["ok"] is False
+    assert "labels_add" in result["message"]
+    assert client.edits == []
+
+
+def test_jira_edit_issue_combines_whole_array_labels_with_atomic_op_on_a_different_field(
+    tmp_path, monkeypatch
+) -> None:
+    """K7: the README-advertised combination -- a whole-array write on one field together with
+    an atomic operation on a DIFFERENT field -- must not be refused; only set-and-update of the
+    SAME field is."""
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-400", labels=["a", "b"], fix_versions_add=["V1"], execute=True
+    )
+
+    assert result == {"ok": True, "issue": "FC-400"}
+    assert client.edits[0]["labels"] == ["a", "b"]
+    assert client.edits[0]["fix_versions_add"] == ["V1"]
+
+
 def test_jira_agent_report_accepts_all_as_comment_limit_and_returns_true_counts(
     tmp_path, monkeypatch
 ) -> None:
@@ -2496,6 +2550,49 @@ def test_jira_update_drift_labels_clear_reads_once_and_removes_only_drift_prefix
     assert set(client.labels) == {"jira-agent", "drift-new"}
 
 
+def test_jira_update_drift_labels_clear_does_not_remove_a_drift_label_added_after_its_read(
+    tmp_path, monkeypatch
+) -> None:
+    """K7 (missing-test gap): MCP equivalent of the CLI's
+    test_drift_labels_clear_does_not_remove_a_drift_label_added_after_its_read. --clear's read is
+    a snapshot: a drift label that lands after it is never named in an explicit remove
+    operation, so it survives, exactly like add/remove alone already do for anything they were
+    not told about."""
+    client = _install_drift_labels_client(monkeypatch, tmp_path, initial_labels=["drift-old"])
+    original_get_issue = DriftLabelsFakeClient.get_issue
+
+    def get_issue_then_concurrent_add(self, issue_key, *, fields=None, expand=None):
+        result = original_get_issue(self, issue_key, fields=fields, expand=expand)
+        self.labels.append("drift-concurrent")
+        return result
+
+    client.get_issue = get_issue_then_concurrent_add.__get__(client, DriftLabelsFakeClient)
+
+    result = mcp_server.jira_update_drift_labels("FC-1", clear=True, execute=True)
+
+    assert result["ok"] is True
+    assert client.labels == ["drift-concurrent"]
+
+
+def test_jira_update_drift_labels_nothing_to_do_still_reports_dry_run(
+    tmp_path, monkeypatch
+) -> None:
+    """K6: the "nothing to do" early return happens BEFORE the dry-run branch, so a caller with
+    no add and no remove got a byte-identical document whether execute was true or false, with
+    no `dry_run` key at all. Every other return on this surface carries `dry_run`; a caller
+    branching on it would get a KeyError without it here."""
+    client = _install_drift_labels_client(monkeypatch, tmp_path)
+
+    dry_run_result = mcp_server.jira_update_drift_labels("FC-1")
+    execute_result = mcp_server.jira_update_drift_labels("FC-1", execute=True)
+
+    assert dry_run_result["ok"] is True
+    assert dry_run_result["dry_run"] is True
+    assert execute_result["ok"] is True
+    assert execute_result["dry_run"] is False
+    assert client.writes == []
+
+
 def test_jira_update_drift_labels_dry_run_shows_operations_not_a_guessed_array(
     tmp_path, monkeypatch
 ) -> None:
@@ -2505,8 +2602,8 @@ def test_jira_update_drift_labels_dry_run_shows_operations_not_a_guessed_array(
 
     assert result["ok"] is True
     assert result["dry_run"] is True
+    # No "fields" key at all -- not even an empty one -- when the request is purely atomic.
     assert result["payload"] == {
-        "fields": {},
         "update": {"labels": [{"add": "drift-reviewed"}, {"remove": "drift-open"}]},
     }
     assert client.writes == []

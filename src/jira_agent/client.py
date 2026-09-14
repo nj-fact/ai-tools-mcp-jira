@@ -640,7 +640,7 @@ class JiraClient:
         )
         return self._guarded_issue_put(
             issue_key,
-            payload["fields"],
+            payload.get("fields") or {},
             update=payload.get("update"),
             expect_updated=expect_updated,
         )
@@ -2001,7 +2001,9 @@ def edit_issue_payload(
     story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
     """Build the PUT body `edit_issue` sends: a `fields` section (whole-field replacement) and,
-    when atomic array operations are requested, an `update` section alongside it.
+    when atomic array operations are requested, an `update` section alongside it. Either section
+    is omitted outright when empty, so the returned dict is exactly the body `edit_issue` sends,
+    never a preview that carries a section the real request does not.
 
     `fields` entries replace a whole field's value outright. Jira applies them unconditionally,
     so a concurrent editor's own change to that same field is silently lost the moment this
@@ -2017,15 +2019,41 @@ def edit_issue_payload(
     stale `expect_updated` token to protect -- and none should be passed for a call built only
     from these four parameters (see `edit_issue`'s docstring).
 
+    A value named in BOTH the add and the remove side of the same field (for example
+    `labels_add=["x"], labels_remove=["x"]`) resolves to added, never removed: the matching
+    remove operation is dropped before either list reaches the `update` section. This is the
+    same add-wins precedence `workflows.drift_label_operations` applies for the identical
+    conflict (`remove_labels -= set(add_labels)`), so the two call paths agree on one outcome
+    for the same input rather than leaving it to whichever order Jira happens to apply
+    operations within one array -- an order nobody here has established.
+
+    Every value in `labels_add`/`labels_remove`/`fix_versions_add`/`fix_versions_remove` must be
+    non-blank: an empty or whitespace-only entry is refused locally with `ValueError` naming the
+    parameter, rather than sent to Jira for it to reject.
+
     Jira rejects a PUT that both sets and updates the SAME field, so passing `labels` together
     with `labels_add`/`labels_remove` (or `fix_versions` together with
     `fix_versions_add`/`fix_versions_remove`) raises ValueError here rather than sending that
-    doomed request. The CLI and the MCP server each pre-check the same conflict first, using
-    their own option/parameter spellings, so a caller sees a message naming what they actually
-    typed; this is the shared defence underneath both, and for any other caller of this function.
+    doomed request. A whole-array write on one field together with an atomic operation on a
+    DIFFERENT field is fine and produces `fields` and `update` side by side -- only the SAME
+    field may not appear in both. The CLI and the MCP server each pre-check the same conflict
+    first, using their own option/parameter spellings, so a caller sees a message naming what
+    they actually typed; this is the shared defence underneath both, and for any other caller of
+    this function.
     """
     if clear_parent and parent_key is not None:
         raise ValueError("Use either parent_key or clear_parent, not both")
+    for _param_name, _values in (
+        ("labels_add", labels_add),
+        ("labels_remove", labels_remove),
+        ("fix_versions_add", fix_versions_add),
+        ("fix_versions_remove", fix_versions_remove),
+    ):
+        for _value in _values or []:
+            if not _value.strip():
+                raise ValueError(
+                    f"{_param_name} must not contain an empty or whitespace-only value."
+                )
     fields: dict[str, Any] = {}
     if summary is not None:
         fields["summary"] = summary
@@ -2053,8 +2081,12 @@ def edit_issue_payload(
                 "labels (the whole array) or labels_add/labels_remove (atomic operations), not "
                 "both."
             )
-        update["labels"] = [{"add": value} for value in labels_add or []] + [
-            {"remove": value} for value in labels_remove or []
+        labels_add_values = list(labels_add or [])
+        labels_remove_values = [
+            value for value in labels_remove or [] if value not in labels_add_values
+        ]
+        update["labels"] = [{"add": value} for value in labels_add_values] + [
+            {"remove": value} for value in labels_remove_values
         ]
     if fix_versions_add or fix_versions_remove:
         if fix_versions is not None:
@@ -2064,13 +2096,19 @@ def edit_issue_payload(
                 "fix_versions (the whole array) or fix_versions_add/fix_versions_remove (atomic "
                 "operations), not both."
             )
-        update["fixVersions"] = [{"add": {"name": value}} for value in fix_versions_add or []] + [
-            {"remove": {"name": value}} for value in fix_versions_remove or []
+        fix_versions_add_values = list(fix_versions_add or [])
+        fix_versions_remove_values = [
+            value for value in fix_versions_remove or [] if value not in fix_versions_add_values
         ]
+        update["fixVersions"] = [
+            {"add": {"name": value}} for value in fix_versions_add_values
+        ] + [{"remove": {"name": value}} for value in fix_versions_remove_values]
 
     if not fields and not update:
         raise ValueError("At least one editable field must be provided")
-    payload: dict[str, Any] = {"fields": fields}
+    payload: dict[str, Any] = {}
+    if fields:
+        payload["fields"] = fields
     if update:
         payload["update"] = update
     return payload

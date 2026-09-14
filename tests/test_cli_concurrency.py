@@ -740,6 +740,80 @@ def test_edit_issue_refuses_to_combine_whole_array_fix_version_with_atomic_ops(
     assert writes == []
 
 
+def test_edit_issue_labels_empty_list_clear_still_takes_the_guard(tmp_path, monkeypatch) -> None:
+    """K2 regression: `edit_issue_payload` now omits an entirely EMPTY `fields` dict, but
+    `--labels ""` (an explicit whole-array clear) is not that -- it keys `fields` with an empty
+    list, which is a non-empty dict even though the list inside it is empty. The guard-read
+    decision (`payload.get("fields")`) must still fire for this case, or it collapses into the
+    atomic-only skip path that needs no guard."""
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+    read_calls: list[str] = []
+    original_issue_version = FakeClient.issue_version
+
+    def issue_version(self, issue_key: str) -> str:
+        read_calls.append(issue_key)
+        return original_issue_version(self, issue_key)
+
+    FakeClient.issue_version = issue_version
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--labels", "", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert read_calls == [ISSUE_KEY], "labels=[] is a whole-field clear and must take the guard"
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+    assert writes[0]["kwargs"]["labels"] == []
+
+
+def test_edit_issue_refuses_a_blank_add_label_value(tmp_path, monkeypatch) -> None:
+    """K4: an empty or whitespace-only atomic value is refused locally, naming the option, rather
+    than sent to Jira for it to reject."""
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--add-label", "  ", "--execute"],
+    )
+
+    assert result.exit_code == 2, result.stdout + result.stderr
+    assert "--add-label" in result.stderr
+    assert writes == []
+
+
+def test_edit_issue_combines_whole_array_labels_with_atomic_op_on_a_different_field(
+    tmp_path, monkeypatch
+) -> None:
+    """K7: the README-advertised combination -- a whole-array write on one field together with
+    an atomic operation on a DIFFERENT field -- must not be refused; only set-and-update of the
+    SAME field is."""
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--labels", "a,b", "--add-fix-version", "V1", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["kwargs"]["labels"] == ["a", "b"]
+    assert writes[0]["kwargs"]["fix_versions_add"] == ["V1"]
+
+
 # --- edit-comment / delete-comment ----------------------------------------------------------
 
 
@@ -1210,9 +1284,9 @@ def test_drift_labels_dry_run_shows_operations_not_a_guessed_resulting_array(
     assert state["get_issue_calls"] == 0
     json_start = result.stdout.index("{\n")
     payload, _ = json.JSONDecoder().raw_decode(result.stdout[json_start:])
+    # No "fields" key at all -- not even an empty one -- when the request is purely atomic.
     assert payload == {
         "payload": {
-            "fields": {},
             "update": {"labels": [{"add": "drift-reviewed"}, {"remove": "drift-open"}]},
         }
     }

@@ -253,6 +253,13 @@ def drift_label_operations(
     an unchanged issue does not change, only how it is sent to Jira.
     """
     add_labels = sorted({normalize_drift_label(label) for label in add or []})
+    # Every named `remove` label becomes an explicit remove operation unconditionally, even one
+    # the array does not currently hold. The previous whole-array implementation used Python's
+    # `set.discard`, which made that case a silent no-op; whether Jira's atomic `remove`
+    # operation does the same for a label the array does not hold, or rejects it instead, is
+    # UNVERIFIED -- settling it needs a live write this branch does not authorise. Left alone on
+    # purpose (see K5 in the atomic-array-ops review); this comment records the assumption so the
+    # next reader treats it as one, not as a checked fact.
     remove_labels = {normalize_drift_label(label) for label in remove or []}
     if clear:
         remove_labels |= {label for label in existing_labels or [] if label.startswith("drift-")}

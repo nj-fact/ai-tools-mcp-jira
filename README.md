@@ -518,8 +518,10 @@ this site: `labels` reports `operations: ["add", "set", "remove"]` with plain st
 sent through Jira's issue PUT `update` section (`{"update": {"labels": [{"add": "x"}, ...]}}`)
 rather than the `fields` section every other write here uses. Jira applies `add`/`remove`
 against whatever the field holds server-side at write time, not against a value this tool read
-earlier, so there is no read-modify-write left for a concurrent editor's own change to lose, and
-no `expect_updated` guard is needed or accepted for a call built only from these operations.
+earlier, so there is no read-modify-write left for a concurrent editor's own change to lose. An
+`expect_updated` guard is not needed, and pointless, for a call built only from these operations
+-- but not rejected: passing one anyway is accepted and enforced exactly as for any other call,
+it just has nothing there to protect.
 
 `edit-issue` exposes this as `--add-label`/`--remove-label` and `--add-fix-version`/
 `--remove-fix-version`, each repeatable, alongside the pre-existing whole-array `--labels` and

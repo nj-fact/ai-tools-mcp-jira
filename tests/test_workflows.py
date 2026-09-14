@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from jira_agent.client import edit_issue_payload
 from jira_agent.workflows import (
     drift_label_operations,
     drift_reconcile_comment_body,
@@ -221,6 +222,21 @@ def test_drift_label_operations_add_wins_over_remove_for_the_same_label() -> Non
     add against one Python set): a label named in both lists is never sent as a remove
     operation, only as an add."""
     assert drift_label_operations(add=["open"], remove=["open"]) == (["drift-open"], [])
+
+
+def test_drift_label_operations_agrees_with_edit_issue_payload_on_add_wins_precedence() -> None:
+    """K3: the identical conflict -- one label named in both add and remove -- reaches Jira
+    through two independent call paths: `drift-labels --add x --remove x` (through this module's
+    `drift_label_operations`) and `edit-issue --add-label x --remove-label x` (through
+    `edit_issue_payload` directly). Both must resolve it to the same net outcome -- added, never
+    removed -- rather than one path resolving it locally while the other sends both operations
+    and lets Jira's own, unestablished processing order decide. Pinning this against BOTH
+    functions in one test is what keeps them from drifting apart again."""
+    add_labels, remove_labels = drift_label_operations(add=["open"], remove=["open"])
+    assert (add_labels, remove_labels) == (["drift-open"], [])
+
+    payload = edit_issue_payload(labels_add=["open"], labels_remove=["open"])
+    assert payload == {"update": {"labels": [{"add": "open"}]}}
 
 
 def test_drift_label_operations_clear_alone_needs_no_add_or_remove() -> None:

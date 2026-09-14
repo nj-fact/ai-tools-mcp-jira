@@ -508,8 +508,11 @@ def test_edit_issue_sends_fix_versions_in_the_jira_shape() -> None:
 def test_edit_issue_payload_builds_atomic_labels_add_remove_ops() -> None:
     payload = edit_issue_payload(labels_add=["needs-review"], labels_remove=["stale"])
 
+    # No "fields" key at all -- not even an empty one -- when the request is purely atomic: the
+    # real PUT `edit_issue` sends never carries an empty `fields` section (see
+    # `_guarded_issue_put`), so a dry-run preview built from this same payload must not show one
+    # either.
     assert payload == {
-        "fields": {},
         "update": {"labels": [{"add": "needs-review"}, {"remove": "stale"}]},
     }
 
@@ -518,7 +521,6 @@ def test_edit_issue_payload_builds_atomic_fix_versions_add_remove_ops() -> None:
     payload = edit_issue_payload(fix_versions_add=["FCL-MVP"], fix_versions_remove=["FCL-1.0"])
 
     assert payload == {
-        "fields": {},
         "update": {
             "fixVersions": [{"add": {"name": "FCL-MVP"}}, {"remove": {"name": "FCL-1.0"}}]
         },
@@ -534,6 +536,92 @@ def test_edit_issue_payload_combines_a_whole_field_set_with_an_unrelated_atomic_
         "fields": {"summary": "New title"},
         "update": {"labels": [{"add": "needs-review"}]},
     }
+
+
+def test_edit_issue_payload_combines_a_whole_array_set_with_an_atomic_op_on_another_field() -> (
+    None
+):
+    """K7: the README-advertised combination of a whole-array write on one field with an atomic
+    operation on a DIFFERENT field (`--labels a,b --add-fix-version V1`). Jira allows this; only
+    set-and-update of the SAME field is refused (see the refusal tests below)."""
+    payload = edit_issue_payload(labels=["a", "b"], fix_versions_add=["V1"])
+
+    assert payload == {
+        "fields": {"labels": ["a", "b"]},
+        "update": {"fixVersions": [{"add": {"name": "V1"}}]},
+    }
+
+
+def test_edit_issue_payload_clears_labels_with_an_empty_list() -> None:
+    """`labels=[]` is a whole-field CLEAR, not an empty request: it keys `fields` with an empty
+    list, which is a non-empty dict (one key) even though the list inside it is empty. This is
+    the case where "empty" in the caller's argument and "empty" in the payload mean opposite
+    things -- the guard-read decision on the CLI and MCP surfaces must key off THIS, not off
+    whether the caller's own list was empty."""
+    payload = edit_issue_payload(labels=[])
+
+    assert payload == {"fields": {"labels": []}}
+
+
+def test_edit_issue_payload_labels_add_wins_over_remove_for_the_same_label() -> None:
+    """K3: the same label named in both `labels_add` and `labels_remove` must resolve to added,
+    never removed -- the same add-wins precedence `workflows.drift_label_operations` applies for
+    the identical conflict -- rather than sending both operations and letting Jira's own,
+    unestablished processing order within one array decide."""
+    payload = edit_issue_payload(labels_add=["open"], labels_remove=["open"])
+
+    assert payload == {"update": {"labels": [{"add": "open"}]}}
+
+
+def test_edit_issue_payload_fix_versions_add_wins_over_remove_for_the_same_version() -> None:
+    """K3, `fixVersions` side of the same fix."""
+    payload = edit_issue_payload(fix_versions_add=["FCL-MVP"], fix_versions_remove=["FCL-MVP"])
+
+    assert payload == {"update": {"fixVersions": [{"add": {"name": "FCL-MVP"}}]}}
+
+
+def test_edit_issue_payload_labels_add_wins_leaves_other_removes_untouched() -> None:
+    """Add-wins precedence resolves only the overlapping value; an unrelated remove alongside it
+    is unaffected."""
+    payload = edit_issue_payload(labels_add=["open"], labels_remove=["open", "stale"])
+
+    assert payload == {"update": {"labels": [{"add": "open"}, {"remove": "stale"}]}}
+
+
+def test_edit_issue_payload_refuses_a_blank_labels_add_value() -> None:
+    try:
+        edit_issue_payload(labels_add=["  "])
+    except ValueError as exc:
+        assert "labels_add" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_labels_remove_value() -> None:
+    try:
+        edit_issue_payload(labels_remove=[""])
+    except ValueError as exc:
+        assert "labels_remove" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_fix_versions_add_value() -> None:
+    try:
+        edit_issue_payload(fix_versions_add=[" "])
+    except ValueError as exc:
+        assert "fix_versions_add" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_fix_versions_remove_value() -> None:
+    try:
+        edit_issue_payload(fix_versions_remove=[""])
+    except ValueError as exc:
+        assert "fix_versions_remove" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
 
 
 def test_edit_issue_payload_refuses_labels_set_and_update_together() -> None:
@@ -621,9 +709,18 @@ class _StatefulLabelsServer:
         assert request.method == "PUT"
         body = json.loads(request.read().decode())
         fields = body.get("fields") or {}
+        update = body.get("update") or {}
+        if "labels" in fields and "labels" in update:
+            # Real Jira rejects a PUT that both sets and updates the same field. Without this
+            # check the fake would happily apply both, which is exactly the regression the local
+            # refusal in `edit_issue_payload` exists to prevent -- and exactly what this fake
+            # would then be unable to catch.
+            return httpx.Response(
+                400,
+                json={"errorMessages": ["Field 'labels' cannot be both set and updated."]},
+            )
         if "labels" in fields:
             self.labels = list(fields["labels"])
-        update = body.get("update") or {}
         for op in update.get("labels", []):
             if "add" in op:
                 if op["add"] not in self.labels:
@@ -642,6 +739,32 @@ def _client_against(server: _StatefulLabelsServer) -> JiraClient:
             transport=httpx.MockTransport(server.handler),
         ),
     )
+
+
+def test_stateful_labels_server_rejects_a_put_that_both_sets_and_updates_labels() -> None:
+    """K8: real Jira rejects a PUT that both sets a field via `fields` and updates it via
+    `update`. `edit_issue_payload` already refuses to build such a payload locally, so no
+    production call path can reach this fake with both `fields.labels` and `update.labels` in
+    one PUT -- but the fake must still reject the combination itself the way Jira does, or it
+    could not catch a regression that starts sending both anyway (for example a caller of the
+    lower-level `_guarded_issue_put`, which does not go through `edit_issue_payload`'s guard at
+    all). Neither the whole-array set nor the atomic op is applied when it does."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    try:
+        client._guarded_issue_put(
+            "FC-1",
+            {"labels": ["a", "b"]},
+            update={"labels": [{"add": "c"}]},
+            expect_updated=None,
+        )
+    except JiraApiError as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("Expected JiraApiError")
+
+    assert server.labels == ["existing"]
 
 
 def test_atomic_label_add_survives_a_label_a_concurrent_editor_already_added() -> None:
