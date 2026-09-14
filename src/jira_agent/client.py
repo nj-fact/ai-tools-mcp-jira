@@ -97,6 +97,26 @@ class JiraMissingConcurrencyTokenError(JiraApiError):
         self.issue_key = issue_key
 
 
+class SprintPreconditionError(RuntimeError):
+    """`sprint-remove`'s precondition failed: at least one requested key is not currently in the
+    named sprint. Raised before `move_issues_to_backlog` is ever called, so the whole batch is
+    refused rather than moving the keys that did match while silently skipping the rest -- the
+    same all-or-nothing contract the batched write itself already has.
+
+    Carries the full membership report (see `sprint_membership_report`), not just the mismatched
+    keys, so a caller can show exactly where every key currently is, not only that one was wrong.
+    """
+
+    def __init__(self, sprint_id: int | str, report: list[dict[str, Any]]) -> None:
+        mismatched = [entry["key"] for entry in report if not entry["in_sprint"]]
+        super().__init__(
+            f"Refusing to remove from sprint {sprint_id}: not every key is currently in that "
+            f"sprint (not in it: {', '.join(mismatched)})."
+        )
+        self.sprint_id = sprint_id
+        self.report = report
+
+
 def require_concurrency_token(
     issue_key: str, read_updated: Any, *, guard_enabled: bool
 ) -> str | None:
@@ -765,13 +785,18 @@ class JiraClient:
 
         `sprint_field` defaults to the `customfield_10020` id probed on this Jira site (schema
         `com.pyxis.greenhopper.jira:gh-sprint`); the id is not guaranteed to match on another
-        site, so a caller on a different site must pass its own. A `JIRA_SPRINT_FIELD` config
-        key alongside `config.story_points_field` would be the better long-term home for this
-        default; it is deliberately left out here rather than added untested.
+        site, so a caller on a different site must pass its own. `config.sprint_field`
+        (env `JIRA_SPRINT_FIELD`) is the config-resolved home for this default now, alongside
+        `config.story_points_field`; callers that have a `JiraConfig` in hand should pass
+        `config.sprint_field` explicitly rather than rely on this method's own default, which
+        exists mainly for callers (and tests) with no config to resolve one from.
 
-        Note this collapses two states a caller may need to tell apart: an issue whose sprint
-        field is absent from the response and an issue whose sprint list is empty both return
-        `[]`. Read the field off `get_issue` directly when that distinction matters.
+        Note this collapses three states an issue's sprint field can be in: absent from the
+        response entirely, present with the value `null` (Jira's own shape for "in no sprint" —
+        verified via `Sprint IS EMPTY` JQL), and present with a list. `null` and `[]` both mean
+        "in no sprint" and both return `[]` here, same as an absent field. Read the field off
+        `get_issue` directly instead when telling "field absent" apart from "genuinely no
+        sprint" matters (see the CLI's `issue-sprint` command and `jira_get_issue_sprints`).
         """
         issue = self.get_issue(issue_key, fields=[sprint_field])
         value = (issue.get("fields") or {}).get(sprint_field)
@@ -848,6 +873,66 @@ class JiraClient:
                 message = f"{message}: {errors}"
 
         return JiraApiError(message, status_code=response.status_code, details=details)
+
+
+def is_in_sprint(sprints: list[dict[str, Any]], sprint_id: int | str) -> bool:
+    """Whether one of the parsed sprint objects (as `get_issue_sprints` returns) has this
+    sprint's id. Compared as strings since a caller may pass either an int (the CLI's own
+    `sprint_id` argument type) or a str (the MCP surface accepts either).
+    """
+    target = str(sprint_id)
+    return any(str(sprint.get("id")) == target for sprint in sprints if isinstance(sprint, dict))
+
+
+def sprint_membership_report(
+    client: JiraClient,
+    issue_keys: Iterable[str],
+    sprint_id: int | str,
+    *,
+    sprint_field: str,
+) -> list[dict[str, Any]]:
+    """Re-read each key's current sprint field and report whether `sprint_id` is among them.
+
+    One shared read-and-decide step for two different callers that both need it: the
+    `sprint-remove` precondition (refuse the whole batch up front if any key is not in the named
+    sprint) and the post-write verification both `sprint-add` and `sprint-remove` run afterwards
+    (the Agile write endpoints return 204 with no body, so this reread is what actually proves
+    membership changed, not the response). Each entry carries the full parsed `sprints` list too,
+    so a caller can report exactly where a mismatched key currently is, not only that it is not
+    where expected.
+    """
+    report: list[dict[str, Any]] = []
+    for issue_key in issue_keys:
+        sprints = client.get_issue_sprints(issue_key, sprint_field=sprint_field)
+        report.append(
+            {
+                "key": issue_key,
+                "sprint_id": sprint_id,
+                "sprints": sprints,
+                "in_sprint": is_in_sprint(sprints, sprint_id),
+            }
+        )
+    return report
+
+
+def sprint_verification_results(
+    report: list[dict[str, Any]], *, expected_in_sprint: bool
+) -> list[dict[str, Any]]:
+    """Attach `expected_in_sprint` / `verified` to a `sprint_membership_report` result.
+
+    `expected_in_sprint=True` for `sprint-add` (the key must now be in the target sprint),
+    `False` for `sprint-remove` (the key must no longer be in the sprint it was removed from).
+    A 204 response proves only that Jira accepted the request, not that the issue ended up where
+    asked; `verified` is the actual proof, from a fresh read taken after the write.
+    """
+    return [
+        {
+            **entry,
+            "expected_in_sprint": expected_in_sprint,
+            "verified": entry["in_sprint"] == expected_in_sprint,
+        }
+        for entry in report
+    ]
 
 
 def text_to_adf(text: str) -> dict[str, Any]:

@@ -1155,11 +1155,17 @@ def test_jira_agent_report_all_path_returns_comments_newest_first(tmp_path, monk
     assert result["report"].get("comments_order") == "newest-first"
 
 
-def test_jira_get_issue_default_fields_include_parent(tmp_path, monkeypatch) -> None:
-    """R2: `parent` now lives in the one shared `DEFAULT_FIELDS` (see `client.DEFAULT_FIELDS`),
-    not bolted on separately for `jira_get_issue` alone, so this asserts against the shared list
+def test_jira_get_issue_default_fields_include_parent_and_the_configured_sprint_field(
+    tmp_path, monkeypatch
+) -> None:
+    """R2: `parent` lives in the one shared `DEFAULT_FIELDS` (see `client.DEFAULT_FIELDS`), not
+    bolted on separately for `jira_get_issue` alone, so this asserts against the shared list
     directly rather than `[*DEFAULT_FIELDS, "parent"]` — asserting the old shape here would
-    require `parent` twice under the new, single-list contract.
+    require `parent` twice under the single-list contract.
+
+    Sprint hardening item 4: the configured sprint field is appended on top of `DEFAULT_FIELDS`
+    for this default-fields case, resolved from config at call time (`_sprint_field`) rather than
+    folded into the shared `DEFAULT_FIELDS` constant itself -- see `_fields_or_default`.
     """
     config = make_config(tmp_path)
     calls: dict[str, object] = {}
@@ -1184,7 +1190,7 @@ def test_jira_get_issue_default_fields_include_parent(tmp_path, monkeypatch) -> 
     result = mcp_server.jira_get_issue("FC-401")
 
     assert result["ok"] is True
-    assert calls["fields"] == mcp_server.DEFAULT_FIELDS
+    assert calls["fields"] == [*mcp_server.DEFAULT_FIELDS, "customfield_10020"]
     assert "parent" in calls["fields"]
 
 
@@ -1281,6 +1287,49 @@ def test_jira_search_issues_never_invents_a_total_and_reports_returned_and_is_la
     assert result["result"]["is_last"] is True
     assert client.search_issues_calls[0]["limit"] == 20
     assert client.search_all_issues_calls == []
+
+
+def test_jira_search_issues_default_fields_include_the_configured_sprint_field(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_search_client(monkeypatch, tmp_path)
+
+    mcp_server.jira_search_issues("project = FC", limit=20)
+
+    expected_fields = [*mcp_server.DEFAULT_FIELDS, "customfield_10020"]
+    assert client.search_issues_calls[0]["fields"] == expected_fields
+
+
+def test_jira_search_issues_explicit_fields_are_not_augmented_with_sprint(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_search_client(monkeypatch, tmp_path)
+
+    mcp_server.jira_search_issues("project = FC", limit=20, fields=["summary"])
+
+    assert client.search_issues_calls[0]["fields"] == ["summary"]
+
+
+def test_jira_recent_issues_default_fields_include_the_configured_sprint_field(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_search_client(monkeypatch, tmp_path)
+
+    mcp_server.jira_recent_issues(days=7, limit=20)
+
+    expected_fields = [*mcp_server.DEFAULT_FIELDS, "customfield_10020"]
+    assert client.search_issues_calls[0]["fields"] == expected_fields
+
+
+def test_jira_test_scope_issues_default_fields_include_the_configured_sprint_field(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_search_client(monkeypatch, tmp_path)
+
+    mcp_server.jira_test_scope_issues(limit=5)
+
+    expected_fields = [*mcp_server.DEFAULT_FIELDS, "customfield_10020"]
+    assert client.search_issues_calls[0]["fields"] == expected_fields
 
 
 def test_jira_search_issues_single_page_reports_is_last_none_when_signal_is_absent(
@@ -1796,12 +1845,31 @@ def test_jira_set_issue_type_refuses_a_concurrent_edit(tmp_path, monkeypatch) ->
 
 
 class SprintFakeClient:
-    def __init__(self, _config, *, sprint_field_present: bool = True) -> None:
+    """Models the same real Agile behaviour as the CLI's `_SprintStateFakeClient`: the write
+    endpoints return 204 with no body (`{}`), and `apply_writes=False` simulates a write Jira
+    accepted without actually changing membership -- the scenario the post-write verification
+    (sprint hardening item 3) exists to catch.
+    """
+
+    def __init__(
+        self,
+        _config,
+        *,
+        sprint_field_present: bool = True,
+        initial_sprints: dict[str, list[dict[str, object]]] | None = None,
+        disallowed_project_for: str | None = None,
+        apply_writes: bool = True,
+    ) -> None:
         self.config = _config
         self.added: list[tuple[object, list[str]]] = []
         self.moved: list[list[str]] = []
         self.sprint_field_present = sprint_field_present
         self.sprint_field_value: object = [{"id": 42, "name": "Sprint 42"}]
+        self._disallowed_project_for = disallowed_project_for
+        self._apply_writes = apply_writes
+        self._sprints: dict[str, list[dict[str, object]]] = {
+            key: list(value) for key, value in (initial_sprints or {}).items()
+        }
 
     def __enter__(self):
         return self
@@ -1818,19 +1886,37 @@ class SprintFakeClient:
 
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
-            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+            project = "OTHER" if issue_key == self._disallowed_project_for else "FC"
+            return {"key": issue_key, "fields": {"project": {"key": project}}}
         assert fields == ["customfield_10020"]
         fields_dict: dict[str, object] = {}
         if self.sprint_field_present:
             fields_dict["customfield_10020"] = self.sprint_field_value
         return {"key": issue_key, "fields": fields_dict}
 
+    def get_issue_sprints(self, issue_key, *, sprint_field=None):
+        assert sprint_field == "customfield_10020"
+        return list(self._sprints.get(issue_key) or [])
+
     def add_issues_to_sprint(self, sprint_id, issue_keys):
         self.added.append((sprint_id, list(issue_keys)))
+        if self._apply_writes:
+            sprint = {"id": sprint_id, "name": f"Sprint {sprint_id}", "state": "active"}
+            for issue_key in issue_keys:
+                current = [
+                    entry
+                    for entry in self._sprints.get(issue_key, [])
+                    if entry.get("id") != sprint_id
+                ]
+                current.append(sprint)
+                self._sprints[issue_key] = current
         return {}
 
     def move_issues_to_backlog(self, issue_keys):
         self.moved.append(list(issue_keys))
+        if self._apply_writes:
+            for issue_key in issue_keys:
+                self._sprints[issue_key] = []
         return {}
 
 
@@ -1907,6 +1993,10 @@ def test_jira_get_issue_sprints_marks_field_absent_rather_than_an_empty_list(
 
 
 def test_jira_add_issues_to_sprint_dry_run_then_execute(tmp_path, monkeypatch) -> None:
+    """3: this fake actually moves FC-405 into sprint 42 on `add_issues_to_sprint`, so the
+    `verified: True` below is proof `jira_add_issues_to_sprint` re-read membership rather than
+    trusted the 204.
+    """
     client = _install_sprint_client(monkeypatch, tmp_path)
 
     dry_run = mcp_server.jira_add_issues_to_sprint(42, ["FC-405"])
@@ -1917,7 +2007,38 @@ def test_jira_add_issues_to_sprint_dry_run_then_execute(tmp_path, monkeypatch) -
 
     executed = mcp_server.jira_add_issues_to_sprint(42, ["FC-405"], execute=True)
 
-    assert executed == {"ok": True, "sprint_id": 42, "issue_keys": ["FC-405"]}
+    assert executed == {
+        "ok": True,
+        "sprint_id": 42,
+        "issue_keys": ["FC-405"],
+        "results": [
+            {
+                "key": "FC-405",
+                "sprint_id": 42,
+                "sprints": [{"id": 42, "name": "Sprint 42", "state": "active"}],
+                "in_sprint": True,
+                "expected_in_sprint": True,
+                "verified": True,
+            }
+        ],
+    }
+    assert client.added == [(42, ["FC-405"])]
+
+
+def test_jira_add_issues_to_sprint_execute_reports_failure_when_reread_does_not_confirm(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: fails against the pre-hardening tool, which trusted the batched POST and
+    never re-read membership afterwards, so it always reported success. `apply_writes=False`
+    simulates Jira accepting the request (still 204/`{}`) without membership actually changing.
+    """
+    client = _install_sprint_client(monkeypatch, tmp_path, apply_writes=False)
+
+    executed = mcp_server.jira_add_issues_to_sprint(42, ["FC-405"], execute=True)
+
+    assert executed["ok"] is False
+    assert executed["results"][0]["verified"] is False
+    assert executed["results"][0]["in_sprint"] is False
     assert client.added == [(42, ["FC-405"])]
 
 
@@ -1930,24 +2051,87 @@ def test_jira_add_issues_to_sprint_refuses_an_empty_list(tmp_path, monkeypatch) 
 
 
 def test_jira_move_issues_to_backlog_dry_run_then_execute(tmp_path, monkeypatch) -> None:
-    client = _install_sprint_client(monkeypatch, tmp_path)
+    """1/3: `sprint_id` is now required (breaking change); FC-405 starts in sprint 42 so the
+    precondition passes, and this fake actually clears membership on `move_issues_to_backlog`,
+    so `verified: True` below is proof of a re-read, not a trusted 204.
+    """
+    client = _install_sprint_client(
+        monkeypatch,
+        tmp_path,
+        initial_sprints={"FC-405": [{"id": 42, "name": "Sprint 42", "state": "active"}]},
+    )
 
-    dry_run = mcp_server.jira_move_issues_to_backlog(["FC-405"])
+    dry_run = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"])
 
     assert dry_run["ok"] is True
     assert dry_run["dry_run"] is True
+    assert dry_run["precondition"][0]["in_sprint"] is True
     assert client.moved == []
 
-    executed = mcp_server.jira_move_issues_to_backlog(["FC-405"], execute=True)
+    executed = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
 
-    assert executed == {"ok": True, "issue_keys": ["FC-405"]}
+    assert executed == {
+        "ok": True,
+        "sprint_id": 42,
+        "issue_keys": ["FC-405"],
+        "results": [
+            {
+                "key": "FC-405",
+                "sprint_id": 42,
+                "sprints": [],
+                "in_sprint": False,
+                "expected_in_sprint": False,
+                "verified": True,
+            }
+        ],
+    }
+    assert client.moved == [["FC-405"]]
+
+
+def test_jira_move_issues_to_backlog_precondition_refuses_whole_batch_when_not_in_sprint(
+    tmp_path, monkeypatch
+) -> None:
+    """1: sprint_id is a precondition this tool enforces, not something Jira checks -- refuse
+    the whole batch before any write when a key is not currently in sprint_id.
+    """
+    client = _install_sprint_client(monkeypatch, tmp_path, initial_sprints={"FC-405": []})
+
+    result = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "sprint_precondition_failed"
+    assert result["sprint_id"] == 42
+    assert result["report"] == [
+        {"key": "FC-405", "sprint_id": 42, "sprints": [], "in_sprint": False}
+    ]
+    assert client.moved == []
+
+
+def test_jira_move_issues_to_backlog_execute_reports_failure_when_reread_still_shows_membership(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: fails against the pre-hardening tool, which trusted the batched POST and
+    never re-read membership afterwards, so it always reported success.
+    """
+    client = _install_sprint_client(
+        monkeypatch,
+        tmp_path,
+        initial_sprints={"FC-405": [{"id": 42, "name": "Sprint 42", "state": "active"}]},
+        apply_writes=False,
+    )
+
+    executed = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
+
+    assert executed["ok"] is False
+    assert executed["results"][0]["verified"] is False
+    assert executed["results"][0]["in_sprint"] is True
     assert client.moved == [["FC-405"]]
 
 
 def test_jira_move_issues_to_backlog_refuses_an_empty_list(tmp_path, monkeypatch) -> None:
     _install_sprint_client(monkeypatch, tmp_path)
 
-    result = mcp_server.jira_move_issues_to_backlog([])
+    result = mcp_server.jira_move_issues_to_backlog(42, [])
 
     assert result == {"ok": False, "message": "issue_keys must not be empty."}
 
@@ -2708,3 +2892,32 @@ def test_jira_render_mermaid_diagrams_incorporates_concurrent_edit_landing_befor
         "the concurrent editor's paragraph must survive the write, not be silently dropped: "
         f"{written_description}"
     )
+
+
+def test_jira_config_fields_reports_resolved_ids(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+
+    result = mcp_server.jira_config_fields()
+
+    assert result == {
+        "ok": True,
+        "story_points_field": "customfield_10028",
+        "sprint_field": "customfield_10020",
+    }
+
+
+def test_jira_config_fields_reflects_a_configured_override(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_SPRINT_FIELD": "customfield_99999",
+        }
+    )
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+
+    result = mcp_server.jira_config_fields()
+
+    assert result["sprint_field"] == "customfield_99999"

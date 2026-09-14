@@ -302,3 +302,27 @@ def test_every_edit_issue_call_is_guarded_or_on_the_named_allowlist() -> None:
 
     stale = set(_NO_GUARD_ALLOWLIST) - seen_allowlist_keys
     assert not stale, f"allowlist entries no longer match any unguarded call: {sorted(stale)}"
+
+
+# --- Sprint hardening: the concurrency guard's scope is a deliberate decision, not a gap -------
+#
+# `_guarded_issue_put` (and the `expect_updated` contract it enforces) exists for a specific
+# failure mode: a caller reads a whole JSON field (an ADF description, a label set), transforms
+# it locally, and PUTs the whole computed field back, risking a lost update against a concurrent
+# editor. `add_issues_to_sprint` and `move_issues_to_backlog` are not that shape -- each names a
+# target membership action (these keys join this sprint / these keys leave whatever sprint they
+# were in) through the separate Agile API, not a read-transform-whole-field PUT through
+# `_guarded_issue_put` -- so `_guarded_edit_methods()` correctly never picks them up, and no
+# `_NO_GUARD_ALLOWLIST` entry is needed for either. Their own correctness gate is the post-write
+# reread (`sprint_membership_report` / `sprint_verification_results`), which verifies the actual
+# membership outcome regardless of what any concurrent editor did in between, rather than a
+# stale-token comparison a 204-with-no-body response could not carry anyway.
+
+
+def test_sprint_writes_intentionally_bypass_the_concurrency_guard() -> None:
+    assert "add_issues_to_sprint" not in _GUARDED_EDIT_METHODS
+    assert "move_issues_to_backlog" not in _GUARDED_EDIT_METHODS
+
+    client_source = inspect.getsource(client_module.JiraClient.add_issues_to_sprint)
+    client_source += inspect.getsource(client_module.JiraClient.move_issues_to_backlog)
+    assert "_guarded_issue_put" not in client_source

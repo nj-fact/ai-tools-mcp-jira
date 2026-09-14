@@ -43,7 +43,7 @@ def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -146,7 +146,7 @@ def _install_patch_cli(monkeypatch, tmp_path) -> list[dict[str, object]]:
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -578,7 +578,7 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -638,7 +638,7 @@ def test_edit_issue_cli_dry_run_shows_several_fix_versions_in_payload(
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -891,7 +891,7 @@ def test_issue_cli_json_api_error_emits_a_document_on_stdout_not_empty(
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -923,7 +923,7 @@ def test_issue_cli_no_json_api_error_leaves_stdout_empty(tmp_path, monkeypatch) 
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -952,7 +952,7 @@ def test_assign_cli_json_safety_error_emits_a_document_on_stdout(tmp_path, monke
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1057,7 +1057,7 @@ def test_issue_cli_json_round_trips_long_and_bracket_bearing_values_byte_identic
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1105,7 +1105,7 @@ def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1154,6 +1154,7 @@ class _CuratedSearchFakeClient:
     """
 
     def __init__(self, _config):
+        self.config = _config
         self.search_all_issues_calls: list[dict[str, object]] = []
 
     def __enter__(self):
@@ -1405,7 +1406,7 @@ def test_issue_cli_json_shows_parent_field_with_no_fields_argument(tmp_path, mon
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1448,7 +1449,7 @@ def test_search_cli_limit_pages_past_one_page(tmp_path, monkeypatch) -> None:
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1488,7 +1489,7 @@ def test_search_cli_all_returns_everything_and_overrides_limit(tmp_path, monkeyp
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1524,7 +1525,7 @@ def test_search_cli_count_reports_an_explicitly_approximate_total(tmp_path, monk
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1569,7 +1570,7 @@ def test_search_cli_count_reports_a_missing_count_instead_of_dropping_it(
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1608,7 +1609,7 @@ def test_comments_cli_defaults_newest_first_and_all_pages_everything(tmp_path, m
 
     class FakeClient:
         def __init__(self, _config):
-            pass
+            self.config = _config
 
         def __enter__(self):
             return self
@@ -1693,6 +1694,17 @@ class _JsonExecuteSweepFakeClient:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
         if fields == ["parent"]:
             return {"key": issue_key, "fields": {"parent": None}}
+        if fields == ["customfield_10020"]:
+            # sprint-remove's precondition (and sprint-add/-remove's post-write reread) reads
+            # this field through `get_issue_sprints`, reused below from the real client.
+            return {
+                "key": issue_key,
+                "fields": {
+                    "customfield_10020": [
+                        {"id": 7340, "name": "Sweep Sprint", "state": "active"}
+                    ]
+                },
+            }
         if fields == ["description"]:
             return {"key": issue_key, "fields": {"description": _patch_description()}}
         if fields == ["description", "updated"]:
@@ -1747,6 +1759,10 @@ class _JsonExecuteSweepFakeClient:
     def get_edit_metadata(self, issue_key):
         return {"fields": {"issuetype": {"allowedValues": [{"name": "Bug"}, {"name": "Task"}]}}}
 
+    # sprint-remove's precondition check calls this; reuse the real, already-tested parsing
+    # logic on top of this fake's own `get_issue` rather than reimplementing it.
+    get_issue_sprints = RealJiraClient.get_issue_sprints
+
 
 def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
     attach_file = tmp_path / "sweep-attachment.txt"
@@ -1789,7 +1805,7 @@ def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
         "delete-comment": ["delete-comment", "FC-1", "667647", "--json"],
         "issue-type": ["issue-type", "FC-1", "Bug", "--json"],
         "sprint-add": ["sprint-add", "7340", "FC-1", "--json"],
-        "sprint-remove": ["sprint-remove", "FC-1", "--json"],
+        "sprint-remove": ["sprint-remove", "7340", "FC-1", "--json"],
     }
 
 

@@ -13,13 +13,13 @@ from rich.table import Table
 from jira_agent.audit import audit_write
 from jira_agent.client import (
     DEFAULT_FIELDS,
-    DEFAULT_SPRINT_FIELD,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
+    SprintPreconditionError,
     adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
@@ -30,6 +30,8 @@ from jira_agent.client import (
     replace_diagram_with_media,
     require_concurrency_token,
     select_transition,
+    sprint_membership_report,
+    sprint_verification_results,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -74,6 +76,15 @@ data_console = Console(markup=False, highlight=False, soft_wrap=True)
 # renders as "Costs". Tables still need width handling, so this console keeps wrapping and only
 # drops the interpretation.
 table_console = Console(markup=False, highlight=False)
+
+# The literal every command below uses as its own `--fields` default, computed once so every
+# comparison against "the caller did not narrow --fields" reads the same value `DEFAULT_FIELDS`
+# itself would produce. Commands that request this exact default (rather than an explicit
+# narrower --fields) also get the config-resolved sprint field appended to what they ask Jira
+# for -- see `issue` and `_run_search`. It is never folded into `DEFAULT_FIELDS` itself: that
+# constant is shared with the MCP surface and other non-issue/search callers, and the sprint
+# field id is instance-specific, resolved from config at call time, not a shared literal.
+_DEFAULT_FIELDS_CSV = ",".join(DEFAULT_FIELDS)
 
 
 def _client() -> JiraClient:
@@ -142,13 +153,32 @@ def _csv_list(value: str | None) -> list[str] | None:
     return items
 
 
-def _issue_row(issue: dict[str, Any]) -> dict[str, str]:
+def _sprint_cell(fields: dict[str, Any], sprint_field: str) -> str:
+    """Render an issue's sprint field as its name(s) and state, never the raw Jira object.
+
+    The field is `null` (not `[]`, not absent) for an issue in no sprint on this Jira site; both
+    that and a present-but-empty list render the same "-" here, matching `issue-sprint`'s own
+    three-state read where only "field absent entirely" is a distinct case worth calling out on
+    its own, and this cell has no room to spell that distinction out.
+    """
+    raw = fields.get(sprint_field)
+    sprints = raw if isinstance(raw, list) else []
+    if not sprints:
+        return "-"
+    return ", ".join(
+        f"{sprint.get('name')} ({sprint.get('state')})"
+        for sprint in sprints
+        if isinstance(sprint, dict)
+    )
+
+
+def _issue_row(issue: dict[str, Any], *, sprint_field: str | None = None) -> dict[str, str]:
     fields = issue.get("fields") or {}
     status = fields.get("status") or {}
     assignee = fields.get("assignee") or {}
     issue_type = fields.get("issuetype") or {}
     project = fields.get("project") or {}
-    return {
+    row = {
         "key": str(issue.get("key") or ""),
         "summary": str(fields.get("summary") or ""),
         "status": str(status.get("name") or ""),
@@ -157,17 +187,30 @@ def _issue_row(issue: dict[str, Any]) -> dict[str, str]:
         "project": str(project.get("key") or ""),
         "updated": str(fields.get("updated") or ""),
     }
+    if sprint_field:
+        row["sprint"] = _sprint_cell(fields, sprint_field)
+    return row
 
 
-def _print_issues_table(issues: list[dict[str, Any]]) -> None:
+def _print_issues_table(issues: list[dict[str, Any]], *, sprint_field: str | None = None) -> None:
+    """Render the shared issue table. `sprint_field` is opt-in per call site (only `issue` and
+    the search-backed commands pass it) rather than baked into every caller of this shared
+    renderer, since a caller such as `test-issue` that never requested the sprint field would
+    otherwise render an always-blank column for a field it never asked Jira for.
+    """
     table = Table(show_header=True, header_style="bold")
     table.add_column("Key", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("Assignee", no_wrap=True)
     table.add_column("Summary")
+    if sprint_field:
+        table.add_column("Sprint")
     for issue in issues:
-        row = _issue_row(issue)
-        table.add_row(row["key"], row["status"], row["assignee"], row["summary"])
+        row = _issue_row(issue, sprint_field=sprint_field)
+        values = [row["key"], row["status"], row["assignee"], row["summary"]]
+        if sprint_field:
+            values.append(row["sprint"])
+        table.add_row(*values)
     table_console.print(table)
 
 
@@ -384,16 +427,27 @@ def issue(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     fields: Annotated[
         str | None,
-        typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+        typer.Option(
+            "--fields",
+            help=(
+                "Comma-separated Jira fields to fetch. Left at its default, this also asks for "
+                "the configured sprint field (config.sprint_field / JIRA_SPRINT_FIELD); an "
+                "explicit --fields is used exactly as given, with no field added to it."
+            ),
+        ),
+    ] = _DEFAULT_FIELDS_CSV,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
     """Fetch one Jira issue."""
-    requested_fields = _field_list(fields)
     with _client() as client:
+        sprint_field = client.config.sprint_field
+        if fields == _DEFAULT_FIELDS_CSV:
+            requested_fields: list[str] | None = [*DEFAULT_FIELDS, sprint_field]
+        else:
+            requested_fields = _field_list(fields)
         try:
             data = client.get_issue(key, fields=requested_fields)
         except JiraApiError as exc:
@@ -413,7 +467,13 @@ def issue(
         _emit_json(data)
         return
 
-    _print_issues_table([data])
+    # Only render a Sprint column when the sprint field was actually part of what was requested:
+    # an explicit --fields that left it out must not render an always-blank column that looks
+    # like "checked, no sprint" rather than "not asked for".
+    render_sprint_field = (
+        sprint_field if requested_fields and sprint_field in requested_fields else None
+    )
+    _print_issues_table([data], sprint_field=render_sprint_field)
 
 
 @app.command()
@@ -707,7 +767,7 @@ def recent(
     fields: Annotated[
         str | None,
         typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+    ] = _DEFAULT_FIELDS_CSV,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -753,7 +813,7 @@ def mine(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -800,7 +860,7 @@ def fc_open(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -834,7 +894,7 @@ def by_status(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -873,7 +933,7 @@ def search(
     fields: Annotated[
         str | None,
         typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+    ] = _DEFAULT_FIELDS_CSV,
     next_page_token: Annotated[
         str | None,
         typer.Option(
@@ -931,7 +991,7 @@ def test_scope(
     _run_search(
         config.test_jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -2306,6 +2366,41 @@ def mcp_config() -> None:
     _emit_json(_mcp_config_payload())
 
 
+@app.command("config-fields")
+def config_fields(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the resolved field ids as JSON."),
+    ] = False,
+) -> None:
+    """Show the custom field ids this tool has resolved from config. Read-only, no Jira call.
+
+    `story_points_field` and `sprint_field` are both instance-specific Jira custom field ids --
+    a story-points id that is right on one Jira site can be someone else's sprint field on
+    another -- resolved the same way in one place, `config.py`: a `JIRA_STORY_POINTS_FIELD` /
+    `JIRA_SPRINT_FIELD` env var, or this site's probed default (`customfield_10028` /
+    `customfield_10020`). Two incorrect readings came from guessing a custom field id instead of
+    checking it; this command exists so a caller can check instead of guess, before running
+    anything that writes.
+
+    On this site: `customfield_10028` is "Story Points", populated and editable for project FC,
+    and is the correct `story_points_field` default. `customfield_10016` is "Story point
+    estimate" -- it exists, but is unused and not editable for FC, and must never be the
+    configured `story_points_field` on this site.
+    """
+    config = _config()
+    if json_output:
+        _emit_json(
+            {
+                "story_points_field": config.story_points_field,
+                "sprint_field": config.sprint_field,
+            }
+        )
+        return
+    console.print(f"story_points_field: {config.story_points_field}")
+    console.print(f"sprint_field: {config.sprint_field}")
+
+
 @app.command("smoke-write")
 def smoke_write(
     execute: Annotated[
@@ -3607,9 +3702,16 @@ _SPRINT_FIELD_MISSING = object()
 def issue_sprint(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     sprint_field: Annotated[
-        str,
-        typer.Option("--sprint-field", help="Sprint custom field id."),
-    ] = DEFAULT_SPRINT_FIELD,
+        str | None,
+        typer.Option(
+            "--sprint-field",
+            help=(
+                "Sprint custom field id. Defaults to config.sprint_field "
+                "(JIRA_SPRINT_FIELD), resolved from config at call time rather than a fixed "
+                "literal, so a site override takes effect without passing this every time."
+            ),
+        ),
+    ] = None,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -3624,23 +3726,26 @@ def issue_sprint(
     """Show which sprint(s) one issue is in. Read-only, no --execute.
 
     Renders three distinct states instead of collapsing any two of them: the sprint field
-    absent from the Jira response entirely, the field present but an empty list (the issue is
-    in no sprint), and the field present with one or more sprints.
+    absent from the Jira response entirely, the field present with the value `null` or an empty
+    list (the issue is in no sprint -- this Jira site returns `null`, not `[]`, verified via
+    `Sprint IS EMPTY` JQL, and both render identically here), and the field present with one or
+    more sprints.
     """
     with _client() as client:
+        field = sprint_field or client.config.sprint_field
         try:
-            issue = client.get_issue(key, fields=[sprint_field])
+            issue = client.get_issue(key, fields=[field])
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
     fields = issue.get("fields") or {}
-    raw = fields.get(sprint_field, _SPRINT_FIELD_MISSING)
+    raw = fields.get(field, _SPRINT_FIELD_MISSING)
     field_present = raw is not _SPRINT_FIELD_MISSING
     sprint_list = raw if isinstance(raw, list) else []
 
     if not field_present:
         _say(
-            f"{key}: the Jira response did not include the sprint field ({sprint_field}).",
+            f"{key}: the Jira response did not include the sprint field ({field}).",
             json_mode=json_output,
         )
     elif not sprint_list:
@@ -3657,7 +3762,7 @@ def issue_sprint(
         _emit_json(
             {
                 "issue": key,
-                "sprint_field": sprint_field,
+                "sprint_field": field,
                 "sprint_field_present": field_present,
                 "sprints": sprint_list,
             }
@@ -3687,6 +3792,12 @@ def sprint_add(
     The safety gate is checked for every key before the dry run reports success, not only before
     `--execute` writes: a clean dry run must predict what `--execute` does, and a dry run that
     never checked the gate could report success for a batch `--execute` goes on to refuse.
+
+    The Agile add endpoint returns 204 with no body, so a 200 from Jira proves only that the
+    request was accepted, not that each issue actually ended up in the sprint. After `--execute`,
+    every key's sprint field is re-read and `results` (per key, under `--json`; one line each
+    otherwise) reports whether it is now confirmed in `sprint_id` -- a key that is not exits
+    non-zero even though the write itself returned success.
     """
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
@@ -3724,29 +3835,65 @@ def sprint_add(
             _say("Pass --execute to write it to Jira.", json_mode=json_output)
             return
 
+        sprint_field = client.config.sprint_field
         try:
             data = client.add_issues_to_sprint(sprint_id, list(keys))
+            results = sprint_verification_results(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                expected_in_sprint=True,
+            )
             audit_write(
                 client.config,
                 action="sprint_add",
                 issue_key=None,
                 payload={"sprint_id": sprint_id, "issue_keys": list(keys)},
-                result=data,
+                result={**data, "verification": results},
             )
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
+    failures = [entry for entry in results if not entry["verified"]]
+    for entry in results:
+        if entry["verified"]:
+            _say(f"- {entry['key']}: verified in sprint {sprint_id}", json_mode=json_output)
+        else:
+            _say(
+                f"- {entry['key']}: [red]FAILURE[/red] -- not in sprint {sprint_id} after write "
+                f"(currently in: {_sprint_locations(entry['sprints'])})",
+                json_mode=json_output,
+            )
+
     if json_output:
         _emit_json(
-            {"sprint_id": sprint_id, "issue_keys": list(keys), "result": data, "dry_run": False}
+            {
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "result": data,
+                "results": results,
+                "ok": not failures,
+                "dry_run": False,
+            }
         )
+        if failures:
+            raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
         return
 
-    console.print(f"Added {len(keys)} issue(s) to sprint {sprint_id}.")
+    if failures:
+        console.print(
+            f"[red]{len(failures)} of {len(keys)} issue(s) did not verify in sprint "
+            f"{sprint_id} after the write.[/red]"
+        )
+        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+
+    console.print(f"Added {len(keys)} issue(s) to sprint {sprint_id}, verified by reread.")
 
 
 @app.command("sprint-remove")
 def sprint_remove(
+    sprint_id: Annotated[
+        int,
+        typer.Argument(help="Sprint id every key must currently be in, checked before any write."),
+    ],
     keys: Annotated[
         list[str],
         typer.Argument(help="One or more Jira issue keys to move to the backlog."),
@@ -3760,12 +3907,25 @@ def sprint_remove(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Move one or more issues to the backlog: how this API removes an issue from a sprint.
+    """Remove one or more issues from SPRINT_ID, moving them to the backlog. Defaults to dry-run.
 
-    Defaults to dry-run. Like sprint-add, this is one batched POST, and every key clears the
-    safety gate before the dry run reports success, not only before `--execute` writes: a clean
-    dry run must predict what `--execute` does, and a rejected key leaves the whole batch
-    unwritten either way.
+    BREAKING CHANGE: this command used to take only issue keys (`sprint-remove KEY...`) and post
+    them straight to the backlog endpoint. `SPRINT_ID` is now a required first argument, and it is
+    a PRECONDITION THIS COMMAND ENFORCES, NOT SOMETHING JIRA CHECKS: the underlying Jira endpoint
+    (`POST /rest/agile/1.0/backlog/issue`) takes no sprint id at all and moves whatever keys it is
+    given to the backlog regardless of which sprint they were in. Before any write, every key's
+    current sprint field is re-read, and the WHOLE batch is refused -- nothing written for any
+    key -- if even one key is not currently in `SPRINT_ID`, listing exactly which sprint each
+    mismatched key is actually in. A mistyped key can no longer silently leave whatever sprint it
+    was actually in.
+
+    Like sprint-add, the write itself is one batched POST, and every key clears the write-scope
+    safety gate before the dry run reports success, not only before `--execute` writes. The Agile
+    endpoint also returns 204 with no body, so after `--execute` every key's sprint field is
+    re-read again and `results` reports, per key, whether it is now confirmed OUT of `SPRINT_ID`
+    -- not merely that Jira accepted the request. A key that still verifies as in `SPRINT_ID`
+    after the write is reported as a FAILURE and the command exits non-zero, even though the POST
+    itself returned success.
     """
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
@@ -3779,36 +3939,85 @@ def sprint_remove(
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc, json_mode=json_output)
 
+        sprint_field = client.config.sprint_field
+        precondition = sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field)
+        if any(not entry["in_sprint"] for entry in precondition):
+            _exit_sprint_precondition_error(
+                SprintPreconditionError(sprint_id, precondition), json_mode=json_output
+            )
+
         if not execute:
             _say(
-                f"[yellow]Dry run:[/yellow] would move {len(keys)} issue(s) to the backlog",
+                f"[yellow]Dry run:[/yellow] would move {len(keys)} issue(s) from sprint "
+                f"{sprint_id} to the backlog",
                 json_mode=json_output,
             )
             for issue_key in keys:
                 _say(f"- {issue_key} -> backlog", json_mode=json_output)
             _say(f"safety: {safety}", json_mode=json_output)
             if json_output:
-                _emit_json({"issue_keys": list(keys), "safety": safety, "dry_run": True})
+                _emit_json(
+                    {
+                        "sprint_id": sprint_id,
+                        "issue_keys": list(keys),
+                        "safety": safety,
+                        "precondition": precondition,
+                        "dry_run": True,
+                    }
+                )
             _say("Pass --execute to write it to Jira.", json_mode=json_output)
             return
 
         try:
             data = client.move_issues_to_backlog(list(keys))
+            results = sprint_verification_results(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                expected_in_sprint=False,
+            )
             audit_write(
                 client.config,
                 action="sprint_remove",
                 issue_key=None,
-                payload={"issue_keys": list(keys)},
-                result=data,
+                payload={"sprint_id": sprint_id, "issue_keys": list(keys)},
+                result={**data, "verification": results},
             )
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
+    failures = [entry for entry in results if not entry["verified"]]
+    for entry in results:
+        if entry["verified"]:
+            _say(f"- {entry['key']}: verified out of sprint {sprint_id}", json_mode=json_output)
+        else:
+            _say(
+                f"- {entry['key']}: [red]FAILURE[/red] -- still in sprint {sprint_id} after "
+                "the write",
+                json_mode=json_output,
+            )
+
     if json_output:
-        _emit_json({"issue_keys": list(keys), "result": data, "dry_run": False})
+        _emit_json(
+            {
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "result": data,
+                "results": results,
+                "ok": not failures,
+                "dry_run": False,
+            }
+        )
+        if failures:
+            raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
         return
 
-    console.print(f"Moved {len(keys)} issue(s) to the backlog.")
+    if failures:
+        console.print(
+            f"[red]{len(failures)} of {len(keys)} issue(s) did not verify out of sprint "
+            f"{sprint_id} after the write.[/red]"
+        )
+        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+
+    console.print(f"Moved {len(keys)} issue(s) from sprint {sprint_id} to the backlog, verified.")
 
 
 # --- Issue type change ---------------------------------------------------------------------
@@ -3956,6 +4165,14 @@ def _run_search(
     """
     approximate_total: int | None = None
     with _client() as client:
+        sprint_field = client.config.sprint_field
+        # A caller who left --fields at its shared default also gets the sprint field appended
+        # to what is actually requested (see `issue`'s identical rule); an explicit --fields is
+        # used exactly as given, matching the existing "explicit fields are not augmented" rule.
+        if fields == _DEFAULT_FIELDS_CSV:
+            requested_fields: list[str] | None = [*DEFAULT_FIELDS, sprint_field]
+        else:
+            requested_fields = _field_list(fields)
         try:
             if count:
                 approximate_total = client.approximate_issue_count(jql)
@@ -3963,13 +4180,13 @@ def _run_search(
                 data = client.search_all_issues(
                     jql,
                     limit=None if all_pages else limit,
-                    fields=_field_list(fields),
+                    fields=requested_fields,
                 )
             else:
                 data = client.search_issues(
                     jql,
                     limit=limit,
-                    fields=_field_list(fields),
+                    fields=requested_fields,
                     next_page_token=next_page_token,
                 )
         except JiraApiError as exc:
@@ -4001,7 +4218,12 @@ def _run_search(
     if not isinstance(issues, list):
         error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
         raise typer.Exit(1)
-    _print_issues_table(issues)
+    # Only render a Sprint column when the sprint field was actually part of what was requested
+    # -- see `issue`'s identical rule.
+    render_sprint_field = (
+        sprint_field if requested_fields and sprint_field in requested_fields else None
+    )
+    _print_issues_table(issues, sprint_field=render_sprint_field)
     if is_last is True:
         console.print(f"returned {returned} issues; complete")
     elif is_last is False:
@@ -4109,6 +4331,50 @@ def _exit_concurrent_edit_error(exc: JiraConcurrentEditError, *, json_mode: bool
             }
         )
     raise typer.Exit(CONCURRENT_EDIT_EXIT_CODE) from exc
+
+
+# Distinct from every exit code above: these two are specific to the sprint commands' own
+# read-then-decide checks, not a Jira API failure, a write-scope refusal, or a lost-update race.
+# 5 fires before any write is attempted (sprint-remove's precondition); 6 fires after a write
+# that Jira accepted but a post-write reread did not confirm -- a script can tell "refused, wrote
+# nothing" apart from "wrote, but did not verify" without parsing prose.
+SPRINT_PRECONDITION_EXIT_CODE = 5
+SPRINT_VERIFICATION_EXIT_CODE = 6
+
+
+def _sprint_locations(sprints: list[dict[str, Any]]) -> str:
+    """Human-readable "where a key currently is", for sprint precondition and verification
+    reporting: every sprint id and name it is in, or "no sprint" when the list is empty."""
+    if not sprints:
+        return "no sprint"
+    return ", ".join(f"{sprint.get('id')} {sprint.get('name')!r}" for sprint in sprints)
+
+
+def _exit_sprint_precondition_error(exc: SprintPreconditionError, *, json_mode: bool) -> None:
+    """Refuse the whole `sprint-remove` batch before any write, when a key is not currently in
+    the named sprint. Lists every key's actual current sprint(s), not only which keys mismatched,
+    because the point of this refusal is to make the caller's wrong assumption visible rather
+    than just recorded.
+    """
+    _print_error("Refusing sprint-remove:", str(exc))
+    for entry in exc.report:
+        marker = (
+            "in target sprint"
+            if entry["in_sprint"]
+            else f"NOT in target sprint (in {_sprint_locations(entry['sprints'])})"
+        )
+        _say(f"- {entry['key']}: {marker}", json_mode=json_mode)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "sprint_precondition_failed",
+                "sprint_id": exc.sprint_id,
+                "report": exc.report,
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(SPRINT_PRECONDITION_EXIT_CODE) from exc
 
 
 def _exit_missing_concurrency_token_error(

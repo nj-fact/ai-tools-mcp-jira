@@ -16,6 +16,7 @@ from jira_agent.client import (
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
+    SprintPreconditionError,
     adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
@@ -26,6 +27,8 @@ from jira_agent.client import (
     replace_diagram_with_media,
     require_concurrency_token,
     select_transition,
+    sprint_membership_report,
+    sprint_verification_results,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -67,13 +70,22 @@ def _client() -> JiraClient:
 def _fields_or_default(fields: list[str] | None) -> list[str]:
     """The shared default field set, imported from `client.DEFAULT_FIELDS` so this surface and
     the CLI's own `DEFAULT_FIELDS` cannot drift apart again — see
-    `test_default_fields_are_the_single_shared_list` in `test_surface_parity.py`.
+    `test_default_fields_are_the_single_shared_list` in `test_surface_parity.py`, plus the
+    config-resolved sprint field appended on top.
 
     This already includes `parent`; there is no longer a separate single-issue default, because
     the divergence that used to require one (this surface's list-shaped tools omitting `parent`
-    while the CLI's did not) is exactly the inconsistency this shared list closes.
+    while the CLI's did not) is exactly the inconsistency this shared list closes. The sprint
+    field is deliberately NOT folded into `DEFAULT_FIELDS` itself: that constant is shared with
+    the CLI and every other caller of it, and the sprint field id is instance-specific, resolved
+    from config at call time, not a literal safe to hardcode into a shared list. An explicit
+    `fields` argument is used exactly as given, with no field appended to it — matching
+    `test_jira_get_issue_explicit_fields_are_not_augmented_with_parent`'s existing rule for
+    `parent`.
     """
-    return fields or DEFAULT_FIELDS
+    if fields:
+        return fields
+    return [*DEFAULT_FIELDS, _sprint_field()]
 
 
 def _story_points_field() -> str:
@@ -83,6 +95,16 @@ def _story_points_field() -> str:
         return load_config().story_points_field
     except Exception:
         return DEFAULT_STORY_POINTS_FIELD
+
+
+def _sprint_field() -> str:
+    """Same contract as `_story_points_field`: show the field id a write/read would actually
+    use, without failing a caller (for example a dry run, or the default-fields augmentation in
+    `_fields_or_default`) just because the environment is incomplete."""
+    try:
+        return load_config().sprint_field
+    except Exception:
+        return DEFAULT_SPRINT_FIELD
 
 
 def _error(exc: JiraApiError) -> dict[str, Any]:
@@ -239,7 +261,7 @@ def _run_jql(jql: str, limit: int = 20, project: str | None = None) -> dict[str,
                 "ok": True,
                 "jql": jql,
                 "result": _search_result(
-                    client, jql, limit=limit, fields=DEFAULT_FIELDS, project=project
+                    client, jql, limit=limit, fields=_fields_or_default(None), project=project
                 ),
             }
     except JiraApiError as exc:
@@ -349,7 +371,10 @@ def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
                 "ok": True,
                 "test_jql": config.test_jql,
                 "result": _search_result(
-                    client, config.test_jql, limit=limit, fields=DEFAULT_FIELDS
+                    client,
+                    config.test_jql,
+                    limit=limit,
+                    fields=[*DEFAULT_FIELDS, config.sprint_field],
                 ),
             }
     except JiraApiError as exc:
@@ -2579,29 +2604,32 @@ def _sprint_field_or_missing(fields: dict[str, Any], sprint_field: str) -> Any:
 
 
 @mcp.tool
-def jira_get_issue_sprints(key: str, sprint_field: str = DEFAULT_SPRINT_FIELD) -> dict[str, Any]:
+def jira_get_issue_sprints(key: str, sprint_field: str | None = None) -> dict[str, Any]:
     """Return the sprint objects on one issue's sprint field.
 
-    sprint_field defaults to customfield_10020, the id probed on this Jira site; pass a
+    sprint_field defaults to config.sprint_field (JIRA_SPRINT_FIELD), resolved from config at
+    call time -- customfield_10020, the id probed on this Jira site, unless overridden; pass a
     different id if this site's Agile sprint field uses another custom field id.
 
     `sprint_field_present` tells apart two states an empty `sprints` list alone cannot: the
     field absent from Jira's response entirely (this site's sprint field id is probably
     different, or the field is not visible with the caller's permissions) and the field present
-    with an empty list (the issue genuinely is in no sprint). Reads the issue directly rather
-    than through `JiraClient.get_issue_sprints`, which documents that it collapses this
-    distinction into the same `[]` either way, matching the CLI's `issue-sprint` command, which
+    -- with `null` (this Jira site's own shape for "in no sprint", verified via `Sprint IS EMPTY`
+    JQL) or an empty list -- meaning the issue genuinely is in no sprint. Reads the issue
+    directly rather than through `JiraClient.get_issue_sprints`, which documents that it
+    collapses all three into the same `[]`, matching the CLI's `issue-sprint` command, which
     makes the same choice for the same reason.
     """
     try:
         with _client() as client:
-            issue = client.get_issue(key, fields=[sprint_field])
-            raw = _sprint_field_or_missing(issue.get("fields") or {}, sprint_field)
+            field = sprint_field or client.config.sprint_field
+            issue = client.get_issue(key, fields=[field])
+            raw = _sprint_field_or_missing(issue.get("fields") or {}, field)
             field_present = raw is not _SPRINT_FIELD_MISSING
             return {
                 "ok": True,
                 "issue": key,
-                "sprint_field": sprint_field,
+                "sprint_field": field,
                 "sprint_field_present": field_present,
                 "sprints": raw if isinstance(raw, list) else [],
             }
@@ -2615,7 +2643,14 @@ def jira_add_issues_to_sprint(
     issue_keys: list[str],
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Add one or more issues to a sprint. Defaults to dry-run."""
+    """Add one or more issues to a sprint. Defaults to dry-run.
+
+    The Agile add endpoint returns 204 with no body, so Jira accepting the request is not proof
+    the issue ended up in the sprint. After execute=true, every key's sprint field is re-read and
+    `results` reports, per key, whether it is now confirmed in `sprint_id` (`verified`). `ok` is
+    false and a key can show `verified: false` even though the write itself succeeded, if the
+    reread does not confirm it -- that reread, not the 204, is what this tool treats as proof.
+    """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
     try:
@@ -2634,15 +2669,26 @@ def jira_add_issues_to_sprint(
                     "message": "Pass execute=true to add these issues to the sprint in Jira.",
                 }
 
+            sprint_field = client.config.sprint_field
             client.add_issues_to_sprint(sprint_id, issue_keys)
+            results = sprint_verification_results(
+                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
+                expected_in_sprint=True,
+            )
             audit_write(
                 client.config,
                 action="add_issues_to_sprint",
                 issue_key=issue_keys[0],
                 payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
-                result={},
+                result={"verification": results},
             )
-            return {"ok": True, "sprint_id": sprint_id, "issue_keys": issue_keys}
+            ok = all(entry["verified"] for entry in results)
+            return {
+                "ok": ok,
+                "sprint_id": sprint_id,
+                "issue_keys": issue_keys,
+                "results": results,
+            }
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2651,10 +2697,27 @@ def jira_add_issues_to_sprint(
 
 @mcp.tool
 def jira_move_issues_to_backlog(
+    sprint_id: int | str,
     issue_keys: list[str],
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Move one or more issues to the backlog, out of any sprint. Defaults to dry-run."""
+    """Remove one or more issues from sprint_id, moving them to the backlog. Defaults to dry-run.
+
+    BREAKING CHANGE: this tool used to take only issue_keys and post them straight to the
+    backlog endpoint. `sprint_id` is now required, and it is a PRECONDITION THIS TOOL ENFORCES,
+    NOT SOMETHING JIRA CHECKS: the underlying endpoint (`POST /rest/agile/1.0/backlog/issue`)
+    takes no sprint id at all and moves whatever keys it is given regardless of which sprint they
+    were in. Before any write (including the dry run, so it predicts what execute=true does),
+    every key's current sprint field is re-read, and the whole batch is refused -- via
+    `error_type: "sprint_precondition_failed"`, nothing written for any key -- if even one key is
+    not currently in `sprint_id`; `report` lists exactly which sprint each mismatched key is
+    actually in.
+
+    The endpoint also returns 204 with no body, so after execute=true every key's sprint field is
+    re-read again and `results` reports, per key, whether it is now confirmed OUT of `sprint_id`
+    (`verified`). `ok` is false and a key can show `verified: false` even though the write itself
+    succeeded, if it still verifies as in `sprint_id` afterwards.
+    """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
     try:
@@ -2663,28 +2726,77 @@ def jira_move_issues_to_backlog(
                 issue_key: ensure_issue_write_allowed(client.config, client, issue_key)
                 for issue_key in issue_keys
             }
+
+            sprint_field = client.config.sprint_field
+            precondition = sprint_membership_report(
+                client, issue_keys, sprint_id, sprint_field=sprint_field
+            )
+            if any(not entry["in_sprint"] for entry in precondition):
+                exc = SprintPreconditionError(sprint_id, precondition)
+                return {
+                    "ok": False,
+                    "error_type": "sprint_precondition_failed",
+                    "message": str(exc),
+                    "sprint_id": sprint_id,
+                    "report": precondition,
+                }
+
             if not execute:
                 return {
                     "ok": True,
                     "dry_run": True,
+                    "sprint_id": sprint_id,
                     "issue_keys": issue_keys,
                     "safety": safety,
+                    "precondition": precondition,
                     "message": "Pass execute=true to move these issues to the backlog in Jira.",
                 }
 
             client.move_issues_to_backlog(issue_keys)
+            results = sprint_verification_results(
+                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
+                expected_in_sprint=False,
+            )
             audit_write(
                 client.config,
                 action="move_issues_to_backlog",
                 issue_key=issue_keys[0],
-                payload={"issue_keys": issue_keys},
-                result={},
+                payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
+                result={"verification": results},
             )
-            return {"ok": True, "issue_keys": issue_keys}
+            ok = all(entry["verified"] for entry in results)
+            return {
+                "ok": ok,
+                "sprint_id": sprint_id,
+                "issue_keys": issue_keys,
+                "results": results,
+            }
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
+
+
+@mcp.tool
+def jira_config_fields() -> dict[str, Any]:
+    """Show the custom field ids this tool has resolved from config. Read-only, no Jira call.
+
+    Mirrors the CLI's `config-fields` command. `story_points_field` and `sprint_field` are both
+    instance-specific Jira custom field ids -- resolved the same way in `config.py`, from a
+    `JIRA_STORY_POINTS_FIELD` / `JIRA_SPRINT_FIELD` env var, or this site's probed default
+    (`customfield_10028` / `customfield_10020`) -- and this tool exists so a caller can check
+    which ids are actually in effect instead of guessing, before running anything that writes.
+
+    On this site: customfield_10028 is "Story Points", populated and editable for project FC,
+    and is the correct story_points_field default. customfield_10016 is "Story point estimate"
+    -- it exists, but is unused and not editable for FC, and must never be configured instead.
+    """
+    config = load_config()
+    return {
+        "ok": True,
+        "story_points_field": config.story_points_field,
+        "sprint_field": config.sprint_field,
+    }
 
 
 def main() -> None:

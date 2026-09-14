@@ -99,6 +99,7 @@ class JiraConfig(BaseModel):
     write_issue_keys: list[str] = Field(default_factory=list, alias="JIRA_WRITE_ISSUE_KEYS")
     audit_log_path: str = Field(default=".jira-agent/audit.jsonl", alias="JIRA_AUDIT_LOG_PATH")
     story_points_field: str = Field(default="customfield_10028", alias="JIRA_STORY_POINTS_FIELD")
+    sprint_field: str = Field(default="customfield_10020", alias="JIRA_SPRINT_FIELD")
     project_credentials: dict[str, ProjectCredentials] = Field(default_factory=dict)
 
     @model_validator(mode="before")
@@ -222,6 +223,17 @@ class JiraConfig(BaseModel):
         if not normalized.startswith("customfield_") or not normalized[12:].isdigit():
             raise ValueError(
                 "JIRA_STORY_POINTS_FIELD must look like customfield_10028; "
+                "the numeric id differs per Jira site"
+            )
+        return normalized
+
+    @field_validator("sprint_field")
+    @classmethod
+    def validate_sprint_field(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("customfield_") or not normalized[12:].isdigit():
+            raise ValueError(
+                "JIRA_SPRINT_FIELD must look like customfield_10020; "
                 "the numeric id differs per Jira site"
             )
         return normalized

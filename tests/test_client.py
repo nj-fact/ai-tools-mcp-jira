@@ -13,14 +13,18 @@ from jira_agent.client import (
     JiraApiError,
     JiraClient,
     JiraConcurrentEditError,
+    SprintPreconditionError,
     adf_contains_media_id,
     adf_heading_text,
     create_issue_payload,
     edit_issue_payload,
+    is_in_sprint,
     issue_link_payload,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
+    sprint_membership_report,
+    sprint_verification_results,
     text_to_adf,
 )
 from jira_agent.config import JiraConfig
@@ -539,6 +543,47 @@ def test_a_malformed_story_points_field_id_is_rejected_at_config_time() -> None:
         )
     except ValueError as exc:
         assert "customfield_10028" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_sprint_field_defaults_to_the_probed_id() -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+        }
+    )
+
+    assert config.sprint_field == "customfield_10020"
+
+
+def test_sprint_field_honours_its_env_alias() -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_SPRINT_FIELD": "customfield_12345",
+        }
+    )
+
+    assert config.sprint_field == "customfield_12345"
+
+
+def test_a_malformed_sprint_field_id_is_rejected_at_config_time() -> None:
+    try:
+        JiraConfig.model_validate(
+            {
+                "JIRA_SITE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_SPRINT_FIELD": "Sprint",
+            }
+        )
+    except ValueError as exc:
+        assert "customfield_10020" in str(exc)
     else:
         raise AssertionError("Expected ValueError")
 
@@ -3466,6 +3511,95 @@ def test_get_issue_sprints_returns_empty_list_when_field_absent() -> None:
     )
 
     assert client.get_issue_sprints("FC-1") == []
+
+
+def test_get_issue_sprints_returns_empty_list_when_field_is_null() -> None:
+    """Verified fact: an issue in no sprint on this Jira site returns the sprint field PRESENT
+    with the value `null` -- not `[]`, not absent -- confirmed via `jql=project = FC AND Sprint
+    IS EMPTY`. This already passes against the current code (`isinstance(None, list)` is False,
+    so it falls through to `[]` exactly like an absent field or an empty list), so this is
+    recorded as a regression test rather than left unverified, per the hardening brief's own
+    instruction to check what the current code does with `null` before assuming it needs a fix.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"fields": {"customfield_10020": None}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == []
+
+
+def test_is_in_sprint_matches_by_id_regardless_of_int_or_str() -> None:
+    sprints = [{"id": 7340, "name": "10 SEPA-Mandate, Disbursement", "state": "active"}]
+
+    assert is_in_sprint(sprints, 7340) is True
+    assert is_in_sprint(sprints, "7340") is True
+    assert is_in_sprint(sprints, 9001) is False
+    assert is_in_sprint([], 7340) is False
+
+
+def test_sprint_membership_report_reads_each_key_and_reports_membership() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def get_issue_sprints(self, issue_key, *, sprint_field):
+            self.calls.append((issue_key, sprint_field))
+            if issue_key == "FC-1":
+                return [{"id": 7340, "name": "Sprint 7340", "state": "active"}]
+            return []
+
+    client = FakeClient()
+
+    report = sprint_membership_report(
+        client, ["FC-1", "FC-2"], 7340, sprint_field="customfield_10020"
+    )
+
+    assert report == [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [{"id": 7340, "name": "Sprint 7340", "state": "active"}],
+            "in_sprint": True,
+        },
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+    assert client.calls == [("FC-1", "customfield_10020"), ("FC-2", "customfield_10020")]
+
+
+def test_sprint_verification_results_marks_verified_against_expected_polarity() -> None:
+    report = [
+        {"key": "FC-1", "sprint_id": 7340, "sprints": [{"id": 7340}], "in_sprint": True},
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+
+    added = sprint_verification_results(report, expected_in_sprint=True)
+    assert [entry["verified"] for entry in added] == [True, False]
+    assert [entry["expected_in_sprint"] for entry in added] == [True, True]
+
+    removed = sprint_verification_results(report, expected_in_sprint=False)
+    assert [entry["verified"] for entry in removed] == [False, True]
+
+
+def test_sprint_precondition_error_names_the_mismatched_keys() -> None:
+    report = [
+        {"key": "FC-1", "sprint_id": 7340, "sprints": [{"id": 7340}], "in_sprint": True},
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+
+    error = SprintPreconditionError(7340, report)
+
+    assert "FC-2" in str(error)
+    assert "FC-1" not in str(error)
+    assert error.sprint_id == 7340
+    assert error.report == report
 
 
 def test_add_issues_to_sprint_posts_issue_keys() -> None:
