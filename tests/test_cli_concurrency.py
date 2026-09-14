@@ -520,3 +520,81 @@ def test_delete_comment_execute_calls_delete_comment_once_and_audits(tmp_path, m
     _, audit_kwargs = audits[0]
     assert audit_kwargs["action"] == "delete_comment"
     assert audit_kwargs["issue_key"] == ISSUE_KEY
+
+
+# --- Integration seam: issue-type was built alongside these commands, in a separate worktree,
+# and arrived with its own inline copy of the refusal instead of the shared helper. That copy
+# printed prose only, so under --json a lost-update refusal produced an empty stdout and a
+# non-zero exit — the caller could parse nothing and had to read prose to learn why. These two
+# tests pin the unified behaviour so the duplicate cannot come back.
+
+
+class _IssueTypeFakeClient:
+    """Answers the reads `issue-type` makes, and fails its write with a lost-update race."""
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.writes: list[dict[str, Any]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def is_issue_type_allowed(self, issue_key, issue_type_name):
+        return True
+
+    def get_edit_metadata(self, issue_key):
+        return {"fields": {"issuetype": {"allowedValues": [{"name": "Bug"}, {"name": "Task"}]}}}
+
+    def issue_version(self, issue_key):
+        return READ_UPDATED
+
+    def set_issue_type(self, issue_key, issue_type_name, *, expect_updated=None):
+        raise JiraConcurrentEditError(
+            f"{issue_key} changed since it was read",
+            issue_key=issue_key,
+            expected_updated=expect_updated,
+            found_updated=CHANGED_UPDATED,
+        )
+
+
+def test_issue_type_concurrent_refusal_is_machine_readable_under_json(
+    tmp_path, monkeypatch
+) -> None:
+    clients: list[_IssueTypeFakeClient] = []
+
+    def _factory(config):
+        client = _IssueTypeFakeClient(config)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _factory)
+    monkeypatch.setattr(cli, "audit_write", lambda *_a, **_k: None)
+
+    result = CliRunner().invoke(cli.app, ["issue-type", ISSUE_KEY, "Bug", "--execute", "--json"])
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    # The whole of stdout is the refusal document: no find('{') slicing, no prose mixed in.
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "concurrent_edit"
+    assert payload["issue"] == ISSUE_KEY
+    assert payload["expected_updated"] == READ_UPDATED
+    assert payload["found_updated"] == CHANGED_UPDATED
+    assert clients and clients[0].writes == []
+
+
+def test_issue_type_refusal_uses_the_same_exit_code_as_the_other_guarded_commands(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _IssueTypeFakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda *_a, **_k: None)
+
+    result = CliRunner().invoke(cli.app, ["issue-type", ISSUE_KEY, "Bug", "--execute"])
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE
+    assert "Concurrent edit refused:" in result.stderr
+    assert CHANGED_UPDATED in result.stderr

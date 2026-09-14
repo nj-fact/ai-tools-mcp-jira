@@ -679,10 +679,13 @@ class JiraClient:
 
         `sprint_field` defaults to the `customfield_10020` id probed on this Jira site (schema
         `com.pyxis.greenhopper.jira:gh-sprint`); the id is not guaranteed to match on another
-        site. This follows the same pattern as `config.story_points_field` but is not wired
-        through config.py, whose per-project override machinery belongs to another worker's
-        files right now — a `JIRA_SPRINT_FIELD`-style config key would be the better long-term
-        home for this default once that file is this worker's to change.
+        site, so a caller on a different site must pass its own. A `JIRA_SPRINT_FIELD` config
+        key alongside `config.story_points_field` would be the better long-term home for this
+        default; it is deliberately left out here rather than added untested.
+
+        Note this collapses two states a caller may need to tell apart: an issue whose sprint
+        field is absent from the response and an issue whose sprint list is empty both return
+        `[]`. Read the field off `get_issue` directly when that distinction matters.
         """
         issue = self.get_issue(issue_key, fields=[sprint_field])
         value = (issue.get("fields") or {}).get(sprint_field)

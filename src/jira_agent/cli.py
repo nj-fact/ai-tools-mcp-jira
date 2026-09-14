@@ -3533,10 +3533,9 @@ def issue_type(
     this issue: a doomed PUT with a Jira error is worse than a local refusal that shows the
     options. When executing, this captures `issue_version` immediately before the write and
     passes it as `expect_updated`, so a change landing between that read and the PUT surfaces as
-    `JiraConcurrentEditError` here rather than silently overwriting it; that failure exits with
-    code 4. A sibling worker is adding a shared `_exit_concurrent_edit_error` helper using the
-    same exit code elsewhere in this file for the same condition on other commands; the two
-    should be unified into one helper at integration rather than duplicated further.
+    `JiraConcurrentEditError` here rather than silently overwriting it. That refusal goes through
+    the same `_exit_concurrent_edit_error` helper, and therefore the same exit code 4 and the same
+    machine-readable JSON document, as every other guarded whole-field rewrite in this file.
     """
     with _client() as client:
         try:
@@ -3572,12 +3571,7 @@ def issue_type(
             try:
                 data = client.set_issue_type(key, new_type, expect_updated=expected_updated)
             except JiraConcurrentEditError as exc:
-                _print_error(
-                    "Concurrent edit:",
-                    f"{key} changed since it was read: expected updated="
-                    f"{exc.expected_updated!r}, found {exc.found_updated!r}. Re-read and retry.",
-                )
-                raise typer.Exit(4) from exc
+                _exit_concurrent_edit_error(exc, json_mode=json_output)
 
             audit_write(
                 client.config,

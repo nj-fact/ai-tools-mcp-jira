@@ -156,11 +156,21 @@ def _install_patch_cli(monkeypatch, tmp_path) -> list[dict[str, object]]:
         def get_issue(self, issue_key, **_kwargs):
             return {
                 "key": issue_key,
-                "fields": {"project": {"key": "FC"}, "description": _patch_description()},
+                "fields": {
+                    "project": {"key": "FC"},
+                    "description": _patch_description(),
+                    "updated": "2026-09-14T10:00:00.000+0200",
+                },
             }
 
-        def edit_issue_adf_description(self, issue_key, description):
-            writes.append({"issue": issue_key, "description": description})
+        def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
+            writes.append(
+                {
+                    "issue": issue_key,
+                    "description": description,
+                    "expect_updated": expect_updated,
+                }
+            )
             return {"updated": True}
 
     monkeypatch.setattr(cli, "load_config", lambda: config)
@@ -546,6 +556,9 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
         def get_issue(self, issue_key, **_kwargs):
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
 
+        def issue_version(self, issue_key):
+            return "2026-09-14T10:00:00.000+0200"
+
         def edit_issue(self, issue_key, **kwargs):
             audited.append({"issue": issue_key, "kwargs": kwargs})
             return {"key": issue_key, "fields": {"fixVersions": [{"name": "FCL-MVP"}]}}
@@ -571,6 +584,7 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
                 "parent_key": None,
                 "priority": None,
                 "story_points": None,
+                "expect_updated": "2026-09-14T10:00:00.000+0200",
             },
         }
     ]
@@ -839,6 +853,9 @@ class _EditIssueFakeClient:
 
     def get_issue(self, issue_key, **_kwargs):
         return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def issue_version(self, issue_key):
+        return "2026-09-14T10:00:00.000+0200"
 
     def edit_issue(self, issue_key, **_kwargs):
         return {"key": issue_key, "fields": {"summary": "Updated summary"}}
@@ -1343,11 +1360,13 @@ class _JsonExecuteSweepFakeClient:
 
     Every command in the sweep only reads Jira state before its dry-run return, so this fake only
     has to answer the handful of read shapes those commands ask for, keyed on the exact `fields`
-    list each call site uses.
+    list each call site uses. It also carries `config`, because a command may run the write-scope
+    check before its dry-run return rather than after — `issue-type` does, deliberately, so a
+    dry run reports up front whether the write would be permitted at all.
     """
 
-    def __init__(self, _config) -> None:
-        pass
+    def __init__(self, config) -> None:
+        self.config = config
 
     def __enter__(self):
         return self
@@ -1365,6 +1384,17 @@ class _JsonExecuteSweepFakeClient:
             return {"key": issue_key, "fields": {"parent": None}}
         if fields == ["description"]:
             return {"key": issue_key, "fields": {"description": _patch_description()}}
+        if fields == ["description", "updated"]:
+            # patch-description-section reads its concurrency-guard token in the same request
+            # that reads the description, so the token cannot straddle a change the way a
+            # second, separate read could.
+            return {
+                "key": issue_key,
+                "fields": {
+                    "description": _patch_description(),
+                    "updated": "2026-09-14T10:00:00.000+0200",
+                },
+            }
         if fields == ["description", "attachment"]:
             return {
                 "key": issue_key,
@@ -1387,6 +1417,24 @@ class _JsonExecuteSweepFakeClient:
 
     def get_transitions(self, issue_key):
         return {"transitions": [{"id": "31", "name": "Done", "to": {"name": "Done"}}]}
+
+    def get_comment(self, issue_key, comment_id):
+        return {
+            "id": comment_id,
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "Current body"}]}
+                ],
+            },
+        }
+
+    def is_issue_type_allowed(self, issue_key, issue_type_name):
+        return True
+
+    def get_edit_metadata(self, issue_key):
+        return {"fields": {"issuetype": {"allowedValues": [{"name": "Bug"}, {"name": "Task"}]}}}
 
 
 def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
@@ -1419,6 +1467,18 @@ def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
         "assign": ["assign", "FC-1", "--json"],
         "attach": ["attach", "FC-1", "--file", str(attach_file), "--json"],
         "transition": ["transition", "FC-1", "Done", "--json"],
+        "edit-comment": [
+            "edit-comment",
+            "FC-1",
+            "667647",
+            "--body",
+            "Corrected body.",
+            "--json",
+        ],
+        "delete-comment": ["delete-comment", "FC-1", "667647", "--json"],
+        "issue-type": ["issue-type", "FC-1", "Bug", "--json"],
+        "sprint-add": ["sprint-add", "7340", "FC-1", "--json"],
+        "sprint-remove": ["sprint-remove", "FC-1", "--json"],
     }
 
 
