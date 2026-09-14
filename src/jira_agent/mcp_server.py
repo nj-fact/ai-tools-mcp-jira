@@ -7,6 +7,7 @@ from fastmcp import FastMCP
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    DEFAULT_FIELDS,
     DEFAULT_SPRINT_FIELD,
     DEFAULT_STORY_POINTS_FIELD,
     AdfPatchInvariantError,
@@ -18,6 +19,7 @@ from jira_agent.client import (
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    issue_type_allowed_values,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
@@ -55,26 +57,21 @@ from jira_agent.workflows import (
 
 mcp = FastMCP("jira-agent")
 
-DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated"]
-
 
 def _client() -> JiraClient:
     return JiraClient(load_config())
 
 
 def _fields_or_default(fields: list[str] | None) -> list[str]:
-    return fields or DEFAULT_FIELDS
+    """The shared default field set, imported from `client.DEFAULT_FIELDS` so this surface and
+    the CLI's own `DEFAULT_FIELDS` cannot drift apart again — see
+    `test_default_fields_are_the_single_shared_list` in `test_surface_parity.py`.
 
-
-def _issue_fields_or_default(fields: list[str] | None) -> list[str]:
-    """jira_get_issue's own default field set: DEFAULT_FIELDS plus `parent`.
-
-    `parent` is missing from Jira's own default field list, matching the CLI's DEFAULT_FIELDS,
-    so a caller that fetches one issue and never names `parent` explicitly never sees it. A
-    single-issue fetch is exactly where that absence bites, so it is added only here rather than
-    to the shared DEFAULT_FIELDS the list-shaped search tools use.
+    This already includes `parent`; there is no longer a separate single-issue default, because
+    the divergence that used to require one (this surface's list-shaped tools omitting `parent`
+    while the CLI's did not) is exactly the inconsistency this shared list closes.
     """
-    return fields or [*DEFAULT_FIELDS, "parent"]
+    return fields or DEFAULT_FIELDS
 
 
 def _story_points_field() -> str:
@@ -226,12 +223,13 @@ def jira_myself(project: str | None = None) -> dict[str, Any]:
 def jira_get_issue(key: str, fields: list[str] | None = None) -> dict[str, Any]:
     """Fetch one Jira issue by key.
 
-    Defaults to DEFAULT_FIELDS plus `parent`, matching the CLI. `parent` is not part of Jira's
-    own default field list, so passing an explicit `fields` list must name it to see it.
+    Defaults to DEFAULT_FIELDS, matching the CLI, which already includes `parent`. `parent` is
+    not part of Jira's own default field list, so passing an explicit `fields` list must name it
+    to see it.
     """
     try:
         with _client() as client:
-            issue = client.get_issue(key, fields=_issue_fields_or_default(fields))
+            issue = client.get_issue(key, fields=_fields_or_default(fields))
             return {"ok": True, "issue": issue}
     except JiraApiError as exc:
         return _error(exc)
@@ -1389,6 +1387,8 @@ def jira_update_comment(
     `current_body` is the current body flattened to plain text with the same flattener the CLI
     uses, matching the CLI's `edit-comment` dry run rather than exposing raw ADF under a name
     that reads as plain text. The raw ADF document is still available, under `current_body_adf`.
+    The replacement text is `proposed_body`, matching the CLI's own key for the identical fact
+    (this used to be spelled `new_body` here only).
     """
     try:
         with _client() as client:
@@ -1411,7 +1411,7 @@ def jira_update_comment(
                     "current_author": (current.get("author") or {}).get("displayName"),
                     "current_body": adf_to_text(current.get("body")).strip(),
                     "current_body_adf": current.get("body"),
-                    "new_body": body,
+                    "proposed_body": body,
                     "safety": safety,
                     "message": "Pass execute=true to replace this comment body in Jira.",
                 }
@@ -2211,19 +2211,16 @@ def jira_issue_type_options(key: str) -> dict[str, Any]:
     """List one issue's allowed issue-type values for a type change.
 
     Reads editmeta, the same source jira_set_issue_type checks before writing, so an agent can
-    see what an issue may change to without guessing and hitting the refusal.
+    see what an issue may change to without guessing and hitting the refusal. The key is
+    `allowed_values`, matching the CLI's `issue-type-options` output and the Jira editmeta field
+    (`issuetype.allowedValues`) it comes from — this used to be spelled `allowed_issue_types`
+    here only, so the same fact had two names depending on which surface answered it.
     """
     try:
         with _client() as client:
             metadata = client.get_edit_metadata(key)
-            issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
-            allowed = issuetype_field.get("allowedValues") or []
-            names = [
-                str(value.get("name"))
-                for value in allowed
-                if isinstance(value, dict) and value.get("name")
-            ]
-            return {"ok": True, "issue": key, "allowed_issue_types": names}
+            allowed_values = issue_type_allowed_values(metadata)
+            return {"ok": True, "issue": key, "allowed_values": allowed_values}
     except JiraApiError as exc:
         return _error(exc)
 
@@ -2288,14 +2285,23 @@ def jira_list_boards(
     name: str | None = None,
     max_results: int = 50,
 ) -> dict[str, Any]:
-    """List Jira Agile boards, optionally filtered by type (for example "scrum") or name."""
+    """List Jira Agile boards, optionally filtered by type (for example "scrum") or name.
+
+    `max_results` defaults to 50 and this never fetches a second page, so a site with more
+    boards than that has more than this response shows. Matching the CLI's `boards` command,
+    the `boards` document carries `returned` (the board count actually in this response) and
+    `is_last` (Jira's own `isLast`, `None` when the response carried no such signal) alongside
+    the raw fields; neither surface invents a `total` Jira did not report.
+    """
     try:
         with _client() as client:
+            boards = client.list_boards(
+                board_type=board_type, name=name, max_results=max_results
+            )
+            values = boards.get("values") or []
             return {
                 "ok": True,
-                "boards": client.list_boards(
-                    board_type=board_type, name=name, max_results=max_results
-                ),
+                "boards": {**boards, "returned": len(values), "is_last": boards.get("isLast")},
             }
     except JiraApiError as exc:
         return _error(exc)
@@ -2307,14 +2313,24 @@ def jira_list_board_sprints(
     state: str | None = None,
     max_results: int = 50,
 ) -> dict[str, Any]:
-    """List sprints on one Jira Agile board. state optionally filters to active/future/closed."""
+    """List sprints on one Jira Agile board. state optionally filters to active/future/closed.
+
+    `max_results` defaults to 50 and this never fetches a second page, so a board with more
+    sprints than that has more than this response shows. Matching the CLI's `sprints` command,
+    the `sprints` document carries `returned` and `is_last` (Jira's own `isLast`, `None` when
+    absent) alongside the raw fields; neither surface invents a `total` Jira did not report.
+    """
     try:
         with _client() as client:
+            sprints = client.list_board_sprints(board_id, state=state, max_results=max_results)
+            values = sprints.get("values") or []
             return {
                 "ok": True,
-                "sprints": client.list_board_sprints(
-                    board_id, state=state, max_results=max_results
-                ),
+                "sprints": {
+                    **sprints,
+                    "returned": len(values),
+                    "is_last": sprints.get("isLast"),
+                },
             }
     except JiraApiError as exc:
         return _error(exc)

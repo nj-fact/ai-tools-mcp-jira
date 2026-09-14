@@ -304,13 +304,16 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - Fetch one issue with `issue`, including its `parent` by default; a `--fields` value Jira does
   not return for the issue is called out instead of being silently dropped
 - Search issues with JQL using Jira Cloud REST API v3 enhanced search. This endpoint never reports
-  a total match count, so `search` always states how many issues it returned and whether more
-  remain (`returned`/`is_last`, never a fabricated `total`); `--limit` pages automatically past
-  one page, `--all` pages through every match (and wins over `--limit` when both are given), and
-  `--count` opts into one extra, explicitly-approximate count from `/search/approximate-count`
-- Fetch recently updated issues with `recent`
-- Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
-- Run read-only smoke checks inside the configured FC test scope with `test-scope`
+  a total match count, so every search-backed command below states how many issues it returned
+  and whether more remain (`returned`/`is_last`, never a fabricated `total`) instead of just one of
+  them doing so; `search`'s own `--limit` pages automatically past one page, `--all` pages through
+  every match (and wins over `--limit` when both are given), and `--count` opts into one extra,
+  explicitly-approximate count from `/search/approximate-count`
+- Fetch recently updated issues with `recent`, and friendly searches with `mine`,
+  `assigned-to-me`, `fc-open`, and `by-status` — all share `search`'s curated `returned`/`is_last`
+  shape and its uncapped `--limit` paging, not a raw single-page passthrough
+- Run read-only smoke checks inside the configured FC test scope with `test-scope`, curated the
+  same way (its own `--limit` stays capped at 20, deliberately, as a smoke query)
 - Inspect create metadata and create dry-run/real test issues in the configured FC project
 - Create arbitrary allowed issue types with labels, parent, priority, story points, and
   Markdown-to-ADF descriptions; optionally select one Markdown section from a preparation file

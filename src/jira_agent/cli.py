@@ -12,6 +12,7 @@ from rich.table import Table
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    DEFAULT_FIELDS,
     DEFAULT_SPRINT_FIELD,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
@@ -23,6 +24,7 @@ from jira_agent.client import (
     create_issue_payload,
     edit_issue_payload,
     issue_link_payload,
+    issue_type_allowed_values,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
@@ -72,8 +74,6 @@ data_console = Console(markup=False, highlight=False, soft_wrap=True)
 # renders as "Costs". Tables still need width handling, so this console keeps wrapping and only
 # drops the interpretation.
 table_console = Console(markup=False, highlight=False)
-
-DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated", "parent"]
 
 
 def _client() -> JiraClient:
@@ -692,7 +692,7 @@ def recent(
     ] = 30,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     fields: Annotated[
         str | None,
@@ -722,7 +722,7 @@ def mine(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
@@ -751,7 +751,7 @@ def assigned_to_me(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
@@ -766,7 +766,7 @@ def assigned_to_me(
 def fc_open(
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
@@ -793,7 +793,7 @@ def by_status(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
@@ -876,7 +876,6 @@ def search(
         json_output=json_output,
         all_pages=all_issues,
         count=count,
-        curated=True,
     )
 
 
@@ -891,29 +890,20 @@ def test_scope(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Run a read-only smoke query against the configured Jira test scope."""
+    """Run a read-only smoke query against the configured Jira test scope.
+
+    Reports the same curated shape as every other search-backed command (`returned`, `is_last`,
+    never a fabricated `total`); see `_run_search`.
+    """
     config = _config()
     _say(f"test JQL: {config.test_jql}", json_mode=json_output)
-    with JiraClient(config) as client:
-        try:
-            data = client.search_issues(
-                config.test_jql,
-                limit=limit,
-                fields=DEFAULT_FIELDS,
-            )
-        except JiraApiError as exc:
-            _exit_api_error(exc, json_mode=json_output)
-
-    if json_output:
-        _emit_json(data)
-        return
-
-    issues = data.get("issues") or []
-    if not isinstance(issues, list):
-        error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
-        raise typer.Exit(1)
-    _print_issues_table(issues)
-    console.print(f"scope issue count shown: {len(issues)}")
+    _run_search(
+        config.test_jql,
+        limit=limit,
+        fields=",".join(DEFAULT_FIELDS),
+        next_page_token=None,
+        json_output=json_output,
+    )
 
 
 @app.command("create-meta")
@@ -3675,15 +3665,6 @@ def sprint_remove(
 # --- Issue type change ---------------------------------------------------------------------
 
 
-def _issue_type_allowed_values(metadata: dict[str, Any]) -> list[str]:
-    issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
-    return [
-        str(value.get("name"))
-        for value in issuetype_field.get("allowedValues") or []
-        if isinstance(value, dict) and value.get("name")
-    ]
-
-
 @app.command("issue-type-options")
 def issue_type_options(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
@@ -3699,7 +3680,7 @@ def issue_type_options(
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
-    allowed_values = _issue_type_allowed_values(metadata)
+    allowed_values = issue_type_allowed_values(metadata)
 
     if json_output:
         _emit_json({"issue": key, "allowed_values": allowed_values})
@@ -3738,7 +3719,7 @@ def issue_type(
         try:
             if not client.is_issue_type_allowed(key, new_type):
                 metadata = client.get_edit_metadata(key)
-                allowed_values = _issue_type_allowed_values(metadata)
+                allowed_values = issue_type_allowed_values(metadata)
                 _print_error(
                     "Refused:",
                     f"{new_type!r} is not an allowed issue type for {key}. Allowed values: "
@@ -3798,25 +3779,25 @@ def _run_search(
     json_output: bool,
     all_pages: bool = False,
     count: bool = False,
-    curated: bool = False,
 ) -> None:
-    """Run a JQL search and print or emit the result.
+    """Run a JQL search and print or emit the one curated result shape every search-backed
+    command shares: ``recent``, ``mine``, ``fc-open``, ``by-status``, ``test-scope``, and
+    ``search`` itself. There is no separate raw-passthrough path any more, and no ``curated``
+    flag to pick between them — a caller that trusts one page's raw ``issues`` as the whole
+    answer is exactly the false-completeness defect this shape exists to rule out, and it does
+    not matter which command produced that page.
 
-    ``curated=False`` (the default, unchanged for every caller that predates the honest-reporting
-    fix) preserves the original single-page passthrough exactly: one ``search_issues`` call, the
-    raw Jira response emitted as-is under --json, and a bare ``nextPageToken: ...`` line in human
-    mode when one is present.
-
-    ``curated=True`` is the ``search`` command's own path. It honours ``limit`` beyond one page
-    and ``all_pages`` via ``search_all_issues``, adds ``count``'s explicitly-approximate total,
-    and always reports ``returned``/``is_last`` instead of a total the API never gave it.
+    It honours ``limit`` beyond one page and ``all_pages`` via ``search_all_issues``, adds
+    ``count``'s explicitly-approximate total, and always reports ``returned``/``is_last``
+    instead of a total the API never gave it. This never emits a ``total`` key: none of these
+    commands report a match count `/search/jql` never had in the first place.
     """
     approximate_total: int | None = None
     with _client() as client:
         try:
-            if curated and count:
+            if count:
                 approximate_total = client.approximate_issue_count(jql)
-            if curated and next_page_token is None:
+            if next_page_token is None:
                 data = client.search_all_issues(
                     jql,
                     limit=None if all_pages else limit,
@@ -3831,19 +3812,6 @@ def _run_search(
                 )
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
-
-    if not curated:
-        if json_output:
-            _emit_json(data)
-            return
-        issues = data.get("issues") or []
-        if not isinstance(issues, list):
-            error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
-            raise typer.Exit(1)
-        _print_issues_table(issues)
-        if data.get("nextPageToken"):
-            console.print(f"nextPageToken: {data['nextPageToken']}")
-        return
 
     issues = data.get("issues") or []
     # `data` is `search_all_issues`'s own result (spelled `is_last`, snake_case like this tool's

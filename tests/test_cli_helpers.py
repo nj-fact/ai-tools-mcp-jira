@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -1131,6 +1132,116 @@ def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch
     # appear is the separate human-readable "nextPageToken: ..." prose line the non-json path
     # prints after its table.
     assert "nextPageToken: token-abc-123" not in result.stdout
+
+
+# --- R4: every search-backed command shares one curated shape, not just `search` ----------------
+#
+# Before this fix, `_run_search` took a `curated: bool = False` parameter and only `search`
+# passed `curated=True`. `recent`, `mine`, `fc-open`, `by-status`, and `test-scope` emitted the
+# raw Jira `/search/jql` response as-is under `--json` (never `returned`/`is_last`, sometimes a
+# bare `nextPageToken` prose line, never a page-past-one-page walk) — the identical
+# unverifiable-completeness defect `search` was fixed for, still live in five neighbouring
+# commands whose MCP twins (`jira_recent_issues`, `jira_mine`, `jira_fc_open`, `jira_by_status`,
+# `jira_test_scope_issues`) already used the curated shape. `curated` no longer exists: every
+# search-backed command goes through the same `_run_search` path `search` always did.
+
+
+class _CuratedSearchFakeClient:
+    """A fake client whose `search_all_issues` return value proves the CLI command called
+    through the paging path (not a raw single-page `search_issues` passthrough) and whose shape
+    matches what `JiraClient.search_all_issues` itself now reports: `issues`, `returned`,
+    `is_last`, never `total`.
+    """
+
+    def __init__(self, _config):
+        self.search_all_issues_calls: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def search_all_issues(self, jql, **kwargs):
+        self.search_all_issues_calls.append({"jql": jql, **kwargs})
+        return {
+            "issues": [{"key": "FC-9"}],
+            "returned": 1,
+            "is_last": True,
+        }
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["recent", "--json"],
+        ["mine", "--json"],
+        ["fc-open", "--json"],
+        ["by-status", "In Progress", "--json"],
+        ["test-scope", "--json"],
+    ],
+    ids=["recent", "mine", "fc-open", "by-status", "test-scope"],
+)
+def test_search_backed_commands_share_searchs_curated_json_shape(
+    tmp_path, monkeypatch, args
+) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _CuratedSearchFakeClient)
+
+    result = CliRunner().invoke(cli.app, args)
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["issues"] == [{"key": "FC-9"}]
+    assert payload["returned"] == 1
+    assert payload["is_last"] is True
+    assert "total" not in payload
+    # search_all_issues, not a raw single-page search_issues call: proves the paging path ran.
+    assert "search_all_issues_calls" not in payload
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["recent"],
+        ["mine"],
+        ["fc-open"],
+        ["by-status", "In Progress"],
+        ["test-scope"],
+        ["search", "project = FC"],
+    ],
+    ids=["recent", "mine", "fc-open", "by-status", "test-scope", "search"],
+)
+def test_no_search_backed_command_emits_a_total(tmp_path, monkeypatch, args) -> None:
+    """`/search/jql` never reports a match count; no curated command may invent one."""
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _CuratedSearchFakeClient)
+
+    result = CliRunner().invoke(cli.app, [*args, "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert "total" not in payload
+    assert "returned" in payload
+    assert "is_last" in payload
+
+
+def test_recent_and_mine_limit_options_have_no_upper_cap(tmp_path, monkeypatch) -> None:
+    """R4: there is no external compatibility burden here, so the old `max=100` ceiling that
+    `search --limit` never had (and that silently truncated a caller asking for more without any
+    way to detect the truncation) is lifted from its five neighbouring commands too.
+    """
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _CuratedSearchFakeClient)
+
+    for args in (
+        ["recent", "--limit", "500", "--json"],
+        ["mine", "--limit", "500", "--json"],
+        ["fc-open", "--limit", "500", "--json"],
+        ["by-status", "In Progress", "--limit", "500", "--json"],
+    ):
+        result = CliRunner().invoke(cli.app, args)
+        assert result.exit_code == 0, f"{args}: {result.stdout}{result.stderr}"
 
 
 # --- Read-path fixes: agent-report comment paging, issue parent field, search/comments honesty --

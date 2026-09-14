@@ -1026,6 +1026,11 @@ def test_jira_agent_report_all_path_returns_comments_newest_first(tmp_path, monk
 
 
 def test_jira_get_issue_default_fields_include_parent(tmp_path, monkeypatch) -> None:
+    """R2: `parent` now lives in the one shared `DEFAULT_FIELDS` (see `client.DEFAULT_FIELDS`),
+    not bolted on separately for `jira_get_issue` alone, so this asserts against the shared list
+    directly rather than `[*DEFAULT_FIELDS, "parent"]` — asserting the old shape here would
+    require `parent` twice under the new, single-list contract.
+    """
     config = make_config(tmp_path)
     calls: dict[str, object] = {}
 
@@ -1049,7 +1054,8 @@ def test_jira_get_issue_default_fields_include_parent(tmp_path, monkeypatch) -> 
     result = mcp_server.jira_get_issue("FC-401")
 
     assert result["ok"] is True
-    assert calls["fields"] == [*mcp_server.DEFAULT_FIELDS, "parent"]
+    assert calls["fields"] == mcp_server.DEFAULT_FIELDS
+    assert "parent" in calls["fields"]
 
 
 def test_jira_get_issue_explicit_fields_are_not_augmented_with_parent(
@@ -1501,7 +1507,11 @@ def test_jira_update_comment_dry_run_flattens_current_body_like_the_cli(
     tmp_path, monkeypatch
 ) -> None:
     """F8: current_body must be plain text, matching the CLI's edit-comment dry run, with the
-    raw ADF still available under a clearly different key rather than lost."""
+    raw ADF still available under a clearly different key rather than lost.
+
+    Sweep finding (b): the replacement text is `proposed_body`, matching the CLI's `edit-comment`
+    dry run key for the identical fact; this surface used to call it `new_body` instead.
+    """
     client = _install_update_comment_client(monkeypatch, tmp_path)
 
     result = mcp_server.jira_update_comment("FC-403", "555", "Replacement text")
@@ -1511,7 +1521,8 @@ def test_jira_update_comment_dry_run_flattens_current_body_like_the_cli(
     assert result["current_body"] == "Original comment"
     assert isinstance(result["current_body"], str)
     assert result["current_body_adf"] == _COMMENT_BODY_ADF
-    assert result["new_body"] == "Replacement text"
+    assert result["proposed_body"] == "Replacement text"
+    assert "new_body" not in result
     assert client.updated == []
 
 
@@ -1596,11 +1607,16 @@ def _install_issue_type_client(monkeypatch, tmp_path, **kwargs) -> IssueTypeFake
 
 
 def test_jira_issue_type_options_lists_allowed_values(tmp_path, monkeypatch) -> None:
+    """R3: the key is `allowed_values`, matching the CLI's `issue-type-options` output and the
+    Jira editmeta field it comes from — not `allowed_issue_types`, which used to be this
+    surface's own, differently spelled name for the identical fact.
+    """
     _install_issue_type_client(monkeypatch, tmp_path)
 
     result = mcp_server.jira_issue_type_options("FC-404")
 
-    assert result == {"ok": True, "issue": "FC-404", "allowed_issue_types": ["Bug", "Task"]}
+    assert result == {"ok": True, "issue": "FC-404", "allowed_values": ["Bug", "Task"]}
+    assert "allowed_issue_types" not in result
 
 
 def test_jira_set_issue_type_refuses_a_disallowed_type_without_writing(
@@ -1698,12 +1714,20 @@ def _install_sprint_client(monkeypatch, tmp_path, **kwargs) -> SprintFakeClient:
 
 
 def test_jira_list_boards_returns_client_result(tmp_path, monkeypatch) -> None:
+    """Sweep finding (a)/(b): `list_boards`/`list_board_sprints` used to return the bare raw
+    Jira page with no `returned`/`is_last`, unlike the CLI's `boards`/`sprints` commands, which
+    already curate exactly this shape (see `cli.boards`, `cli.sprints`). A missing `isLast` must
+    surface as `None` (unknown), never default to `True`, matching `search_all_issues`.
+    """
     _install_sprint_client(monkeypatch, tmp_path)
 
     result = mcp_server.jira_list_boards()
 
     assert result["ok"] is True
     assert result["boards"]["values"][0]["id"] == 7
+    assert result["boards"]["returned"] == 1
+    assert result["boards"]["is_last"] is None
+    assert "total" not in result["boards"]
 
 
 def test_jira_list_board_sprints_returns_client_result(tmp_path, monkeypatch) -> None:
@@ -1713,6 +1737,8 @@ def test_jira_list_board_sprints_returns_client_result(tmp_path, monkeypatch) ->
 
     assert result["ok"] is True
     assert result["sprints"]["values"][0]["id"] == 42
+    assert result["sprints"]["returned"] == 1
+    assert result["sprints"]["is_last"] is None
 
 
 def test_jira_get_issue_sprints_returns_the_issues_sprints(tmp_path, monkeypatch) -> None:
