@@ -211,6 +211,17 @@ _NO_GUARD_ALLOWLIST: dict[tuple[str, str, str], str] = {
         "independently confirms that target state regardless of what a concurrent editor did to "
         "parent in between."
     ),
+    ("cli", "drift_labels", "edit_issue"): (
+        "Sends only Jira `update` operations (labels add/remove), never a `fields` rewrite of the "
+        "labels array. The server applies each operation against whatever the array currently "
+        "holds, so there is no read-modify-write to lose and nothing for a guard token to "
+        "protect: a concurrent editor's label survives by construction rather than by a "
+        "check-then-act race the guard could only narrow."
+    ),
+    ("mcp_server", "jira_update_drift_labels", "edit_issue"): (
+        "Same reasoning as cli.drift_labels: atomic label operations, no whole-array rewrite, so "
+        "a guard token would protect nothing."
+    ),
     ("mcp_server", "jira_clear_issue_parent", "edit_issue"): (
         "Same reasoning as cli.clear_parent: a single-field clear verified by reread, not a "
         "read-transform-whole-field rewrite."
@@ -233,6 +244,20 @@ def _package_modules() -> dict[str, ModuleType]:
         short_name = module_info.name.rsplit(".", 1)[-1]
         modules[short_name] = module
     return modules
+
+
+def _is_real_guard_token(keyword: ast.keyword) -> bool:
+    """True only for `expect_updated=<something that could be a token>`.
+
+    A literal `expect_updated=None` is NOT a guard: `_guarded_issue_put` reads None as "no guard
+    requested" and skips the check entirely. Counting the keyword's mere presence would let any
+    read-modify-write opt out of this test by spelling the default, which is the silent hole this
+    file exists to close. A deliberate unguarded write therefore has to say so once in
+    `_NO_GUARD_ALLOWLIST`, with a reason, rather than in a keyword a reader skims past.
+    """
+    if keyword.arg != "expect_updated":
+        return False
+    return not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None)
 
 
 class _EditCallVisitor(ast.NodeVisitor):
@@ -260,7 +285,7 @@ class _EditCallVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in _GUARDED_EDIT_METHODS:
-            guarded = any(kw.arg == "expect_updated" for kw in node.keywords)
+            guarded = any(_is_real_guard_token(kw) for kw in node.keywords)
             function_name = self._stack[-1] if self._stack else "<module>"
             self.calls.append((function_name, node.func.attr, guarded))
         self.generic_visit(node)
