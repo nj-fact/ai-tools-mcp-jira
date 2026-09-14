@@ -162,11 +162,12 @@ _SEARCH_PAGE_SIZE = 100
 def _normalize_is_last(payload: dict[str, Any]) -> dict[str, Any]:
     """Rename an aggregated search payload's completeness key to this file's `is_last`.
 
-    `client.search_all_issues` is being migrated from `isLast` to `is_last` independently of
-    this file, so this is tolerant of either spelling on input and always emits `is_last` on
-    output. Never invents a value: a payload carrying neither key stays `None`, rather than
-    the `True` this used to default to, so an aggregation that never confirmed completeness is
-    never reported as complete.
+    `client.search_all_issues` already returns `is_last`, not Jira's own `isLast`; that
+    migration is complete. This stays tolerant of either spelling on input anyway, as a cheap
+    defence against a future regression on that side, and always emits `is_last` on output.
+    Never invents a value: a payload carrying neither key stays `None`, rather than the `True`
+    this used to default to, so an aggregation that never confirmed completeness is never
+    reported as complete.
     """
     result = dict(payload)
     if "is_last" in result:
