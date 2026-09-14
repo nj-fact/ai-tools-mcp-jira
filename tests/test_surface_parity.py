@@ -105,6 +105,29 @@ def test_guard_unavailable_error_type_is_pinned_to_one_spelling_on_both_surfaces
     assert f"`{_CONCURRENT_EDIT_GUARD_UNAVAILABLE}`" in client_source
 
 
+# FC-492 backwards-move incident: `transition`/`jira_transition_issue` gained three refusal
+# `error_type`s (a backwards or undeterminable-direction move, a missing required field, and an
+# unmatched transition name). Pin all three spellings on both surfaces the same way H3 pins
+# `concurrent_edit_guard_unavailable`, so a future edit to either file cannot rename one locally
+# and leave the two surfaces reporting the same fact under two different names.
+_TRANSITION_ERROR_TYPES = (
+    "transition_direction_refused",
+    "transition_fields_missing",
+    "transition_not_found",
+)
+
+
+def test_transition_refusal_error_types_are_pinned_to_the_same_spelling_on_both_surfaces() -> None:
+    cli_source = inspect.getsource(cli)
+    mcp_source = inspect.getsource(mcp_server)
+
+    for error_type in _TRANSITION_ERROR_TYPES:
+        assert f'"{error_type}"' in cli_source, f"cli.py must emit error_type {error_type!r}"
+        assert f'"{error_type}"' in mcp_source, (
+            f"mcp_server.py must emit error_type {error_type!r}"
+        )
+
+
 def test_search_backed_paths_share_the_same_completeness_keys_never_a_total() -> None:
     """Both surfaces must spell "how many issues came back" and "did this response return
     everything" the same way — `returned` and `is_last` — never Jira's raw `isLast`, and never a

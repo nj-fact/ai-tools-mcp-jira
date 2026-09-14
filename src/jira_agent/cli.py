@@ -21,10 +21,15 @@ from jira_agent.client import (
     JiraMissingConcurrencyTokenError,
     SprintMultiRemovalError,
     SprintPreconditionError,
+    TransitionDirectionRefusedError,
+    TransitionFieldsMissingError,
     adf_contains_media_id,
+    check_transition_direction,
     create_issue_payload,
+    describe_transition_options,
     edit_issue_payload,
     issue_link_payload,
+    issue_status_category,
     issue_type_allowed_values,
     patch_adf_description_section,
     png_dimensions,
@@ -35,6 +40,9 @@ from jira_agent.client import (
     sprint_removal_blast_radius,
     sprint_removal_verification_results,
     sprint_verification_results,
+    transition_fields_payload,
+    transition_required_fields_missing,
+    transition_target_category,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -147,6 +155,26 @@ def _field_list(value: str | None) -> list[str] | None:
         return None
     fields = [item.strip() for item in value.split(",") if item.strip()]
     return fields or None
+
+
+def _parse_transition_fields(values: list[str] | None) -> dict[str, str]:
+    """Parse repeatable `--field NAME=VALUE` options into a `{name: value}` mapping.
+
+    A malformed entry (no `=`, or an empty NAME) is a local usage error -- it needs no Jira read
+    to detect -- so it exits 2, the same code every other pure-argument-shape refusal in this
+    file uses, distinct from the transition-specific refusals below that need a live transitions
+    read first. A name repeated across multiple `--field` options keeps its LAST value, the same
+    "last one wins" rule `dict` assignment already gives every other repeated-key case here.
+    """
+    fields: dict[str, str] = {}
+    for raw in values or []:
+        name, separator, value = raw.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            _print_error("Invalid --field:", f"{raw!r} (expected NAME=VALUE)")
+            raise typer.Exit(2)
+        fields[name] = value
+    return fields
 
 
 def _csv_list(value: str | None) -> list[str] | None:
@@ -3614,7 +3642,13 @@ def transitions(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """List available transitions for one Jira issue."""
+    """List available transitions for one Jira issue.
+
+    An EMPTY result is not necessarily the end of the workflow: it means Jira offered none of
+    its own applicable transitions to the authenticated account right now, which can mean no
+    permission just as easily as no applicable transition (probed against the real instance:
+    two of three FC issues checked hit exactly this).
+    """
     with _client() as client:
         try:
             data = client.get_transitions(key)
@@ -3630,16 +3664,26 @@ def transitions(
         error_console.print("[red]Unexpected Jira response: transitions is not a list[/red]")
         raise typer.Exit(1)
 
+    if not transitions_data:
+        console.print(
+            "No transitions available for this account on this issue right now "
+            "(no permission or no applicable transition -- not necessarily the end of the "
+            "workflow)."
+        )
+        return
+
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", no_wrap=True)
     table.add_column("Name", no_wrap=True)
     table.add_column("To")
+    table.add_column("Category")
     for transition in transitions_data:
         target = transition.get("to") or {}
         table.add_row(
             str(transition.get("id") or ""),
             str(transition.get("name") or ""),
             str(target.get("name") or ""),
+            str((target.get("statusCategory") or {}).get("name") or ""),
         )
     table_console.print(table)
 
@@ -3651,6 +3695,34 @@ def transition(
         str,
         typer.Argument(help="Transition name or transition ID."),
     ],
+    field: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--field",
+            help=(
+                "Supply one required transition field as NAME=VALUE (repeatable), for example "
+                "--field resolution=\"Won't Do\". NAME is the field id Jira's transition metadata "
+                "names (see `transitions --json` for a given issue); the value is sent as Jira's "
+                "plain string or {\"name\": ...} shape, decided from that field's own schema, not "
+                "hardcoded to any one field id."
+            ),
+        ),
+    ] = None,
+    allow_backwards_transition: Annotated[
+        bool,
+        typer.Option(
+            "--allow-backwards-transition",
+            help=(
+                "Allow a transition whose target status category is EARLIER than the issue's "
+                "current one on the fixed To Do < In Progress < Done order, or whose direction "
+                "could not be determined because a category was missing from Jira's response -- "
+                "both refused by default. This checks the category information Jira's response "
+                "happens to carry, not a safety guarantee about the site's actual workflow: a "
+                "differently configured workflow can make a forward-looking category a real "
+                "regression anyway."
+            ),
+        ),
+    ] = False,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually transition the issue in Jira."),
@@ -3660,14 +3732,45 @@ def transition(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Transition one Jira issue. Defaults to dry-run."""
+    """Transition one Jira issue. Defaults to dry-run.
+
+    Refuses by default when the chosen transition would move the issue backwards (see
+    --allow-backwards-transition) or when it requires a field --field did not supply (naming the
+    field and, when Jira provided them, its allowed values). Both checks run identically in the
+    dry run and under --execute, so a clean dry run predicts the real one.
+    """
+    supplied_fields = _parse_transition_fields(field)
+
     with _client() as client:
         try:
             transition_data = client.get_transitions(key)
             selected = select_transition(transition_data, transition_name_or_id)
             if selected is None:
-                _print_error("No transition found for:", transition_name_or_id)
-                raise typer.Exit(1)
+                _exit_transition_not_found(
+                    key, transition_name_or_id, transition_data, json_mode=json_output
+                )
+
+            issue = client.get_issue(key, fields=["status"])
+            current_category = issue_status_category(issue)
+
+            try:
+                check_transition_direction(
+                    issue_key=key,
+                    transition=selected,
+                    current_category=current_category,
+                    allow_backwards=allow_backwards_transition,
+                )
+            except TransitionDirectionRefusedError as exc:
+                _exit_transition_direction_refused(exc, json_mode=json_output)
+
+            missing = transition_required_fields_missing(selected, supplied_fields)
+            if missing:
+                fields_exc = TransitionFieldsMissingError(
+                    transition_name=str(selected.get("name") or ""), missing=missing
+                )
+                _exit_transition_fields_missing(fields_exc, json_mode=json_output)
+
+            fields_payload = transition_fields_payload(selected, supplied_fields)
 
             if not execute:
                 target = selected.get("to") or {}
@@ -3678,18 +3781,35 @@ def transition(
                     json_mode=json_output,
                 )
                 _say(f"target status: {target.get('name')}", json_mode=json_output)
+                _say(
+                    f"category: {current_category!r} -> "
+                    f"{transition_target_category(selected)!r}",
+                    json_mode=json_output,
+                )
+                if fields_payload:
+                    _say(f"fields: {fields_payload}", json_mode=json_output)
                 if json_output:
-                    _emit_json({"issue": key, "transition": selected, "dry_run": True})
+                    _emit_json(
+                        {
+                            "issue": key,
+                            "transition": selected,
+                            "current_category": current_category,
+                            "fields": fields_payload,
+                            "dry_run": True,
+                        }
+                    )
                 _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             ensure_issue_write_allowed(client.config, client, key)
-            data = client.transition_issue(key, str(selected["id"]))
+            data = client.transition_issue(
+                key, str(selected["id"]), fields=fields_payload or None
+            )
             audit_write(
                 client.config,
                 action="transition_issue",
                 issue_key=key,
-                payload={"transition": selected},
+                payload={"transition": selected, "fields": fields_payload},
                 result=data,
             )
         except JiraWriteSafetyError as exc:
@@ -4629,6 +4749,16 @@ SPRINT_PRECONDITION_EXIT_CODE = 5
 SPRINT_VERIFICATION_EXIT_CODE = 6
 SPRINT_MULTI_REMOVAL_EXIT_CODE = 7
 
+# Distinct from every exit code above (1 API, 2 usage, 3 write-safety, 4 concurrent-edit/guard
+# unavailable, 5-7 sprint): `transition` refuses by default when the chosen transition's target
+# status category is earlier than the issue's current one, or when a category needed to tell
+# could not be read from Jira's response at all (see check_transition_direction /
+# TransitionDirectionRefusedError). A script can tell this refusal apart from every other one
+# above without parsing prose -- in particular from a plain "no transition matched" (exit 1) or a
+# missing-required-field refusal (also exit 1, the same family as an unmatched name: both are
+# "this request could not be resolved against what Jira just returned", not this direction check).
+TRANSITION_DIRECTION_REFUSED_EXIT_CODE = 8
+
 
 def _sprint_locations(sprints: list[dict[str, Any]]) -> str:
     """Human-readable "where a key currently is", for sprint precondition and verification
@@ -4732,6 +4862,104 @@ def _exit_missing_concurrency_token_error(
             }
         )
     raise typer.Exit(CONCURRENT_EDIT_EXIT_CODE) from exc
+
+
+def _exit_transition_not_found(
+    issue_key: str,
+    requested: str,
+    transitions_data: dict[str, Any],
+    *,
+    json_mode: bool,
+) -> None:
+    """Refuse an unmatched transition name/id by listing what IS available, per issue.
+
+    `select_transition` already matches by id or case-insensitive name; this is reached only
+    when neither matched. An EMPTY list gets its own sentence, not silence: two of three FC
+    issues probed against the live instance returned an empty transitions list here, meaning no
+    permission or no applicable transition for the authenticated account right now, not the end
+    of the workflow -- and that is the COMMON case this hits, not the edge one.
+    """
+    options = describe_transition_options(transitions_data)
+    if options:
+        _print_error("No transition found for:", requested)
+        _say(f"Available transitions for {issue_key}:", json_mode=json_mode)
+        for option in options:
+            _say(
+                f"- {option['name']} ({option['id']}) -> {option['to']} "
+                f"[{option['to_category'] or 'unknown category'}]",
+                json_mode=json_mode,
+            )
+        message = f"No transition found for: {requested}"
+    else:
+        message = (
+            f"Jira returned no transitions for {issue_key} for the authenticated account. This "
+            "means no permission or no applicable transition right now, not the end of the "
+            "workflow."
+        )
+        _print_error("No transitions available:", message)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_not_found",
+                "issue": issue_key,
+                "requested": requested,
+                "available_transitions": options,
+                "message": message,
+            }
+        )
+    raise typer.Exit(1)
+
+
+def _exit_transition_direction_refused(
+    exc: TransitionDirectionRefusedError, *, json_mode: bool
+) -> None:
+    """Refuse a backwards, or undeterminable-direction, transition. See
+    TRANSITION_DIRECTION_REFUSED_EXIT_CODE for why this has its own exit code.
+    """
+    _print_error("Transition refused:", exc)
+    _say(
+        "Pass --allow-backwards-transition to do this deliberately.",
+        json_mode=json_mode,
+    )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_direction_refused",
+                "issue": exc.issue_key,
+                "transition": {"id": exc.transition_id, "name": exc.transition_name},
+                "current_category": exc.current_category,
+                "target_category": exc.target_category,
+                "direction": exc.direction,
+                "message": str(exc),
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(TRANSITION_DIRECTION_REFUSED_EXIT_CODE) from exc
+
+
+def _exit_transition_fields_missing(
+    exc: TransitionFieldsMissingError, *, json_mode: bool
+) -> None:
+    """Refuse a transition that requires a field `--field` did not supply. Shares exit code 1
+    with `_exit_transition_not_found`: both are "this request could not be resolved against what
+    Jira just returned", distinguished by `error_type`, not by exit code.
+    """
+    _print_error("Transition refused:", exc)
+    _say("Pass --field NAME=VALUE for each missing field.", json_mode=json_mode)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_fields_missing",
+                "transition": exc.transition_name,
+                "missing_fields": exc.missing,
+                "message": str(exc),
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":

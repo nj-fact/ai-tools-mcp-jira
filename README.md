@@ -385,7 +385,24 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - Run bundled write smoke checks against the configured test issue
 - List and add comments. `comments` defaults to newest first (`--order oldest` to opt back into
   Jira's natural order), and `--all` pages through every comment instead of the `--limit` page
-- List and execute issue transitions
+- List (`transitions`) and execute (`transition`) issue transitions. `select_transition` matches
+  the transition you name by id or case-insensitive name only — there is no "first available
+  transition" fallback on either surface, so an ambiguous or absent name always refuses rather
+  than picking one for you. An unmatched name, or an empty transitions list, lists every
+  transition Jira actually offers (id, target status, target status category) instead of a bare
+  failure; an empty list means no permission or no applicable transition for the authenticated
+  account right now, not the end of the workflow — this is the common case on some issues, not
+  the edge case. `transition` also refuses by default when the chosen transition's target status
+  category is EARLIER than the issue's current one on the fixed To Do < In Progress < Done order,
+  or when a category needed to tell could not be read from Jira's response at all (exit code 8;
+  see below) — pass `--allow-backwards-transition` to do this deliberately. This is a check on
+  the category information Jira's response happens to carry, not a safety guarantee about the
+  site's actual workflow graph: a differently configured workflow can make a forward-looking
+  category a real regression anyway. A transition Jira marks as requiring one or more fields (for
+  example a `resolution` on a "Won't Do"-style transition) is refused before any write until you
+  supply them with repeatable `--field NAME=VALUE` options; the refusal names each missing field
+  and, when Jira provided them, its allowed values. Both refusals run identically in the dry run
+  and under `--execute`, so a clean dry run predicts the real one.
 
 Write actions default to dry-run. Pass `--execute` to actually modify Jira.
 Write actions are blocked unless the issue belongs to `JIRA_WRITE_PROJECT_KEYS`
@@ -663,6 +680,19 @@ before any write, like 5, but for a different reason specific to `sprint-remove`
 `--json`, the three failure states carry distinct `error_type` values —
 `sprint_precondition_failed`, `sprint_multi_removal_refused`, and
 `sprint_verification_unavailable` — so a script never has to parse prose to tell them apart.
+
+`transition` adds exit code 8, beyond every code above: it fires before any write when the
+chosen transition's target status category is EARLIER than the issue's current one, or when a
+category needed to tell could not be read from Jira's response at all, and `--allow-backwards-
+transition` is not set. Under `--json` this carries `error_type: "transition_direction_refused"`
+with `direction` (`"backward"` or `"unknown"`), `current_category`, and `target_category`. This
+checks the category information Jira's response happens to carry, not a safety guarantee about
+the site's actual workflow: it cannot see a differently configured workflow where a
+forward-looking category is still a real regression. An unmatched transition name, and a
+transition missing a required field, share exit code 1 with the generic API error — the same
+family as "this request could not be resolved against what Jira just returned" — distinguished
+under `--json` by `error_type: "transition_not_found"` and `error_type:
+"transition_fields_missing"` respectively, not by a dedicated exit code.
 
 Sprint and issue-type writes follow the same dry-run-by-default, `--execute`-to-write,
 `JIRA_WRITE_PROJECT_KEYS`/`JIRA_WRITE_ISSUE_KEYS`-gated, and audit-logged rules as every other

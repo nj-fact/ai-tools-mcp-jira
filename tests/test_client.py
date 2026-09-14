@@ -14,18 +14,27 @@ from jira_agent.client import (
     JiraClient,
     JiraConcurrentEditError,
     SprintPreconditionError,
+    TransitionDirectionRefusedError,
+    TransitionFieldsMissingError,
     adf_contains_media_id,
     adf_heading_text,
+    check_transition_direction,
     create_issue_payload,
+    describe_transition_options,
     edit_issue_payload,
     is_in_sprint,
     issue_link_payload,
+    issue_status_category,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     sprint_membership_report,
     sprint_verification_results,
+    status_category_rank,
     text_to_adf,
+    transition_fields_payload,
+    transition_required_fields_missing,
+    transition_target_category,
 )
 from jira_agent.config import JiraConfig
 from jira_agent.image_gallery import (
@@ -158,7 +167,11 @@ def test_add_comment_posts_adf_body() -> None:
     )
 
 
-def test_get_transitions_uses_issue_transitions_endpoint() -> None:
+def test_get_transitions_uses_issue_transitions_endpoint_with_fields_expand() -> None:
+    """`expand=transitions.fields` is required so each transition's `fields` metadata (required
+    flags and `allowedValues`) comes back in this same read -- see `JiraClient.get_transitions`'s
+    own docstring and FC-458's probed `resolution` field.
+    """
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -175,7 +188,10 @@ def test_get_transitions_uses_issue_transitions_endpoint() -> None:
 
     client.get_transitions("ABC-123")
 
-    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
+        "?expand=transitions.fields"
+    )
 
 
 def test_transition_issue_posts_transition_id() -> None:
@@ -197,6 +213,32 @@ def test_transition_issue_posts_transition_id() -> None:
     assert client.transition_issue("ABC-123", "31") == {}
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
     assert seen["json"] == '{"transition":{"id":"31"}}'
+
+
+def test_transition_issue_includes_fields_when_supplied() -> None:
+    """A transition that requires a field (FC-458's `resolution`) must be able to carry it in the
+    same POST, shaped exactly as the caller/`transition_fields_payload` built it -- this method
+    must not silently drop a non-empty `fields` argument.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.transition_issue("ABC-123", "811", fields={"resolution": {"name": "Won't Do"}})
+
+    assert seen["json"] == (
+        '{"transition":{"id":"811"},"fields":{"resolution":{"name":"Won\'t Do"}}}'
+    )
 
 
 def test_create_metadata_uses_project_and_issue_type_filters() -> None:
@@ -3991,3 +4033,264 @@ def test_agile_call_uses_per_project_site_url_override() -> None:
         client.add_issues_to_sprint(1, ["FINRP-9"])
 
     assert seen["url"] == "https://other.atlassian.net/rest/agile/1.0/sprint/1/issue"
+
+
+# --- Backwards-transition direction check (jira-agent FC-492 incident) ----------------------
+#
+# FC-492 was moved backwards to Open this afternoon by an agent looping over "the first
+# available transition". Nobody asked for that and nobody noticed until later. These tests pin
+# the direction check that now refuses such a move by default, using the exact response shapes
+# probed today against the real instance: `to.statusCategory.name` present on an offered
+# transition, and `statusCategory.id` values (2/4/3) that must NOT be used as an ordering.
+
+
+def test_status_category_rank_orders_the_three_fixed_categories_case_insensitively() -> None:
+    assert status_category_rank("To Do") == 0
+    assert status_category_rank("in progress") == 1
+    assert status_category_rank("DONE") == 2
+    todo_rank = status_category_rank("To Do")
+    progress_rank = status_category_rank("In Progress")
+    done_rank = status_category_rank("Done")
+    assert todo_rank < progress_rank < done_rank
+
+
+def test_status_category_rank_returns_none_for_missing_or_unrecognized_name() -> None:
+    assert status_category_rank(None) is None
+    assert status_category_rank("") is None
+    assert status_category_rank("Backlog") is None  # not one of Jira's three fixed categories
+
+
+def test_issue_status_category_reads_nested_status_category_name() -> None:
+    issue = {
+        "fields": {"status": {"name": "In Progress", "statusCategory": {"name": "In Progress"}}}
+    }
+    assert issue_status_category(issue) == "In Progress"
+    assert issue_status_category({"fields": {}}) is None
+    assert issue_status_category({}) is None
+
+
+def test_transition_target_category_reads_nested_to_status_category_name() -> None:
+    transition = {"to": {"name": "Closed", "statusCategory": {"name": "Done"}}}
+    assert transition_target_category(transition) == "Done"
+    assert transition_target_category({"to": {"name": "Closed"}}) is None
+    assert transition_target_category({}) is None
+
+
+def test_describe_transition_options_lists_id_name_target_and_category() -> None:
+    data = {
+        "transitions": [
+            {
+                "id": "21",
+                "name": "Start Progress",
+                "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+            },
+            {
+                "id": "31",
+                "name": "Done",
+                "to": {"name": "Done", "statusCategory": {"name": "Done"}},
+            },
+        ]
+    }
+    assert describe_transition_options(data) == [
+        {"id": "21", "name": "Start Progress", "to": "In Progress", "to_category": "In Progress"},
+        {"id": "31", "name": "Done", "to": "Done", "to_category": "Done"},
+    ]
+
+
+def test_describe_transition_options_returns_empty_list_for_malformed_transitions() -> None:
+    """Probed fact: FC-425 and FC-389 both returned an EMPTY transitions list from the live
+    instance. This must produce an empty list here, not an error, so a caller can distinguish
+    "no options" from "response was malformed".
+    """
+    assert describe_transition_options({"transitions": []}) == []
+    assert describe_transition_options({}) == []
+    assert describe_transition_options({"transitions": "not-a-list"}) == []
+
+
+def test_check_transition_direction_allows_forward_and_same_category_without_the_flag() -> None:
+    forward = {
+        "id": "21",
+        "name": "Start Progress",
+        "to": {"statusCategory": {"name": "In Progress"}},
+    }
+    check_transition_direction(
+        issue_key="FC-1", transition=forward, current_category="To Do", allow_backwards=False
+    )  # must not raise
+
+    same = {"id": "5", "name": "Reassign", "to": {"statusCategory": {"name": "In Progress"}}}
+    check_transition_direction(
+        issue_key="FC-1", transition=same, current_category="In Progress", allow_backwards=False
+    )  # must not raise
+
+
+def test_check_transition_direction_allows_wont_do_straight_to_do_to_done() -> None:
+    """FC-458's real, probed transition: "Won't Do" moves a "Prepare" (To Do category) issue
+    straight to "Closed" (Done category). This skips "In Progress" entirely but is still FORWARD
+    and must be allowed without --allow-backwards-transition.
+    """
+    wont_do = {
+        "id": "811",
+        "name": "Won't Do",
+        "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+    }
+    check_transition_direction(
+        issue_key="FC-458", transition=wont_do, current_category="To Do", allow_backwards=False
+    )  # must not raise
+
+
+def test_check_transition_direction_refuses_backward_without_the_flag() -> None:
+    reopen = {"id": "11", "name": "Reopen", "to": {"statusCategory": {"name": "To Do"}}}
+    try:
+        check_transition_direction(
+            issue_key="FC-492",
+            transition=reopen,
+            current_category="In Progress",
+            allow_backwards=False,
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "backward"
+        assert exc.issue_key == "FC-492"
+        assert exc.current_category == "In Progress"
+        assert exc.target_category == "To Do"
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_allows_backward_with_the_flag() -> None:
+    reopen = {"id": "11", "name": "Reopen", "to": {"statusCategory": {"name": "To Do"}}}
+    check_transition_direction(
+        issue_key="FC-492",
+        transition=reopen,
+        current_category="In Progress",
+        allow_backwards=True,
+    )  # must not raise
+
+
+def test_check_transition_direction_refuses_when_current_category_is_missing() -> None:
+    """Probed fact: FC-425 and FC-389 both hit exactly this shape when transitions ARE offered
+    but the caller's own issue read did not resolve a category. Must refuse, not guess.
+    """
+    transition = {"id": "9", "name": "Close", "to": {"statusCategory": {"name": "Done"}}}
+    try:
+        check_transition_direction(
+            issue_key="FC-1", transition=transition, current_category=None, allow_backwards=False
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "unknown"
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_refuses_when_target_category_is_missing() -> None:
+    transition = {"id": "9", "name": "Mystery", "to": {"name": "Somewhere"}}
+    try:
+        check_transition_direction(
+            issue_key="FC-1",
+            transition=transition,
+            current_category="To Do",
+            allow_backwards=False,
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "unknown"
+        assert exc.target_category is None
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_unknown_direction_allowed_with_the_flag() -> None:
+    transition = {"id": "9", "name": "Mystery", "to": {"name": "Somewhere"}}
+    check_transition_direction(
+        issue_key="FC-1",
+        transition=transition,
+        current_category="To Do",
+        allow_backwards=True,
+    )  # must not raise
+
+
+# --- Required transition fields (FC-458's `resolution`) --------------------------------------
+
+
+def _wont_do_transition() -> dict[str, Any]:
+    return {
+        "id": "811",
+        "name": "Won't Do",
+        "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+        "fields": {
+            "resolution": {
+                "required": True,
+                "schema": {"type": "resolution", "system": "resolution"},
+                "allowedValues": [
+                    {"id": "10000", "name": "Done"},
+                    {"id": "10001", "name": "Won't Do"},
+                ],
+            },
+            "worklog": {"required": False, "schema": {"type": "worklog"}},
+        },
+    }
+
+
+def test_transition_required_fields_missing_names_field_and_allowed_values() -> None:
+    missing = transition_required_fields_missing(_wont_do_transition(), None)
+    assert missing == [{"field": "resolution", "allowed_values": ["Done", "Won't Do"]}]
+
+
+def test_transition_required_fields_missing_is_empty_once_supplied() -> None:
+    missing = transition_required_fields_missing(
+        _wont_do_transition(), {"resolution": "Won't Do"}
+    )
+    assert missing == []
+
+
+def test_transition_required_fields_missing_ignores_non_required_fields() -> None:
+    """`worklog` is present but NOT required (probed fact); it must never appear as missing."""
+    missing = transition_required_fields_missing(_wont_do_transition(), {"resolution": "Done"})
+    assert missing == []
+
+
+def test_transition_required_fields_missing_is_empty_when_transition_has_no_fields_metadata() -> (
+    None
+):
+    """A transition read without `expand=transitions.fields` (or one Jira genuinely has no
+    required fields for) has no `fields` key at all; nothing can be checked, so nothing is
+    reported missing.
+    """
+    assert transition_required_fields_missing({"id": "31", "name": "Done"}, None) == []
+
+
+def test_transition_fields_missing_error_message_names_field_and_allowed_values() -> None:
+    exc = TransitionFieldsMissingError(
+        transition_name="Won't Do",
+        missing=[{"field": "resolution", "allowed_values": ["Done", "Won't Do"]}],
+    )
+    message = str(exc)
+    assert "resolution" in message
+    assert "Won't Do" in message
+    assert "Done" in message
+
+
+def test_transition_fields_payload_wraps_reference_field_using_its_own_schema() -> None:
+    """`resolution` is shaped as `{"name": ...}` because ITS metadata carries `allowedValues` --
+    not because the field happens to be named "resolution". A plain string field with no
+    `allowedValues` is sent literally.
+    """
+    transition = _wont_do_transition()
+    transition["fields"]["comment"] = {"required": False, "schema": {"type": "string"}}
+
+    payload = transition_fields_payload(
+        transition, {"resolution": "Won't Do", "comment": "closing as won't do"}
+    )
+
+    assert payload == {
+        "resolution": {"name": "Won't Do"},
+        "comment": "closing as won't do",
+    }
+
+
+def test_transition_fields_payload_passes_through_a_field_absent_from_metadata_as_plain_value() -> (
+    None
+):
+    """A caller-supplied field name the transition's own metadata does not mention at all (no
+    `expand`, or a field Jira did not describe) is passed through literally rather than dropped.
+    """
+    payload = transition_fields_payload({"id": "31", "name": "Done"}, {"comment": "done"})
+    assert payload == {"comment": "done"}

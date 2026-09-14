@@ -3212,3 +3212,354 @@ def test_jira_config_fields_reflects_a_configured_override(tmp_path, monkeypatch
     result = mcp_server.jira_config_fields()
 
     assert result["sprint_field"] == "customfield_99999"
+
+
+# --- jira_list_transitions / jira_transition_issue (FC-492 backwards-move incident) ----------
+#
+# Mirrors tests/test_cli_helpers.py's `transition`/`transitions` CLI coverage: both surfaces
+# must apply the identical direction check, the identical required-fields check, and the
+# identical "name did not match" / "empty list" wording (see tests/test_surface_parity.py).
+
+
+class _McpTransitionFakeClient:
+    def __init__(
+        self,
+        config,
+        *,
+        transitions: dict[str, object],
+        status_category: str | None = "To Do",
+        write_project: str = "FC",
+    ) -> None:
+        self.config = config
+        self._transitions = transitions
+        self._status_category = status_category
+        self._write_project = write_project
+        self.captured_transition_issue: dict[str, object] | None = None
+
+    def __enter__(self) -> _McpTransitionFakeClient:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def get_transitions(self, _issue_key: str) -> dict[str, object]:
+        return self._transitions
+
+    def get_issue(self, issue_key: str, *, fields=None, expand=None) -> dict[str, object]:
+        if fields == ["status"]:
+            status_fields = (
+                {}
+                if self._status_category is None
+                else {"statusCategory": {"name": self._status_category}}
+            )
+            return {"key": issue_key, "fields": {"status": status_fields}}
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": self._write_project}}}
+        return {"key": issue_key, "fields": {}}
+
+    def transition_issue(self, issue_key, transition_id, *, fields=None):
+        self.captured_transition_issue = {
+            "issue_key": issue_key,
+            "transition_id": transition_id,
+            "fields": fields,
+        }
+        return {}
+
+
+def _install_transition_client(
+    monkeypatch, tmp_path, *, transitions, status_category="To Do", write_project="FC"
+) -> _McpTransitionFakeClient:
+    config = make_config(tmp_path)
+    client = _McpTransitionFakeClient(
+        config,
+        transitions=transitions,
+        status_category=status_category,
+        write_project=write_project,
+    )
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+    return client
+
+
+def test_jira_transition_issue_allows_a_forward_move_without_the_flag(
+    tmp_path, monkeypatch
+) -> None:
+    _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-1", transition_name_or_id="Start Progress")
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["current_category"] == "To Do"
+
+
+def test_jira_transition_issue_refuses_a_backwards_move_without_the_flag(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "11",
+                    "name": "Reopen",
+                    "to": {"name": "Open", "statusCategory": {"name": "To Do"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-492", transition_name_or_id="Reopen")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_direction_refused"
+    assert result["direction"] == "backward"
+    assert result["current_category"] == "In Progress"
+    assert result["target_category"] == "To Do"
+    assert client.captured_transition_issue is None
+
+
+def test_jira_transition_issue_allows_a_backwards_move_with_the_flag(tmp_path, monkeypatch) -> None:
+    client = _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "11",
+                    "name": "Reopen",
+                    "to": {"name": "Open", "statusCategory": {"name": "To Do"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+
+    result = mcp_server.jira_transition_issue(
+        key="FC-492",
+        transition_name_or_id="Reopen",
+        execute=True,
+        allow_backwards_transition=True,
+    )
+
+    assert result["ok"] is True
+    assert client.captured_transition_issue == {
+        "issue_key": "FC-492",
+        "transition_id": "11",
+        "fields": None,
+    }
+
+
+def test_jira_transition_issue_allows_a_same_category_move_without_the_flag(
+    tmp_path, monkeypatch
+) -> None:
+    _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "5",
+                    "name": "Reassign",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-1", transition_name_or_id="Reassign")
+
+    assert result["ok"] is True
+
+
+def test_jira_transition_issue_refuses_when_a_category_cannot_be_read(
+    tmp_path, monkeypatch
+) -> None:
+    _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category=None,
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-1", transition_name_or_id="Start Progress")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_direction_refused"
+    assert result["direction"] == "unknown"
+
+    result2 = mcp_server.jira_transition_issue(
+        key="FC-1", transition_name_or_id="Start Progress", allow_backwards_transition=True
+    )
+    assert result2["ok"] is True
+
+
+def test_jira_transition_issue_unmatched_name_lists_available_transitions_with_categories(
+    tmp_path, monkeypatch
+) -> None:
+    _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                },
+                {
+                    "id": "31",
+                    "name": "Done",
+                    "to": {"name": "Done", "statusCategory": {"name": "Done"}},
+                },
+            ]
+        },
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-1", transition_name_or_id="Bogus Name")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_not_found"
+    assert result["available_transitions"] == [
+        {"id": "21", "name": "Start Progress", "to": "In Progress", "to_category": "In Progress"},
+        {"id": "31", "name": "Done", "to": "Done", "to_category": "Done"},
+    ]
+
+
+def test_jira_transition_issue_empty_transitions_list_states_no_permission_or_no_transition(
+    tmp_path, monkeypatch
+) -> None:
+    _install_transition_client(monkeypatch, tmp_path, transitions={"transitions": []})
+
+    result = mcp_server.jira_transition_issue(key="FC-425", transition_name_or_id="Anything")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_not_found"
+    assert result["available_transitions"] == []
+    assert "no permission or no applicable transition" in result["message"]
+    assert "not the end of the workflow" in result["message"]
+
+
+def test_jira_transition_issue_refuses_before_writing_when_a_required_field_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {
+                        "resolution": {
+                            "required": True,
+                            "allowedValues": [
+                                {"id": "10000", "name": "Done"},
+                                {"id": "10001", "name": "Won't Do"},
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    result = mcp_server.jira_transition_issue(key="FC-458", transition_name_or_id="Won't Do")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_fields_missing"
+    assert result["missing_fields"] == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+    assert client.captured_transition_issue is None
+
+
+def test_jira_transition_issue_execute_with_a_supplied_required_field_writes_it(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {
+                        "resolution": {
+                            "required": True,
+                            "allowedValues": [
+                                {"id": "10000", "name": "Done"},
+                                {"id": "10001", "name": "Won't Do"},
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+    )
+
+    result = mcp_server.jira_transition_issue(
+        key="FC-458",
+        transition_name_or_id="Won't Do",
+        execute=True,
+        fields={"resolution": "Won't Do"},
+    )
+
+    assert result["ok"] is True
+    assert client.captured_transition_issue == {
+        "issue_key": "FC-458",
+        "transition_id": "811",
+        "fields": {"resolution": {"name": "Won't Do"}},
+    }
+
+
+def test_jira_list_transitions_returns_raw_transitions_document(tmp_path, monkeypatch) -> None:
+    _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+    )
+
+    result = mcp_server.jira_list_transitions(key="FC-1")
+
+    assert result["ok"] is True
+    assert result["transitions"]["transitions"][0]["to"]["statusCategory"]["name"] == (
+        "In Progress"
+    )

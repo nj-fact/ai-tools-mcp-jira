@@ -29,6 +29,453 @@ def test_select_transition_matches_id_or_case_insensitive_name() -> None:
     assert select_transition(data, "missing") is None
 
 
+# --- `transition` / `transitions` CLI commands (FC-492 backwards-move incident) --------------
+
+
+class _TransitionFakeClient:
+    """One configurable fake for the `transition`/`transitions` CLI command tests.
+
+    `status_category=None` reproduces an issue read that could not resolve a `statusCategory`
+    (the "direction could not be determined" case); every other case names the category directly.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        transitions: dict[str, object],
+        status_category: str | None = "To Do",
+        write_project: str = "FC",
+        transition_result: dict[str, object] | None = None,
+    ) -> None:
+        self.config = config
+        self._transitions = transitions
+        self._status_category = status_category
+        self._write_project = write_project
+        self._transition_result = {} if transition_result is None else transition_result
+        self.captured_transition_issue: dict[str, object] | None = None
+
+    def __enter__(self) -> _TransitionFakeClient:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def get_transitions(self, _issue_key: str) -> dict[str, object]:
+        return self._transitions
+
+    def get_issue(self, issue_key: str, *, fields=None, expand=None) -> dict[str, object]:
+        if fields == ["status"]:
+            status_fields = (
+                {} if self._status_category is None
+                else {"statusCategory": {"name": self._status_category}}
+            )
+            return {"key": issue_key, "fields": {"status": status_fields}}
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": self._write_project}}}
+        return {"key": issue_key, "fields": {}}
+
+    def transition_issue(self, issue_key, transition_id, *, fields=None):
+        self.captured_transition_issue = {
+            "issue_key": issue_key,
+            "transition_id": transition_id,
+            "fields": fields,
+        }
+        return self._transition_result
+
+
+def _patch_transition_client(monkeypatch, fake: _TransitionFakeClient) -> None:
+    """Patch `cli.JiraClient` to return `fake`, binding the REAL config `_client()` loads onto
+    it -- `ensure_issue_write_allowed` reads `client.config.write_issue_keys` /
+    `write_project_keys`, so the fake must carry the actual `JiraConfig`, not the placeholder
+    passed to its constructor.
+    """
+
+    def _factory(config: JiraConfig) -> _TransitionFakeClient:
+        fake.config = config
+        return fake
+
+    monkeypatch.setattr(cli, "JiraClient", _factory)
+
+
+def _transition_config(tmp_path) -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+
+def test_transition_cli_allows_a_forward_move_without_the_flag(tmp_path, monkeypatch) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-1", "Start Progress", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["current_category"] == "To Do"
+    assert payload["transition"]["name"] == "Start Progress"
+
+
+def test_transition_cli_allows_wont_do_straight_to_do_to_done(tmp_path, monkeypatch) -> None:
+    """FC-458's real, probed transition: To Do straight to Done, skipping In Progress. Forward,
+    must be allowed without --allow-backwards-transition.
+    """
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {
+                        "resolution": {
+                            "required": True,
+                            "allowedValues": [
+                                {"id": "10000", "name": "Done"},
+                                {"id": "10001", "name": "Won't Do"},
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["transition", "FC-458", "Won't Do", "--field", "resolution=Won't Do", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["fields"] == {"resolution": {"name": "Won't Do"}}
+
+
+def test_transition_cli_refuses_a_backwards_move_without_the_flag(tmp_path, monkeypatch) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "11",
+                    "name": "Reopen",
+                    "to": {"name": "Open", "statusCategory": {"name": "To Do"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-492", "Reopen", "--json"])
+
+    assert result.exit_code == cli.TRANSITION_DIRECTION_REFUSED_EXIT_CODE, (
+        result.stdout + result.stderr
+    )
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "transition_direction_refused"
+    assert payload["direction"] == "backward"
+    assert payload["current_category"] == "In Progress"
+    assert payload["target_category"] == "To Do"
+    assert fake.captured_transition_issue is None  # refused before any write
+
+
+def test_transition_cli_allows_a_backwards_move_with_the_flag(tmp_path, monkeypatch) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "11",
+                    "name": "Reopen",
+                    "to": {"name": "Open", "statusCategory": {"name": "To Do"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["transition", "FC-492", "Reopen", "--allow-backwards-transition", "--execute", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert fake.captured_transition_issue == {
+        "issue_key": "FC-492",
+        "transition_id": "11",
+        "fields": None,
+    }
+
+
+def test_transition_cli_allows_a_same_category_move_without_the_flag(tmp_path, monkeypatch) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "5",
+                    "name": "Reassign",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category="In Progress",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-1", "Reassign", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+
+
+def test_transition_cli_refuses_when_current_category_cannot_be_read(tmp_path, monkeypatch) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+        status_category=None,
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-1", "Start Progress", "--json"])
+
+    assert result.exit_code == cli.TRANSITION_DIRECTION_REFUSED_EXIT_CODE, (
+        result.stdout + result.stderr
+    )
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "transition_direction_refused"
+    assert payload["direction"] == "unknown"
+    assert payload["current_category"] is None
+
+    # The explicit flag is required to proceed, exactly as for a confirmed backward move.
+    result2 = CliRunner().invoke(
+        cli.app,
+        ["transition", "FC-1", "Start Progress", "--allow-backwards-transition", "--json"],
+    )
+    assert result2.exit_code == 0, result2.stdout + result2.stderr
+
+
+def test_transition_cli_unmatched_name_lists_available_transitions_with_categories(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                },
+                {
+                    "id": "31",
+                    "name": "Done",
+                    "to": {"name": "Done", "statusCategory": {"name": "Done"}},
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-1", "Bogus Name", "--json"])
+
+    assert result.exit_code == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "transition_not_found"
+    assert payload["available_transitions"] == [
+        {"id": "21", "name": "Start Progress", "to": "In Progress", "to_category": "In Progress"},
+        {"id": "31", "name": "Done", "to": "Done", "to_category": "Done"},
+    ]
+
+
+def test_transition_cli_empty_transitions_list_says_no_permission_or_no_applicable_transition(
+    tmp_path, monkeypatch
+) -> None:
+    """Probed fact: FC-425 and FC-389 both returned an EMPTY transitions list from the live
+    instance -- the common case, not the edge case. Must say so explicitly, not just fail.
+    """
+    fake = _TransitionFakeClient(None, transitions={"transitions": []})
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-425", "Anything", "--json"])
+
+    assert result.exit_code == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "transition_not_found"
+    assert payload["available_transitions"] == []
+    assert "no permission or no applicable transition" in payload["message"]
+    assert "not the end of the workflow" in payload["message"]
+
+
+def test_transition_cli_refuses_before_writing_when_a_required_field_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {
+                        "resolution": {
+                            "required": True,
+                            "allowedValues": [
+                                {"id": "10000", "name": "Done"},
+                                {"id": "10001", "name": "Won't Do"},
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-458", "Won't Do", "--json"])
+
+    assert result.exit_code == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "transition_fields_missing"
+    assert payload["missing_fields"] == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+    assert fake.captured_transition_issue is None  # refused before any write
+
+
+def test_transition_cli_execute_with_a_supplied_required_field_writes_it(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {
+                        "resolution": {
+                            "required": True,
+                            "allowedValues": [
+                                {"id": "10000", "name": "Done"},
+                                {"id": "10001", "name": "Won't Do"},
+                            ],
+                        }
+                    },
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "transition",
+            "FC-458",
+            "Won't Do",
+            "--field",
+            "resolution=Won't Do",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert fake.captured_transition_issue == {
+        "issue_key": "FC-458",
+        "transition_id": "811",
+        "fields": {"resolution": {"name": "Won't Do"}},
+    }
+
+
+def test_transition_cli_rejects_a_malformed_field_option(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["transition", "FC-1", "Done", "--field", "no-equals"])
+
+    assert result.exit_code == 2, result.stdout + result.stderr
+
+
+def test_transitions_cli_lists_category_column_and_labels_an_empty_list(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "21",
+                    "name": "Start Progress",
+                    "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(cli.app, ["transitions", "FC-1"])
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "In Progress" in result.stdout
+
+    empty_fake = _TransitionFakeClient(None, transitions={"transitions": []})
+    _patch_transition_client(monkeypatch, empty_fake)
+    empty_result = CliRunner().invoke(cli.app, ["transitions", "FC-425"])
+    assert empty_result.exit_code == 0, empty_result.stdout + empty_result.stderr
+    # Normalize whitespace: Rich wraps this sentence across lines at terminal width, so a raw
+    # substring check would pass or fail on wrap position rather than content.
+    normalized = " ".join(empty_result.stdout.split())
+    assert "no permission or no applicable transition" in normalized
+
+
 def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -> None:
     config = JiraConfig.model_validate(
         {
@@ -1740,10 +2187,24 @@ class _JsonExecuteSweepFakeClient:
                     "attachment": [],
                 },
             }
+        if fields == ["status"]:
+            # `transition`'s direction check reads this. Same category as get_transitions' own
+            # "Done" target below, so the sweep's dry run is a same-category move: allowed
+            # without --allow-backwards-transition, exactly like every other command in this
+            # sweep expects a clean dry run with no extra flag.
+            return {"key": issue_key, "fields": {"status": {"statusCategory": {"name": "Done"}}}}
         return {"key": issue_key, "fields": {}}
 
     def get_transitions(self, issue_key):
-        return {"transitions": [{"id": "31", "name": "Done", "to": {"name": "Done"}}]}
+        return {
+            "transitions": [
+                {
+                    "id": "31",
+                    "name": "Done",
+                    "to": {"name": "Done", "statusCategory": {"name": "Done"}},
+                }
+            ]
+        }
 
     def get_comment(self, issue_key, comment_id):
         return {

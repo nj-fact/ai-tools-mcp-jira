@@ -433,13 +433,42 @@ class JiraClient:
         )
 
     def get_transitions(self, issue_key: str) -> dict[str, Any]:
-        return self._request("GET", f"/issue/{issue_key}/transitions", key=issue_key)
+        """List transitions Jira currently offers this account for `issue_key`.
 
-    def transition_issue(self, issue_key: str, transition_id: str) -> dict[str, Any]:
+        Always requests `expand=transitions.fields`, so every transition's `fields` metadata
+        (which fields it requires, and each one's `allowedValues` when Jira has them) comes back
+        in the same read that lists the transitions -- see `transition_required_fields_missing`
+        and `transition_fields_payload`, which are the only things that read `fields`. Probed
+        fact (FC-458): the metadata is per-transition, not a separate call.
+        """
+        return self._request(
+            "GET",
+            f"/issue/{issue_key}/transitions",
+            params={"expand": "transitions.fields"},
+            key=issue_key,
+        )
+
+    def transition_issue(
+        self,
+        issue_key: str,
+        transition_id: str,
+        *,
+        fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Perform one transition, optionally supplying field values it requires.
+
+        `fields` is only sent when non-empty, so a transition that needs none keeps posting the
+        exact `{"transition": {"id": ...}}` body this always sent. See
+        `transition_fields_payload` for how a caller's plain values are shaped against each
+        field's own metadata before reaching here.
+        """
+        payload: dict[str, Any] = {"transition": {"id": transition_id}}
+        if fields:
+            payload["fields"] = fields
         return self._request(
             "POST",
             f"/issue/{issue_key}/transitions",
-            json={"transition": {"id": transition_id}},
+            json=payload,
             key=issue_key,
         )
 
@@ -2168,3 +2197,234 @@ def select_transition(
         if transition_id == transition_name_or_id or name.casefold() == needle:
             return transition
     return None
+
+
+# Jira's three status categories, in workflow order. Probed fact: `statusCategory.id` is 2/4/3
+# for To Do/In Progress/Done respectively -- NOT ordinal -- so this module orders by NAME, never
+# by that numeric id. Keys are casefolded; lookups through `status_category_rank` casefold too.
+_STATUS_CATEGORY_ORDER = {"to do": 0, "in progress": 1, "done": 2}
+
+
+def status_category_rank(category_name: str | None) -> int | None:
+    """Rank one Jira status-category NAME on the fixed To Do < In Progress < Done order.
+
+    Returns None for a missing or unrecognized name rather than guessing a position: an absent
+    `statusCategory`, a typo, or a future fourth category must read as "cannot be ordered", never
+    as the smallest or largest rank.
+    """
+    if not category_name:
+        return None
+    return _STATUS_CATEGORY_ORDER.get(category_name.strip().casefold())
+
+
+def issue_status_category(issue: dict[str, Any]) -> str | None:
+    """Read `fields.status.statusCategory.name` off one issue GET response, or None."""
+    fields = issue.get("fields") or {}
+    status = fields.get("status") or {}
+    category = status.get("statusCategory") or {}
+    name = category.get("name")
+    return str(name) if name else None
+
+
+def transition_target_category(transition: dict[str, Any]) -> str | None:
+    """Read `to.statusCategory.name` off one transition entry, or None."""
+    target = transition.get("to") or {}
+    category = target.get("statusCategory") or {}
+    name = category.get("name")
+    return str(name) if name else None
+
+
+def describe_transition_options(transitions_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """List every transition Jira currently offers: id, name, target status, target category.
+
+    Shared by both surfaces' "the name I was given did not match" and "Jira offered none at all"
+    refusals, so a caller sees exactly what to try next instead of a dead end. Probed fact: two of
+    three real FC issues checked returned an EMPTY transitions list here -- that reflects the
+    authenticated account's current permissions against the workflow, not a dead workflow, and
+    callers are told so explicitly when the list is empty (see each surface's own refusal text).
+    """
+    transitions_list = transitions_data.get("transitions")
+    if not isinstance(transitions_list, list):
+        return []
+    options: list[dict[str, Any]] = []
+    for transition in transitions_list:
+        if not isinstance(transition, dict):
+            continue
+        target = transition.get("to") or {}
+        options.append(
+            {
+                "id": transition.get("id"),
+                "name": transition.get("name"),
+                "to": target.get("name"),
+                "to_category": (target.get("statusCategory") or {}).get("name"),
+            }
+        )
+    return options
+
+
+class TransitionDirectionRefusedError(RuntimeError):
+    """Refuses a transition whose target status category is EARLIER than the issue's current one
+    on the fixed To Do < In Progress < Done order, or whose direction could not be determined at
+    all because a status-category name was missing from Jira's response (`direction="unknown"`).
+
+    This is a check on the category information Jira's own response happens to carry, NOT a
+    safety guarantee about the site's actual workflow graph: a workflow can be configured so a
+    forward-looking category still represents a real regression in practice, and this check
+    cannot see that. Only the caller's explicit opt-in
+    (`--allow-backwards-transition` / `allow_backwards_transition=true`) overrides it, for either
+    `direction`.
+    """
+
+    def __init__(
+        self,
+        *,
+        issue_key: str,
+        transition_id: str,
+        transition_name: str,
+        current_category: str | None,
+        target_category: str | None,
+        direction: str,
+    ) -> None:
+        if direction == "backward":
+            detail = (
+                f"transition {transition_name!r} ({transition_id}) would move {issue_key} from "
+                f"category {current_category!r} back to {target_category!r}"
+            )
+        elif direction == "unknown":
+            detail = (
+                f"the direction of transition {transition_name!r} ({transition_id}) on "
+                f"{issue_key} could not be determined (current category={current_category!r}, "
+                f"target category={target_category!r})"
+            )
+        else:
+            raise ValueError(f"Unrecognized direction: {direction!r}")
+        super().__init__(f"Refusing {detail}.")
+        self.issue_key = issue_key
+        self.transition_id = transition_id
+        self.transition_name = transition_name
+        self.current_category = current_category
+        self.target_category = target_category
+        self.direction = direction
+
+
+def check_transition_direction(
+    *,
+    issue_key: str,
+    transition: dict[str, Any],
+    current_category: str | None,
+    allow_backwards: bool,
+) -> None:
+    """Raise TransitionDirectionRefusedError unless `transition` moves `issue_key` forward or
+    keeps it in the same status category, or the caller explicitly passed `allow_backwards=True`.
+
+    Called identically from both surfaces' dry run and their `--execute` / `execute=true` path,
+    so a clean dry run predicts the real one. "Won't Do" moving To Do straight to Done is FORWARD
+    and is allowed without the flag; a same-category move is allowed too. Only a target category
+    ranked EARLIER than the current one, or a direction this function cannot determine at all
+    (either category name missing or unrecognized), is refused.
+    """
+    target_category = transition_target_category(transition)
+    current_rank = status_category_rank(current_category)
+    target_rank = status_category_rank(target_category)
+
+    direction: str | None
+    if current_rank is None or target_rank is None:
+        direction = "unknown"
+    elif target_rank < current_rank:
+        direction = "backward"
+    else:
+        direction = None
+
+    if direction is not None and not allow_backwards:
+        raise TransitionDirectionRefusedError(
+            issue_key=issue_key,
+            transition_id=str(transition.get("id") or ""),
+            transition_name=str(transition.get("name") or ""),
+            current_category=current_category,
+            target_category=target_category,
+            direction=direction,
+        )
+
+
+class TransitionFieldsMissingError(RuntimeError):
+    """Refuses a transition Jira marks as requiring one or more fields the caller did not supply.
+
+    `missing` is a list of `{"field": <field id>, "allowed_values": [str, ...] | None}` -- the
+    field's `allowedValues` names when Jira's `expand=transitions.fields` provided them (see
+    FC-458's probed `resolution` field), or None when it did not. Raised before any write, from
+    both surfaces' dry run and their execute path, so a caller sees exactly which `--field
+    NAME=VALUE` (CLI) / `fields` entry (MCP) to add, instead of a transition that fails outright
+    at Jira -- or, worse, one that silently could never be performed at all.
+    """
+
+    def __init__(self, *, transition_name: str, missing: list[dict[str, Any]]) -> None:
+        parts = []
+        for entry in missing:
+            allowed = entry.get("allowed_values")
+            if allowed:
+                parts.append(f"{entry['field']} (allowed: {', '.join(allowed)})")
+            else:
+                parts.append(str(entry["field"]))
+        super().__init__(
+            f"Transition {transition_name!r} requires field(s) not supplied: {', '.join(parts)}."
+        )
+        self.transition_name = transition_name
+        self.missing = missing
+
+
+def transition_required_fields_missing(
+    transition: dict[str, Any],
+    supplied_fields: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return every field `transition`'s own `fields` metadata marks required and
+    `supplied_fields` does not name, each with its `allowedValues` names when Jira provided any.
+
+    Reads `transition["fields"]`, populated only when the transitions read used
+    `expand=transitions.fields` (see `JiraClient.get_transitions`); a transition with no `fields`
+    key has nothing to check against and this returns an empty list, exactly as if nothing were
+    required.
+    """
+    fields_meta = transition.get("fields")
+    if not isinstance(fields_meta, dict):
+        return []
+    supplied_names = set((supplied_fields or {}).keys())
+    missing: list[dict[str, Any]] = []
+    for name, meta in fields_meta.items():
+        if not isinstance(meta, dict) or not meta.get("required") or name in supplied_names:
+            continue
+        allowed_values = meta.get("allowedValues")
+        allowed_names = None
+        if isinstance(allowed_values, list):
+            allowed_names = [
+                str(value.get("name"))
+                for value in allowed_values
+                if isinstance(value, dict) and value.get("name")
+            ] or None
+        missing.append({"field": name, "allowed_values": allowed_names})
+    return sorted(missing, key=lambda entry: str(entry["field"]))
+
+
+def transition_fields_payload(
+    transition: dict[str, Any],
+    supplied_fields: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Shape caller-supplied transition field values against `transition`'s own `fields`
+    metadata, keyed exactly as Jira named each field.
+
+    A field whose metadata carries an `allowedValues` list (a reference field, like FC-458's
+    `resolution`) is sent as `{"name": value}`, the shape Jira's transition POST expects for such
+    a field; every other field is sent as the plain supplied value. This is decided from each
+    field's own schema/metadata, not by special-casing the field id `resolution`, so a future
+    required reference field needs no code change here.
+    """
+    fields_meta = transition.get("fields")
+    if not isinstance(fields_meta, dict):
+        fields_meta = {}
+    payload: dict[str, Any] = {}
+    for name, value in (supplied_fields or {}).items():
+        meta = fields_meta.get(name)
+        if isinstance(meta, dict) and isinstance(meta.get("allowedValues"), list):
+            payload[name] = {"name": value}
+        else:
+            payload[name] = value
+    return payload

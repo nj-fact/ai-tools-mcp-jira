@@ -18,10 +18,15 @@ from jira_agent.client import (
     JiraMissingConcurrencyTokenError,
     SprintMultiRemovalError,
     SprintPreconditionError,
+    TransitionDirectionRefusedError,
+    TransitionFieldsMissingError,
     adf_contains_media_id,
+    check_transition_direction,
     create_issue_payload,
+    describe_transition_options,
     edit_issue_payload,
     issue_link_payload,
+    issue_status_category,
     issue_type_allowed_values,
     patch_adf_description_section,
     png_dimensions,
@@ -32,6 +37,8 @@ from jira_agent.client import (
     sprint_removal_blast_radius,
     sprint_removal_verification_results,
     sprint_verification_results,
+    transition_fields_payload,
+    transition_required_fields_missing,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -124,6 +131,63 @@ def _safety_error(exc: JiraWriteSafetyError) -> dict[str, Any]:
         "ok": False,
         "message": str(exc),
         "error_type": "write_safety",
+    }
+
+
+def _transition_not_found_error(
+    *, issue_key: str, requested: str, transitions_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Shape an unmatched transition name/id by listing what IS available, per issue -- the same
+    refusal `cli._exit_transition_not_found` builds, so both surfaces read identically. An EMPTY
+    list gets its own message rather than silence: two of three FC issues probed against the
+    live instance returned an empty transitions list here, meaning no permission or no
+    applicable transition for the authenticated account right now, not the end of the workflow.
+    """
+    options = describe_transition_options(transitions_data)
+    if options:
+        message = f"No transition found for: {requested}"
+    else:
+        message = (
+            f"Jira returned no transitions for {issue_key} for the authenticated account. This "
+            "means no permission or no applicable transition right now, not the end of the "
+            "workflow."
+        )
+    return {
+        "ok": False,
+        "error_type": "transition_not_found",
+        "issue": issue_key,
+        "requested": requested,
+        "available_transitions": options,
+        "message": message,
+    }
+
+
+def _transition_direction_error(exc: TransitionDirectionRefusedError) -> dict[str, Any]:
+    """Shape a TransitionDirectionRefusedError the same way `cli._exit_transition_direction_refused`
+    does, so a caller sees the identical fact regardless of which surface answered it.
+    """
+    return {
+        "ok": False,
+        "error_type": "transition_direction_refused",
+        "issue": exc.issue_key,
+        "transition": {"id": exc.transition_id, "name": exc.transition_name},
+        "current_category": exc.current_category,
+        "target_category": exc.target_category,
+        "direction": exc.direction,
+        "message": str(exc),
+    }
+
+
+def _transition_fields_missing_error(exc: TransitionFieldsMissingError) -> dict[str, Any]:
+    """Shape a TransitionFieldsMissingError the same way `cli._exit_transition_fields_missing`
+    does, so a caller sees the identical fact regardless of which surface answered it.
+    """
+    return {
+        "ok": False,
+        "error_type": "transition_fields_missing",
+        "transition": exc.transition_name,
+        "missing_fields": exc.missing,
+        "message": str(exc),
     }
 
 
@@ -1626,7 +1690,16 @@ def jira_update_comment(
 
 @mcp.tool
 def jira_list_transitions(key: str) -> dict[str, Any]:
-    """List available transitions for one Jira issue."""
+    """List available transitions for one Jira issue.
+
+    An EMPTY `transitions.transitions` list is not necessarily the end of the workflow: it means
+    Jira offered none of its own applicable transitions to the authenticated account right now,
+    which can mean no permission just as easily as no applicable transition (probed against the
+    real instance: two of three FC issues checked hit exactly this). The response also carries
+    each transition's `fields` metadata (required flags and `allowedValues`), via
+    `expand=transitions.fields`, so a caller can see what `jira_transition_issue`'s `fields`
+    argument would need before ever calling it.
+    """
     try:
         with _client() as client:
             return {"ok": True, "transitions": client.get_transitions(key)}
@@ -2440,18 +2513,66 @@ def jira_transition_issue(
     key: str,
     transition_name_or_id: str,
     execute: bool = False,
+    allow_backwards_transition: bool = False,
+    fields: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Transition one Jira issue by transition name or ID. Defaults to dry-run."""
+    """Transition one Jira issue by transition name or ID. Defaults to dry-run.
+
+    Refuses (`error_type: "transition_direction_refused"`) by default when the chosen
+    transition's target status category is EARLIER than the issue's current one on the fixed
+    To Do < In Progress < Done order, or when either category could not be read from Jira's
+    response at all -- pass allow_backwards_transition=true to proceed deliberately. This checks
+    the category information Jira's response happens to carry, not a safety guarantee about the
+    site's actual workflow: a differently configured workflow can make a forward-looking category
+    a real regression anyway.
+
+    Refuses (`error_type: "transition_fields_missing"`) before writing when the transition
+    requires a field `fields` did not supply, naming it and, when Jira provided them, its allowed
+    values. Pass `fields` as `{field_id: value}`; a reference field (like FC-458's `resolution`)
+    is shaped as Jira's `{"name": value}` from that field's own metadata, not by special-casing
+    the field id `resolution`.
+
+    An unmatched `transition_name_or_id` returns `error_type: "transition_not_found"` together
+    with every transition Jira DID offer (id, name, target status, target category), so a caller
+    can pick one instead of guessing why the name did not match -- including the case where Jira
+    offered none at all, which means no permission or no applicable transition right now, not the
+    end of the workflow.
+
+    Both refusals above run identically in the dry run and under execute=true, so a clean dry run
+    predicts the real one.
+    """
     try:
         with _client() as client:
             transitions = client.get_transitions(key)
             selected = select_transition(transitions, transition_name_or_id)
             if selected is None:
-                return {
-                    "ok": False,
-                    "message": f"No transition found for: {transition_name_or_id}",
-                    "transitions": transitions,
-                }
+                return _transition_not_found_error(
+                    issue_key=key,
+                    requested=transition_name_or_id,
+                    transitions_data=transitions,
+                )
+
+            issue = client.get_issue(key, fields=["status"])
+            current_category = issue_status_category(issue)
+
+            try:
+                check_transition_direction(
+                    issue_key=key,
+                    transition=selected,
+                    current_category=current_category,
+                    allow_backwards=allow_backwards_transition,
+                )
+            except TransitionDirectionRefusedError as exc:
+                return _transition_direction_error(exc)
+
+            missing = transition_required_fields_missing(selected, fields)
+            if missing:
+                fields_exc = TransitionFieldsMissingError(
+                    transition_name=str(selected.get("name") or ""), missing=missing
+                )
+                return _transition_fields_missing_error(fields_exc)
+
+            fields_payload = transition_fields_payload(selected, fields)
 
             if not execute:
                 return {
@@ -2459,19 +2580,21 @@ def jira_transition_issue(
                     "dry_run": True,
                     "issue": key,
                     "transition": selected,
+                    "current_category": current_category,
+                    "fields": fields_payload,
                     "message": "Pass execute=true to transition this issue in Jira.",
                 }
 
             ensure_issue_write_allowed(client.config, client, key)
-            client.transition_issue(key, str(selected["id"]))
+            client.transition_issue(key, str(selected["id"]), fields=fields_payload or None)
             audit_write(
                 client.config,
                 action="transition_issue",
                 issue_key=key,
-                payload={"transition": selected},
+                payload={"transition": selected, "fields": fields_payload},
                 result={},
             )
-            return {"ok": True, "issue": key, "transition": selected}
+            return {"ok": True, "issue": key, "transition": selected, "fields": fields_payload}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
