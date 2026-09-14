@@ -11,6 +11,18 @@ import httpx
 
 from jira_agent.config import DEFAULT_CREDENTIAL_SOURCE, JiraConfig
 
+# Jira Cloud exposes two REST families this client reaches: the platform API this class was
+# originally built against, and the Agile API that carries boards, sprints, and backlog moves.
+# Both honour the same per-project credential lookup; they differ only in this path prefix.
+API_BASE_PATH = "/rest/api/3"
+AGILE_BASE_PATH = "/rest/agile/1.0"
+
+# The sprint custom field id probed on this Jira site (schema
+# com.pyxis.greenhopper.jira:gh-sprint). Field ids are per-site, like story_points_field in
+# config.py, but this one is a method parameter default rather than a config key — see
+# get_issue_sprints.
+DEFAULT_SPRINT_FIELD = "customfield_10020"
+
 
 class JiraApiError(RuntimeError):
     def __init__(
@@ -25,6 +37,36 @@ class JiraApiError(RuntimeError):
         self.details = details
 
 
+class JiraConcurrentEditError(JiraApiError):
+    """A guarded whole-field rewrite found the issue had changed since it was read.
+
+    Subclasses JiraApiError, not RuntimeError directly, so existing callers that already catch
+    JiraApiError broadly (for example to report a failed write to an operator) keep catching
+    this too, while a caller that cares specifically about a lost-update race can still isinstance
+    against this narrower type and inspect expected_updated / found_updated.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        issue_key: str,
+        expected_updated: str,
+        found_updated: str,
+    ) -> None:
+        super().__init__(
+            message,
+            details={
+                "issue_key": issue_key,
+                "expected_updated": expected_updated,
+                "found_updated": found_updated,
+            },
+        )
+        self.issue_key = issue_key
+        self.expected_updated = expected_updated
+        self.found_updated = found_updated
+
+
 class JiraClient:
     def __init__(
         self,
@@ -35,19 +77,26 @@ class JiraClient:
     ) -> None:
         self.config = config
         self._transport = transport
-        self._clients: dict[str, httpx.Client] = {}
+        self._clients: dict[tuple[str, str], httpx.Client] = {}
         self._owned_clients: list[httpx.Client] = []
         if http_client is not None:
-            self._clients[DEFAULT_CREDENTIAL_SOURCE] = http_client
+            self._clients[(DEFAULT_CREDENTIAL_SOURCE, API_BASE_PATH)] = http_client
 
-    def _http_client_for(self, key: str | None) -> httpx.Client:
-        """Return the HTTP client for a project or issue key, one per credential set."""
+    def _http_client_for(self, key: str | None, *, base_path: str = API_BASE_PATH) -> httpx.Client:
+        """Return the HTTP client for one (credential set, API base) pair, cached per pair.
+
+        The credential lookup is unchanged from before the Agile API was added: it is keyed by
+        project or issue key exactly as ``config.credentials_for`` already resolves it. Only the
+        cache key grew a second component so the same credential set can serve both a
+        ``/rest/api/3`` client and a ``/rest/agile/1.0`` client without one evicting the other.
+        """
         source = self.config.credential_source_for(key)
-        client = self._clients.get(source)
+        cache_key = (source, base_path)
+        client = self._clients.get(cache_key)
         if client is None:
             credentials = self.config.credentials_for(key)
             kwargs: dict[str, Any] = {
-                "base_url": f"{credentials.site_url}/rest/api/3",
+                "base_url": f"{credentials.site_url}{base_path}",
                 "auth": (credentials.email, credentials.api_token.get_secret_value()),
                 "timeout": self.config.timeout_seconds,
                 "headers": {
@@ -58,16 +107,16 @@ class JiraClient:
             if self._transport is not None:
                 kwargs["transport"] = self._transport
             client = httpx.Client(**kwargs)
-            self._clients[source] = client
+            self._clients[cache_key] = client
             self._owned_clients.append(client)
         return client
 
     def close(self) -> None:
         """Close the HTTP clients this instance created; injected clients stay open."""
-        for source, client in list(self._clients.items()):
+        for cache_key, client in list(self._clients.items()):
             if client in self._owned_clients:
                 client.close()
-                del self._clients[source]
+                del self._clients[cache_key]
         self._owned_clients.clear()
 
     def __enter__(self) -> JiraClient:
@@ -112,19 +161,139 @@ class JiraClient:
             params["nextPageToken"] = next_page_token
         return self._request("GET", "/search/jql", params=params, key=project_key)
 
+    _MAX_SEARCH_PAGES = 50
+
+    def search_all_issues(
+        self,
+        jql: str,
+        *,
+        limit: int | None = None,
+        fields: Iterable[str] | None = None,
+        page_size: int = 100,
+        project_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Page through `/search/jql` by following `nextPageToken` until done or `limit` is met.
+
+        This endpoint reports no total match count at all, only `issues`, `isLast`, and an opaque
+        `nextPageToken` — see `approximate_issue_count` for the only way this API exposes a count.
+        The returned dict therefore never carries a `total` key; inventing one here would be
+        exactly the kind of fabricated number this method exists to avoid.
+
+        Bounded to `_MAX_SEARCH_PAGES` requests, and stops early on a page that comes back with no
+        issues even if `isLast` has not yet turned true, since there is nothing left to collect.
+        """
+        issues: list[dict[str, Any]] = []
+        is_last = True
+        next_token: str | None = None
+        token: str | None = None
+        for _ in range(self._MAX_SEARCH_PAGES):
+            remaining = None if limit is None else limit - len(issues)
+            if remaining is not None and remaining <= 0:
+                break
+            page_limit = page_size if remaining is None else min(page_size, remaining)
+            page = self.search_issues(
+                jql,
+                limit=page_limit,
+                fields=fields,
+                next_page_token=token,
+                project_key=project_key,
+            )
+            page_issues = page.get("issues") or []
+            is_last = bool(page.get("isLast", True))
+            next_token = page.get("nextPageToken")
+            if not page_issues:
+                break
+            issues.extend(page_issues)
+            if is_last:
+                break
+            token = next_token
+
+        result: dict[str, Any] = {
+            "issues": issues,
+            "returned": len(issues),
+            "isLast": is_last,
+        }
+        if not is_last and next_token:
+            result["nextPageToken"] = next_token
+        return result
+
+    def approximate_issue_count(self, jql: str, *, project_key: str | None = None) -> int:
+        """Return Jira's approximate match count for a JQL query.
+
+        This is a read in intent — it looks up a count, nothing more — but the endpoint Jira
+        provides for it is a POST (`/search/approximate-count`), unlike every other lookup in this
+        class. Naming and documenting that here is deliberate: a caller must not assume GET-like
+        idempotency or cache-ability from the verb alone. This is also the only number this API
+        gives for a `/search/jql` query, so the caller is responsible for labelling it approximate
+        rather than presenting it as an exact total.
+        """
+        data = self._request(
+            "POST",
+            "/search/approximate-count",
+            json={"jql": jql},
+            key=project_key,
+        )
+        return data.get("count")
+
     def list_comments(
         self,
         issue_key: str,
         *,
         start_at: int = 0,
         limit: int = 20,
+        order_by: str | None = None,
     ) -> dict[str, Any]:
+        """Return one page of an issue's comments, oldest first unless `order_by` says otherwise.
+
+        Jira's own default order for this endpoint is oldest-first, which is easy to mistake for
+        "most recent" when only a handful are fetched. Pass ``order_by="-created"`` to get
+        newest-first instead; the parameter is passed through as the ``orderBy`` query parameter
+        only when set, so the unguarded default stays exactly what it was before.
+        """
+        params: dict[str, Any] = {"startAt": start_at, "maxResults": limit}
+        if order_by:
+            params["orderBy"] = order_by
         return self._request(
             "GET",
             f"/issue/{issue_key}/comment",
-            params={"startAt": start_at, "maxResults": limit},
+            params=params,
             key=issue_key,
         )
+
+    _MAX_COMMENT_PAGES = 50
+
+    def list_all_comments(
+        self,
+        issue_key: str,
+        *,
+        order_by: str | None = None,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        """Page through every comment on an issue and return them as one page-shaped response.
+
+        Pages with startAt/maxResults until the collected count reaches the API-reported
+        ``total`` or a page comes back empty. Bounded to ``_MAX_COMMENT_PAGES`` requests: if a
+        miscounted total or comments deleted mid-page ever kept this from converging, this
+        returns the partial result instead of looping forever.
+        """
+        comments: list[dict[str, Any]] = []
+        total: int | None = None
+        start_at = 0
+        for _ in range(self._MAX_COMMENT_PAGES):
+            page = self.list_comments(
+                issue_key, start_at=start_at, limit=page_size, order_by=order_by
+            )
+            page_comments = page.get("comments") or []
+            page_total = page.get("total")
+            if isinstance(page_total, int):
+                total = page_total
+            if not page_comments:
+                break
+            comments.extend(page_comments)
+            start_at += len(page_comments)
+            if total is not None and len(comments) >= total:
+                break
+        return {"comments": comments, "total": total if total is not None else len(comments)}
 
     def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
         return self._request(
@@ -147,6 +316,13 @@ class JiraClient:
             "PUT",
             f"/issue/{issue_key}/comment/{comment_id}",
             json={"body": text_to_adf(body)},
+            key=issue_key,
+        )
+
+    def delete_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+        return self._request(
+            "DELETE",
+            f"/issue/{issue_key}/comment/{comment_id}",
             key=issue_key,
         )
 
@@ -174,6 +350,24 @@ class JiraClient:
         if issue_type_name:
             params["issuetypeNames"] = issue_type_name
         return self._request("GET", "/issue/createmeta", params=params, key=project_key)
+
+    def get_edit_metadata(self, issue_key: str) -> dict[str, Any]:
+        return self._request("GET", f"/issue/{issue_key}/editmeta", key=issue_key)
+
+    def is_issue_type_allowed(self, issue_key: str, issue_type_name: str) -> bool:
+        """Read editmeta and report whether `issue_type_name` is an allowed issuetype value.
+
+        Lets a caller refuse an issue-type change up front with a readable message instead of
+        sending a PUT that editmeta already shows Jira would reject.
+        """
+        metadata = self.get_edit_metadata(issue_key)
+        issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
+        allowed = issuetype_field.get("allowedValues") or []
+        needle = issue_type_name.strip().casefold()
+        return any(
+            isinstance(value, dict) and str(value.get("name") or "").casefold() == needle
+            for value in allowed
+        )
 
     def create_issue(
         self,
@@ -237,6 +431,51 @@ class JiraClient:
             key=issue_key or project_key,
         )
 
+    def issue_version(self, issue_key: str) -> str:
+        """Return `fields.updated` for use as a whole-field-rewrite concurrency guard token.
+
+        Jira Cloud exposes no ETag or other conditional-write token on the issue resource, so
+        `updated` is the closest thing available: any field write moves it, including one made by
+        another user, automation rule, or workflow post-function the caller never saw.
+        """
+        data = self._request(
+            "GET", f"/issue/{issue_key}", params={"fields": "updated"}, key=issue_key
+        )
+        updated = (data.get("fields") or {}).get("updated")
+        if not isinstance(updated, str) or not updated:
+            raise JiraApiError(
+                f"Issue {issue_key} response did not include a usable updated timestamp",
+                details=data,
+            )
+        return updated
+
+    def _guarded_issue_put(
+        self,
+        issue_key: str,
+        fields: dict[str, Any],
+        *,
+        expect_updated: str | None,
+    ) -> dict[str, Any]:
+        """PUT one issue's fields, checking `updated` immediately beforehand when `expect_updated`
+        is given.
+
+        This is a check-then-act narrowing of the race window, NOT an atomic compare-and-swap:
+        Jira Cloud's issue PUT offers no conditional-write mechanism (no ETag / If-Match), so a
+        change landing between the read below and the PUT that follows it is still silently lost.
+        Passing `expect_updated=None` keeps the previously unguarded behaviour exactly as it was.
+        """
+        if expect_updated is not None:
+            found = self.issue_version(issue_key)
+            if found != expect_updated:
+                raise JiraConcurrentEditError(
+                    f"Issue {issue_key} changed since it was read: expected updated="
+                    f"{expect_updated!r}, found {found!r}. Re-read the issue and retry.",
+                    issue_key=issue_key,
+                    expected_updated=expect_updated,
+                    found_updated=found,
+                )
+        return self._request("PUT", f"/issue/{issue_key}", json={"fields": fields}, key=issue_key)
+
     def edit_issue(
         self,
         issue_key: str,
@@ -249,34 +488,48 @@ class JiraClient:
         clear_parent: bool = False,
         priority: str | None = None,
         story_points: float | None = None,
+        expect_updated: str | None = None,
     ) -> dict[str, Any]:
-        return self._request(
-            "PUT",
-            f"/issue/{issue_key}",
-            json=edit_issue_payload(
-                summary=summary,
-                description=description,
-                labels=labels,
-                fix_versions=fix_versions,
-                parent_key=parent_key,
-                clear_parent=clear_parent,
-                priority=priority,
-                story_points=story_points,
-                story_points_field=self.config.story_points_field,
-            ),
-            key=issue_key,
+        payload = edit_issue_payload(
+            summary=summary,
+            description=description,
+            labels=labels,
+            fix_versions=fix_versions,
+            parent_key=parent_key,
+            clear_parent=clear_parent,
+            priority=priority,
+            story_points=story_points,
+            story_points_field=self.config.story_points_field,
         )
+        return self._guarded_issue_put(issue_key, payload["fields"], expect_updated=expect_updated)
 
     def edit_issue_adf_description(
         self,
         issue_key: str,
         description: dict[str, Any],
+        *,
+        expect_updated: str | None = None,
     ) -> dict[str, Any]:
-        return self._request(
-            "PUT",
-            f"/issue/{issue_key}",
-            json={"fields": {"description": description}},
-            key=issue_key,
+        return self._guarded_issue_put(
+            issue_key, {"description": description}, expect_updated=expect_updated
+        )
+
+    def set_issue_type(
+        self,
+        issue_key: str,
+        issue_type_name: str,
+        *,
+        expect_updated: str | None = None,
+    ) -> dict[str, Any]:
+        """Change one issue's issue type, honouring the same concurrency guard as edit_issue.
+
+        Call `is_issue_type_allowed` first to refuse early when `issue_type_name` is not among
+        the target project's allowed issuetype values; this method sends the PUT unconditionally.
+        """
+        return self._guarded_issue_put(
+            issue_key,
+            {"issuetype": {"name": issue_type_name}},
+            expect_updated=expect_updated,
         )
 
     def link_issues(
@@ -383,6 +636,76 @@ class JiraClient:
             key=issue_key,
         )
 
+    # --- Agile API: boards, sprints, and backlog -----------------------------------------
+
+    def list_boards(
+        self,
+        *,
+        board_type: str | None = None,
+        name: str | None = None,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"maxResults": max_results}
+        if board_type:
+            params["type"] = board_type
+        if name:
+            params["name"] = name
+        return self._request("GET", "/board", params=params, base_path=AGILE_BASE_PATH)
+
+    def list_board_sprints(
+        self,
+        board_id: int | str,
+        *,
+        state: str | None = None,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"maxResults": max_results}
+        if state:
+            params["state"] = state
+        return self._request(
+            "GET",
+            f"/board/{board_id}/sprint",
+            params=params,
+            base_path=AGILE_BASE_PATH,
+        )
+
+    def get_issue_sprints(
+        self,
+        issue_key: str,
+        *,
+        sprint_field: str = DEFAULT_SPRINT_FIELD,
+    ) -> list[dict[str, Any]]:
+        """Return the parsed sprint objects from an issue's sprint custom field.
+
+        `sprint_field` defaults to the `customfield_10020` id probed on this Jira site (schema
+        `com.pyxis.greenhopper.jira:gh-sprint`); the id is not guaranteed to match on another
+        site. This follows the same pattern as `config.story_points_field` but is not wired
+        through config.py, whose per-project override machinery belongs to another worker's
+        files right now — a `JIRA_SPRINT_FIELD`-style config key would be the better long-term
+        home for this default once that file is this worker's to change.
+        """
+        issue = self.get_issue(issue_key, fields=[sprint_field])
+        value = (issue.get("fields") or {}).get(sprint_field)
+        return list(value) if isinstance(value, list) else []
+
+    def add_issues_to_sprint(self, sprint_id: int | str, issue_keys: list[str]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/sprint/{sprint_id}/issue",
+            json={"issues": list(issue_keys)},
+            key=issue_keys[0] if issue_keys else None,
+            base_path=AGILE_BASE_PATH,
+        )
+
+    def move_issues_to_backlog(self, issue_keys: list[str]) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/backlog/issue",
+            json={"issues": list(issue_keys)},
+            key=issue_keys[0] if issue_keys else None,
+            base_path=AGILE_BASE_PATH,
+        )
+
     def _request(
         self,
         method: str,
@@ -391,9 +714,12 @@ class JiraClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         key: str | None = None,
+        base_path: str = API_BASE_PATH,
     ) -> dict[str, Any]:
         try:
-            response = self._http_client_for(key).request(method, path, params=params, json=json)
+            response = self._http_client_for(key, base_path=base_path).request(
+                method, path, params=params, json=json
+            )
         except httpx.HTTPError as exc:
             raise JiraApiError(f"Jira request failed before receiving a response: {exc}") from exc
 
@@ -540,7 +866,7 @@ def adf_media_ids(adf: Any) -> list[str]:
         if not isinstance(block, dict) or block.get("type") != "mediaSingle":
             continue
         for media in block.get("content") or []:
-            media_id = ((media.get("attrs") or {}).get("id") if isinstance(media, dict) else None)
+            media_id = (media.get("attrs") or {}).get("id") if isinstance(media, dict) else None
             if media_id is not None:
                 result.append(str(media_id))
     return result

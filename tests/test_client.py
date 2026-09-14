@@ -12,6 +12,7 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    JiraConcurrentEditError,
     adf_contains_media_id,
     adf_heading_text,
     create_issue_payload,
@@ -2829,3 +2830,596 @@ def test_a_non_ascii_name_is_printed_readably_and_still_copies_back() -> None:
         expect_swallowed_headings=_copy_back(message),
     )
     assert patch["swallowed_headings"] == ["Prüfung ⚠ Sicherheit"]
+
+
+# --- Optimistic concurrency guard (issue_version, expect_updated) --------------------------
+
+
+def test_issue_version_reads_updated_field() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {"updated": "2026-09-01T10:00:00.000+0200"}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.issue_version("FC-1") == "2026-09-01T10:00:00.000+0200"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1?fields=updated"
+
+
+def test_edit_issue_adf_description_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(200, json={"id": "FC-1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    adf = {"type": "doc", "version": 1, "content": []}
+    try:
+        client.edit_issue_adf_description("FC-1", adf, expect_updated="T0")
+    except JiraConcurrentEditError as exc:
+        assert exc.issue_key == "FC-1"
+        assert exc.expected_updated == "T0"
+        assert exc.found_updated == "T1"
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    # The mismatch must be caught before the PUT is ever issued.
+    assert calls == ["GET"]
+
+
+def test_edit_issue_adf_description_guard_allows_matching_update() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(200, json={"id": "FC-1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    adf = {"type": "doc", "version": 1, "content": []}
+    result = client.edit_issue_adf_description("FC-1", adf, expect_updated="T1")
+
+    assert result == {"id": "FC-1"}
+    assert calls == ["GET", "PUT"]
+
+
+def test_edit_issue_adf_description_without_guard_sends_no_extra_read() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue_adf_description("FC-1", {"type": "doc", "version": 1, "content": []})
+
+    assert calls == ["PUT"]
+
+
+def test_edit_issue_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    try:
+        client.edit_issue("FC-1", summary="Updated", expect_updated="T0")
+    except JiraConcurrentEditError:
+        pass
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    assert calls == ["GET"]
+
+
+def test_set_issue_type_puts_issuetype_name() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.set_issue_type("FC-1", "Bug") == {}
+    assert seen["method"] == "PUT"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1"
+    assert seen["json"] == {"fields": {"issuetype": {"name": "Bug"}}}
+
+
+def test_set_issue_type_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    try:
+        client.set_issue_type("FC-1", "Bug", expect_updated="T0")
+    except JiraConcurrentEditError:
+        pass
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    assert calls == ["GET"]
+
+
+def test_get_edit_metadata_uses_editmeta_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.get_edit_metadata("FC-1")
+
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1/editmeta"
+
+
+def test_is_issue_type_allowed_matches_allowed_values_case_insensitively() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "fields": {
+                    "issuetype": {
+                        "allowedValues": [
+                            {"id": "10001", "name": "Story"},
+                            {"id": "10002", "name": "Bug"},
+                        ]
+                    }
+                }
+            },
+        )
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.is_issue_type_allowed("FC-1", "bug") is True
+    assert client.is_issue_type_allowed("FC-1", "Epic") is False
+
+
+# --- Comment delete, and update_comment's ADF rendering vs add_comment ----------------------
+
+
+def test_delete_comment_uses_delete_verb_and_path() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.delete_comment("FC-1", "667040") == {}
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1/comment/667040"
+
+
+def test_update_comment_renders_markdown_to_adf_the_same_way_as_add_comment() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode())["body"])
+        return httpx.Response(200, json={"id": "1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    markdown = "**Bold** and a [link](https://example.com)\n\n- one\n- two"
+    client.add_comment("FC-1", markdown)
+    client.update_comment("FC-1", "1", markdown)
+
+    assert bodies[0] == bodies[1] == text_to_adf(markdown)
+
+
+# --- Comment paging and ordering ------------------------------------------------------------
+
+
+def test_list_comments_passes_order_by_only_when_set() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"comments": [], "total": 0})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.list_comments("FC-1", limit=5)
+    client.list_comments("FC-1", limit=5, order_by="-created")
+
+    assert "orderBy" not in seen[0]
+    assert seen[1].endswith("orderBy=-created")
+
+
+def test_list_all_comments_pages_until_total_is_reached() -> None:
+    pages = [
+        {"comments": [{"id": "1"}, {"id": "2"}], "total": 5},
+        {"comments": [{"id": "3"}, {"id": "4"}], "total": 5},
+        {"comments": [{"id": "5"}], "total": 5},
+    ]
+    seen_start_at: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_start_at.append(int(params["startAt"]))
+        return httpx.Response(200, json=pages[len(seen_start_at) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=2)
+
+    assert [comment["id"] for comment in result["comments"]] == ["1", "2", "3", "4", "5"]
+    assert result["total"] == 5
+    assert seen_start_at == [0, 2, 4]
+
+
+def test_list_all_comments_stops_on_an_empty_page() -> None:
+    pages = [
+        {"comments": [{"id": "1"}], "total": 5},
+        {"comments": [], "total": 5},
+    ]
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(200, json=pages[calls["count"]])
+        calls["count"] += 1
+        return response
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=1)
+
+    assert [comment["id"] for comment in result["comments"]] == ["1"]
+    assert result["total"] == 5
+    assert calls["count"] == 2
+
+
+# --- Search paging with no fabricated total, and the approximate-count endpoint -------------
+
+
+def test_search_all_issues_follows_next_page_token_until_is_last() -> None:
+    pages = [
+        {"issues": [{"key": "FC-1"}, {"key": "FC-2"}], "isLast": False, "nextPageToken": "tok-1"},
+        {"issues": [{"key": "FC-3"}, {"key": "FC-4"}], "isLast": False, "nextPageToken": "tok-2"},
+        {"issues": [{"key": "FC-5"}], "isLast": True},
+    ]
+    seen_tokens: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_tokens.append(params.get("nextPageToken"))
+        return httpx.Response(200, json=pages[len(seen_tokens) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC ORDER BY created ASC", page_size=2)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3", "FC-4", "FC-5"]
+    assert result["returned"] == 5
+    assert result["isLast"] is True
+    assert "nextPageToken" not in result
+    assert "total" not in result
+    assert seen_tokens == [None, "tok-1", "tok-2"]
+
+
+def test_search_all_issues_limit_truncates_and_keeps_next_page_token() -> None:
+    pages = [
+        {"issues": [{"key": "FC-1"}, {"key": "FC-2"}], "isLast": False, "nextPageToken": "tok-1"},
+        {"issues": [{"key": "FC-3"}], "isLast": False, "nextPageToken": "tok-2"},
+    ]
+    seen_max_results: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_max_results.append(int(params["maxResults"]))
+        return httpx.Response(200, json=pages[len(seen_max_results) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC", limit=3, page_size=2)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3"]
+    assert result["returned"] == 3
+    assert result["nextPageToken"] == "tok-2"
+    assert result["isLast"] is False
+    assert seen_max_results == [2, 1]
+    assert "total" not in result
+
+
+def test_approximate_issue_count_posts_jql_and_returns_raw_count() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"count": 812})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.approximate_issue_count("project = FC") == 812
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/search/approximate-count"
+    assert seen["json"] == {"jql": "project = FC"}
+
+
+# --- Agile API: boards, sprints, backlog -----------------------------------------------------
+
+
+def test_list_boards_uses_agile_board_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_boards(board_type="scrum", name="FC board", max_results=25)
+
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/agile/1.0/board?maxResults=25&type=scrum&name=FC+board"
+    )
+
+
+def test_list_board_sprints_uses_agile_sprint_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_board_sprints(814, state="active")
+
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/agile/1.0/board/814/sprint?maxResults=50&state=active"
+    )
+
+
+def test_get_issue_sprints_parses_the_sprint_field() -> None:
+    seen: dict[str, str] = {}
+    sprint = {
+        "id": 7340,
+        "name": "10 SEPA-Mandate, Disbursement",
+        "state": "active",
+        "boardId": 814,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {"customfield_10020": [sprint]}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == [sprint]
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/issue/FC-1?fields=customfield_10020"
+    )
+
+
+def test_get_issue_sprints_returns_empty_list_when_field_absent() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"fields": {}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == []
+
+
+def test_add_issues_to_sprint_posts_issue_keys() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        assert client.add_issues_to_sprint(7340, ["FC-1", "FC-2"]) == {}
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/agile/1.0/sprint/7340/issue"
+    assert seen["json"] == {"issues": ["FC-1", "FC-2"]}
+
+
+def test_move_issues_to_backlog_posts_issue_keys() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        assert client.move_issues_to_backlog(["FC-1"]) == {}
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/agile/1.0/backlog/issue"
+    assert seen["json"] == {"issues": ["FC-1"]}
+
+
+def test_agile_calls_use_the_agile_base_and_still_honour_project_credential_overrides() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["Authorization"]))
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_boards()
+        client.add_issues_to_sprint(1, ["FINRP-9"])
+        client.get_issue("FC-1")
+
+    assert seen[0] == (
+        "https://example.atlassian.net/rest/agile/1.0/board?maxResults=50",
+        basic_auth("user@example.com", "token"),
+    )
+    assert seen[1] == (
+        "https://example.atlassian.net/rest/agile/1.0/sprint/1/issue",
+        basic_auth("finrp@example.com", "finrp-token"),
+    )
+    assert seen[2] == (
+        "https://example.atlassian.net/rest/api/3/issue/FC-1",
+        basic_auth("user@example.com", "token"),
+    )
+
+
+def test_agile_call_uses_per_project_site_url_override() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"issues": []})
+
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_PROJECT__FINRP__EMAIL": "finrp@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "finrp-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://other.atlassian.net",
+        }
+    )
+    with JiraClient(config, transport=httpx.MockTransport(handler)) as client:
+        client.add_issues_to_sprint(1, ["FINRP-9"])
+
+    assert seen["url"] == "https://other.atlassian.net/rest/agile/1.0/sprint/1/issue"
