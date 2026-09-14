@@ -104,6 +104,7 @@ uv run jira-agent render-mermaid FC-107
 uv run jira-agent test-issue
 uv run jira-agent agent-report
 uv run jira-agent agent-report FC-107 --changelog 5 --json
+uv run jira-agent agent-report FC-107 --comments all --json
 uv run jira-agent agent-plan-comment --next-step "Run implementation checks."
 uv run jira-agent human-brief --file ./human-brief.md
 uv run jira-agent factory-contract --file ./factory-contract.md --mode comment
@@ -126,8 +127,11 @@ uv run jira-agent assign
 uv run jira-agent assign --execute
 uv run jira-agent recent --limit 5
 uv run jira-agent search "updated >= -30d ORDER BY updated DESC" --limit 5
+uv run jira-agent search "project = FC" --all --json
+uv run jira-agent search "project = FC" --count
 uv run jira-agent issue ABC-123
 uv run jira-agent comments ABC-123 --limit 5
+uv run jira-agent comments ABC-123 --all --order oldest
 uv run jira-agent transitions ABC-123
 uv run jira-agent add-comment ABC-123 "Investigated by local agent." --execute
 uv run jira-agent transition ABC-123 "In Progress" --execute
@@ -297,8 +301,13 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 ## Current Scope
 
 - Read current Jira user with `myself`
-- Fetch one issue with `issue`
-- Search issues with JQL using Jira Cloud REST API v3 enhanced search
+- Fetch one issue with `issue`, including its `parent` by default; a `--fields` value Jira does
+  not return for the issue is called out instead of being silently dropped
+- Search issues with JQL using Jira Cloud REST API v3 enhanced search. This endpoint never reports
+  a total match count, so `search` always states how many issues it returned and whether more
+  remain (`returned`/`is_last`, never a fabricated `total`); `--limit` pages automatically past
+  one page, `--all` pages through every match (and wins over `--limit` when both are given), and
+  `--count` opts into one extra, explicitly-approximate count from `/search/approximate-count`
 - Fetch recently updated issues with `recent`
 - Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
 - Run read-only smoke checks inside the configured FC test scope with `test-scope`
@@ -306,7 +315,10 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - Create arbitrary allowed issue types with labels, parent, priority, story points, and
   Markdown-to-ADF descriptions; optionally select one Markdown section from a preparation file
 - Fetch and assign the configured test issue
-- Build compact agent-friendly issue reports with `agent-report`
+- Build compact agent-friendly issue reports with `agent-report`. `--comments` takes an integer
+  (the newest that many, via `orderBy=-created`) or the literal `all` to page through every
+  comment; the report and its human rendering always state both the true comment count and how
+  many were actually returned, so a caller can tell a short list from a complete one
 - Prepare standardized agent comments with `agent-plan-comment`
 - Write Human Briefs into Jira descriptions with `human-brief`
 - Store Factory Contracts as comments or attachments with `factory-contract`
@@ -338,7 +350,8 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - Inspect issue history with `changelog` or `agent-report --changelog`
 - Inspect local write audit records with `audit-log`
 - Run bundled write smoke checks against the configured test issue
-- List and add comments
+- List and add comments. `comments` defaults to newest first (`--order oldest` to opt back into
+  Jira's natural order), and `--all` pages through every comment instead of the `--limit` page
 - List and execute issue transitions
 
 Write actions default to dry-run. Pass `--execute` to actually modify Jira.

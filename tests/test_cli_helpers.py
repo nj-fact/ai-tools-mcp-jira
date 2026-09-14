@@ -10,6 +10,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from jira_agent import cli
+from jira_agent.client import JiraClient as RealJiraClient
 from jira_agent.client import select_transition
 from jira_agent.config import JiraConfig
 
@@ -924,20 +925,27 @@ def test_issue_cli_json_round_trips_long_and_bracket_bearing_values_byte_identic
 
 
 def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch) -> None:
+    """search --json is curated: it goes through search_all_issues, not raw search_issues,
+
+    and its JSON is `issues`/`returned`/`is_last`/`nextPageToken`, never a fabricated `total`.
+    """
+    fake_issues = [
+        {
+            "key": "FC-1",
+            "fields": {
+                "summary": "s",
+                "status": {"name": "Open"},
+                "assignee": {"displayName": "Ada"},
+                "issuetype": {"name": "Task"},
+                "project": {"key": "FC"},
+                "updated": "2026-09-01T00:00:00.000+0000",
+            },
+        }
+    ]
     fake_response = {
-        "issues": [
-            {
-                "key": "FC-1",
-                "fields": {
-                    "summary": "s",
-                    "status": {"name": "Open"},
-                    "assignee": {"displayName": "Ada"},
-                    "issuetype": {"name": "Task"},
-                    "project": {"key": "FC"},
-                    "updated": "2026-09-01T00:00:00.000+0000",
-                },
-            }
-        ],
+        "issues": fake_issues,
+        "returned": 1,
+        "isLast": False,
         "nextPageToken": "token-abc-123",
     }
 
@@ -951,7 +959,7 @@ def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch
         def __exit__(self, *_args):
             return None
 
-        def search_issues(self, jql, **_kwargs):
+        def search_all_issues(self, jql, **_kwargs):
             return fake_response
 
     monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
@@ -961,11 +969,346 @@ def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch
 
     assert result.exit_code == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
-    assert payload == fake_response
+    assert payload["issues"] == fake_issues
+    assert payload["returned"] == 1
+    assert payload["is_last"] is False
+    assert payload["nextPageToken"] == "token-abc-123"
+    assert "total" not in payload
     # The token legitimately appears as a JSON field in the document above; what must not
     # appear is the separate human-readable "nextPageToken: ..." prose line the non-json path
     # prints after its table.
     assert "nextPageToken: token-abc-123" not in result.stdout
+
+
+# --- Read-path fixes: agent-report comment paging, issue parent field, search/comments honesty --
+
+
+def _agent_report_fake_client(total_comments: int) -> tuple[type, list[tuple[str, object]]]:
+    """A fake JiraClient for `agent-report`, oldest-first source of truth like real Jira.
+
+    Comment ids count up from 1000 in creation order (oldest first). `list_comments` and
+    `list_all_comments` project a newest-first view only when asked for one, exactly like the
+    real endpoint's `orderBy=-created`, so a test can tell a correctly-ordered fetch from an
+    accidentally oldest-first one.
+    """
+    oldest_first = [
+        {
+            "id": str(1000 + i),
+            "author": {"displayName": f"User {i}"},
+            "created": f"2026-01-{i + 1:02d}T00:00:00.000+0000",
+            "body": f"comment {i}",
+        }
+        for i in range(total_comments)
+    ]
+    newest_first = list(reversed(oldest_first))
+    calls: list[tuple[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return {
+                "key": issue_key,
+                "fields": {
+                    "summary": "S",
+                    "status": {"name": "Open", "statusCategory": {"name": "To Do"}},
+                    "assignee": None,
+                    "reporter": None,
+                    "issuetype": {"name": "Task"},
+                    "project": {"key": "FC", "name": "First Cloud Loans"},
+                    "labels": [],
+                    "updated": "2026-01-01T00:00:00.000+0000",
+                    "created": "2026-01-01T00:00:00.000+0000",
+                    "description": None,
+                },
+            }
+
+        def list_comments(self, issue_key, *, limit, order_by=None, start_at=0):
+            calls.append(("list_comments", order_by))
+            source = newest_first if order_by == "-created" else oldest_first
+            return {"comments": source[:limit], "total": total_comments}
+
+        def list_all_comments(self, issue_key, *, order_by=None, page_size=100):
+            calls.append(("list_all_comments", order_by))
+            source = newest_first if order_by == "-created" else oldest_first
+            return {"comments": source, "total": total_comments}
+
+        def get_transitions(self, issue_key):
+            return {"transitions": []}
+
+    return FakeClient, calls
+
+
+def test_agent_report_cli_comments_all_returns_every_comment(tmp_path, monkeypatch) -> None:
+    FakeClient, _calls = _agent_report_fake_client(total_comments=18)
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["agent-report", "FC-1", "--comments", "all", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["comment_count"] == 18
+    assert payload["comments_returned"] == 18
+    assert payload["comments_truncated"] is False
+
+
+def test_agent_report_cli_comments_int_returns_newest_and_flags_truncation(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, calls = _agent_report_fake_client(total_comments=18)
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["agent-report", "FC-1", "--comments", "5", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["comment_count"] == 18
+    assert payload["comments_returned"] == 5
+    assert payload["comments_truncated"] is True
+    returned_ids = [int(c["id"]) for c in payload["comments"]]
+    assert returned_ids == sorted(returned_ids, reverse=True)
+    assert ("list_comments", "-created") in calls
+
+
+def test_agent_report_cli_rejects_a_comments_value_that_is_neither_int_nor_all(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["agent-report", "FC-1", "--comments", "bogus"])
+
+    assert result.exit_code != 0
+    combined = result.stdout + result.stderr
+    assert "bogus" in combined
+    # Old typer-level int coercion also rejects "bogus" (exit 2), but its message never mentions
+    # the "all" alternative; this pins the new, readable validation message instead of that
+    # coincidental overlap.
+    assert "all" in combined.lower()
+
+
+def test_agent_report_cli_human_output_states_both_comment_numbers(tmp_path, monkeypatch) -> None:
+    FakeClient, _calls = _agent_report_fake_client(total_comments=18)
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["agent-report", "FC-1", "--comments", "5"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # The exact phrase, not bare "5"/"18": one of the fake's comment timestamps legitimately
+    # contains "18" (2026-01-18), so a loose substring check would pass against the old code by
+    # coincidence instead of because the new summary line exists.
+    assert "comments: 5 of 18 returned (truncated)" in result.stdout
+
+
+def test_issue_cli_json_shows_parent_field_with_no_fields_argument(tmp_path, monkeypatch) -> None:
+    full_fields = {
+        "summary": "S",
+        "status": {"name": "Open"},
+        "assignee": None,
+        "issuetype": {"name": "Story"},
+        "project": {"key": "FC"},
+        "updated": "2026-09-01T00:00:00.000+0000",
+        "parent": {"key": "FC-349", "fields": {"summary": "Parent epic"}},
+    }
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, *, fields=None, **_kwargs):
+            # A real Jira response only carries what was asked for; project the fixture the
+            # same way so a DEFAULT_FIELDS regression actually starves this test of "parent".
+            projected = (
+                {name: full_fields[name] for name in fields if name in full_fields}
+                if fields
+                else dict(full_fields)
+            )
+            return {"key": issue_key, "fields": projected}
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["issue", "FC-389", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["fields"]["parent"]["key"] == "FC-349"
+
+
+def test_search_cli_limit_pages_past_one_page(tmp_path, monkeypatch) -> None:
+    def make_issues(start: int, count: int) -> list[dict[str, object]]:
+        return [
+            {"key": f"FC-{i}", "fields": {"summary": f"s{i}"}} for i in range(start, start + count)
+        ]
+
+    pages = {
+        None: {"issues": make_issues(0, 100), "isLast": False, "nextPageToken": "p2"},
+        "p2": {"issues": make_issues(100, 100), "isLast": False, "nextPageToken": "p3"},
+        "p3": {"issues": make_issues(200, 50), "isLast": True},
+    }
+    calls: list[object] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_issues(self, jql, *, limit, fields=None, next_page_token=None, project_key=None):
+            calls.append(next_page_token)
+            return pages[next_page_token]
+
+        # Reuse the real paging algorithm against the fake single-page method above, instead of
+        # re-implementing `search_all_issues`'s own already-tested pagination here.
+        _MAX_SEARCH_PAGES = RealJiraClient._MAX_SEARCH_PAGES
+        search_all_issues = RealJiraClient.search_all_issues
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["search", "project = FC", "--limit", "250", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["returned"] == 250
+    assert payload["is_last"] is True
+    assert "total" not in payload
+    assert calls == [None, "p2", "p3"]
+
+
+def test_search_cli_all_returns_everything_and_overrides_limit(tmp_path, monkeypatch) -> None:
+    fake_result = {
+        "issues": [{"key": f"FC-{i}", "fields": {"summary": f"s{i}"}} for i in range(7)],
+        "returned": 7,
+        "isLast": True,
+    }
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_all_issues(self, jql, *, limit=None, fields=None, **_kwargs):
+            captured["limit"] = limit
+            return fake_result
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    # --limit is passed alongside --all on purpose: --all must win.
+    result = CliRunner().invoke(
+        cli.app, ["search", "project = FC", "--all", "--limit", "10", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["returned"] == 7
+    assert payload["is_last"] is True
+    assert captured["limit"] is None
+
+
+def test_search_cli_count_reports_an_explicitly_approximate_total(tmp_path, monkeypatch) -> None:
+    fake_result = {
+        "issues": [{"key": "FC-1", "fields": {"summary": "s"}}],
+        "returned": 1,
+        "isLast": True,
+    }
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_all_issues(self, jql, **_kwargs):
+            return fake_result
+
+        def approximate_issue_count(self, jql, **_kwargs):
+            return 137
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    json_result = CliRunner().invoke(cli.app, ["search", "project = FC", "--count", "--json"])
+    assert json_result.exit_code == 0, json_result.stdout + json_result.stderr
+    payload = json.loads(json_result.stdout)
+    assert payload["approximate_total"] == 137
+    assert "total" not in {k for k in payload if k == "total"}
+
+    human_result = CliRunner().invoke(cli.app, ["search", "project = FC", "--count"])
+    assert human_result.exit_code == 0, human_result.stdout + human_result.stderr
+    assert "approximate" in human_result.stdout.lower()
+
+
+def test_comments_cli_defaults_newest_first_and_all_pages_everything(tmp_path, monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+    oldest_first = [
+        {"id": "1", "author": {"displayName": "A"}, "created": "c1", "body": "first"},
+        {"id": "2", "author": {"displayName": "A"}, "created": "c2", "body": "second"},
+        {"id": "3", "author": {"displayName": "A"}, "created": "c3", "body": "third"},
+    ]
+    newest_first = list(reversed(oldest_first))
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_comments(self, issue_key, *, start_at=0, limit=20, order_by=None):
+            calls.append(("list_comments", order_by))
+            source = newest_first if order_by == "-created" else oldest_first
+            return {"comments": source[:limit], "total": 3}
+
+        def list_all_comments(self, issue_key, *, order_by=None, page_size=100):
+            calls.append(("list_all_comments", order_by))
+            source = newest_first if order_by == "-created" else oldest_first
+            return {"comments": source, "total": 3}
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    default_result = CliRunner().invoke(cli.app, ["comments", "FC-1", "--json"])
+    assert default_result.exit_code == 0, default_result.stdout + default_result.stderr
+    assert ("list_comments", "-created") in calls
+
+    all_result = CliRunner().invoke(cli.app, ["comments", "FC-1", "--all", "--json"])
+    assert all_result.exit_code == 0, all_result.stdout + all_result.stderr
+    all_payload = json.loads(all_result.stdout)
+    assert all_payload["returned"] == all_payload["total"] == 3
 
 
 # --- Every --json/--execute command must fold dry_run into its JSON (item d) --------------------

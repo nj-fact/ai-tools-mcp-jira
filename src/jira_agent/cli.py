@@ -69,7 +69,7 @@ data_console = Console(markup=False, highlight=False, soft_wrap=True)
 # drops the interpretation.
 table_console = Console(markup=False, highlight=False)
 
-DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated"]
+DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated", "parent"]
 
 
 def _client() -> JiraClient:
@@ -217,6 +217,12 @@ def _print_agent_report(report: dict[str, Any]) -> None:
         console.print(description)
 
     console.print("\n[bold]Comments[/bold]")
+    comment_count = report.get("comment_count")
+    comments_returned = report.get("comments_returned")
+    comments_truncated = report.get("comments_truncated")
+    if comments_returned is not None and comment_count is not None:
+        status_word = "truncated" if comments_truncated else "complete"
+        console.print(f"comments: {comments_returned} of {comment_count} returned ({status_word})")
     comments = report.get("comments") or []
     if comments:
         for comment in comments:
@@ -372,11 +378,22 @@ def issue(
     ] = False,
 ) -> None:
     """Fetch one Jira issue."""
+    requested_fields = _field_list(fields)
     with _client() as client:
         try:
-            data = client.get_issue(key, fields=_field_list(fields))
+            data = client.get_issue(key, fields=requested_fields)
         except JiraApiError as exc:
             _exit_api_error(exc)
+
+    if requested_fields:
+        returned_fields = set((data.get("fields") or {}).keys())
+        missing_fields = [name for name in requested_fields if name not in returned_fields]
+        if missing_fields:
+            _say(
+                "[yellow]Jira did not return requested field(s):[/yellow] "
+                f"{', '.join(missing_fields)}",
+                json_mode=json_output,
+            )
 
     if json_output:
         _emit_json(data)
@@ -390,32 +407,59 @@ def comments(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum comments to return."),
+        typer.Option("--limit", min=1, help="Maximum comments to return. Ignored with --all."),
     ] = 20,
     start_at: Annotated[
         int,
-        typer.Option("--start-at", min=0, help="Pagination start offset."),
+        typer.Option("--start-at", min=0, help="Pagination start offset. Ignored with --all."),
     ] = 0,
+    all_comments: Annotated[
+        bool,
+        typer.Option(
+            "--all", help="Page through every comment on the issue, ignoring --limit/--start-at."
+        ),
+    ] = False,
+    order: Annotated[
+        str,
+        typer.Option(
+            "--order",
+            help=(
+                "'newest' or 'oldest'. Default is 'newest', a deliberate change from Jira's "
+                "natural oldest-first order: the common case is verifying a comment just written."
+            ),
+        ),
+    ] = "newest",
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """List comments for one Jira issue."""
+    """List comments for one Jira issue, newest first by default."""
+    if order not in {"newest", "oldest"}:
+        error_console.print(
+            f"[red]Invalid --order value:[/red] {order!r} (use 'newest' or 'oldest')"
+        )
+        raise typer.Exit(2)
+    order_by = "-created" if order == "newest" else None
+
     with _client() as client:
         try:
-            data = client.list_comments(key, start_at=start_at, limit=limit)
+            if all_comments:
+                data = client.list_all_comments(key, order_by=order_by)
+            else:
+                data = client.list_comments(key, start_at=start_at, limit=limit, order_by=order_by)
         except JiraApiError as exc:
             _exit_api_error(exc)
-
-    if json_output:
-        _emit_json(data)
-        return
 
     comments_data = data.get("comments") or []
     if not isinstance(comments_data, list):
         error_console.print("[red]Unexpected Jira response: comments is not a list[/red]")
         raise typer.Exit(1)
+    returned = len(comments_data)
+
+    if json_output:
+        _emit_json({**data, "returned": returned})
+        return
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", no_wrap=True)
@@ -431,6 +475,9 @@ def comments(
             _adf_to_text(comment.get("body")).strip(),
         )
     table_console.print(table)
+    total = data.get("total")
+    if isinstance(total, int):
+        console.print(f"returned {returned} of {total} comments")
 
 
 @app.command()
@@ -615,28 +662,63 @@ def search(
     jql: Annotated[str, typer.Argument(help="JQL query.")],
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option(
+            "--limit",
+            min=1,
+            help=(
+                "Maximum issues to return; pages automatically past one page. "
+                "Ignored when --all is set (--all wins over --limit)."
+            ),
+        ),
     ] = 20,
+    all_issues: Annotated[
+        bool,
+        typer.Option(
+            "--all", help="Page through every matching issue. Overrides --limit when both are set."
+        ),
+    ] = False,
+    count: Annotated[
+        bool,
+        typer.Option(
+            "--count",
+            help=(
+                "Also report Jira's approximate match count via one extra POST to "
+                "/search/approximate-count. Opt-in because of that extra request."
+            ),
+        ),
+    ] = False,
     fields: Annotated[
         str | None,
         typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
     ] = ",".join(DEFAULT_FIELDS),
     next_page_token: Annotated[
         str | None,
-        typer.Option("--next-page-token", help="Jira enhanced search nextPageToken."),
+        typer.Option(
+            "--next-page-token",
+            help="Jira enhanced search nextPageToken, for a caller paging one page at a time.",
+        ),
     ] = None,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Search Jira issues with JQL."""
+    """Search Jira issues with JQL.
+
+    Jira's enhanced search endpoint never reports a total match count, only the issues it
+    returned and whether that was the last page. This command reports exactly that (`returned`,
+    `is_last`) instead of inventing a number the API never gave it. Pass --count for Jira's
+    separate, explicitly approximate count.
+    """
     _run_search(
         jql,
         limit=limit,
         fields=fields,
         next_page_token=next_page_token,
         json_output=json_output,
+        all_pages=all_issues,
+        count=count,
+        curated=True,
     )
 
 
@@ -1070,9 +1152,15 @@ def agent_report(
         typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
     ] = None,
     comments_limit: Annotated[
-        int,
-        typer.Option("--comments", min=0, max=100, help="Maximum comments to include."),
-    ] = 5,
+        str,
+        typer.Option(
+            "--comments",
+            help=(
+                "Newest comments to include: a non-negative integer, or 'all' to page through "
+                "every comment."
+            ),
+        ),
+    ] = "5",
     changelog_limit: Annotated[
         int,
         typer.Option("--changelog", min=0, max=100, help="Maximum changelog entries to include."),
@@ -1083,6 +1171,22 @@ def agent_report(
     ] = False,
 ) -> None:
     """Build a compact agent-friendly report for one Jira issue."""
+    comment_limit: int | str
+    if comments_limit == "all":
+        comment_limit = "all"
+    else:
+        try:
+            parsed_comments_limit = int(comments_limit)
+        except ValueError:
+            parsed_comments_limit = None
+        if parsed_comments_limit is None or parsed_comments_limit < 0:
+            error_console.print(
+                "[red]Invalid --comments value:[/red] "
+                f"{comments_limit!r} (use a non-negative integer or 'all')"
+            )
+            raise typer.Exit(2)
+        comment_limit = parsed_comments_limit
+
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1097,7 +1201,7 @@ def agent_report(
                 client,
                 issue_key=issue_key,
                 site_url=config.site_url,
-                comment_limit=comments_limit,
+                comment_limit=comment_limit,
                 changelog_limit=changelog_limit,
                 write_scope=config.test_issue_key,
             )
@@ -2869,29 +2973,85 @@ def _run_search(
     fields: str | None,
     next_page_token: str | None,
     json_output: bool,
+    all_pages: bool = False,
+    count: bool = False,
+    curated: bool = False,
 ) -> None:
+    """Run a JQL search and print or emit the result.
+
+    ``curated=False`` (the default, unchanged for every caller that predates the honest-reporting
+    fix) preserves the original single-page passthrough exactly: one ``search_issues`` call, the
+    raw Jira response emitted as-is under --json, and a bare ``nextPageToken: ...`` line in human
+    mode when one is present.
+
+    ``curated=True`` is the ``search`` command's own path. It honours ``limit`` beyond one page
+    and ``all_pages`` via ``search_all_issues``, adds ``count``'s explicitly-approximate total,
+    and always reports ``returned``/``is_last`` instead of a total the API never gave it.
+    """
+    approximate_total: int | None = None
     with _client() as client:
         try:
-            data = client.search_issues(
-                jql,
-                limit=limit,
-                fields=_field_list(fields),
-                next_page_token=next_page_token,
-            )
+            if curated and count:
+                approximate_total = client.approximate_issue_count(jql)
+            if curated and next_page_token is None:
+                data = client.search_all_issues(
+                    jql,
+                    limit=None if all_pages else limit,
+                    fields=_field_list(fields),
+                )
+            else:
+                data = client.search_issues(
+                    jql,
+                    limit=limit,
+                    fields=_field_list(fields),
+                    next_page_token=next_page_token,
+                )
         except JiraApiError as exc:
             _exit_api_error(exc)
 
-    if json_output:
-        _emit_json(data)
+    if not curated:
+        if json_output:
+            _emit_json(data)
+            return
+        issues = data.get("issues") or []
+        if not isinstance(issues, list):
+            error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
+            raise typer.Exit(1)
+        _print_issues_table(issues)
+        if data.get("nextPageToken"):
+            console.print(f"nextPageToken: {data['nextPageToken']}")
         return
 
     issues = data.get("issues") or []
+    is_last = data.get("isLast")
+    returned = len(issues) if isinstance(issues, list) else 0
+    next_token = data.get("nextPageToken")
+
+    if json_output:
+        payload: dict[str, Any] = {"issues": issues, "returned": returned, "is_last": is_last}
+        if next_token:
+            payload["nextPageToken"] = next_token
+        if approximate_total is not None:
+            payload["approximate_total"] = approximate_total
+        _emit_json(payload)
+        return
+
     if not isinstance(issues, list):
         error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
         raise typer.Exit(1)
     _print_issues_table(issues)
-    if data.get("nextPageToken"):
-        console.print(f"nextPageToken: {data['nextPageToken']}")
+    if is_last is True:
+        console.print(f"returned {returned} issues; complete")
+    elif is_last is False:
+        console.print(f"returned {returned} issues; more remain")
+    else:
+        console.print(f"returned {returned} issues")
+    if next_token:
+        console.print(f"nextPageToken: {next_token}")
+    if approximate_total is not None:
+        console.print(
+            f"approximate match count: ~{approximate_total} (Jira's approximate count, not exact)"
+        )
 
 
 def _exit_api_error(exc: JiraApiError) -> None:
