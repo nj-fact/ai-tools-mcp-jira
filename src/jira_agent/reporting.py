@@ -58,6 +58,11 @@ def build_agent_report(
     the `comments` list this report carries, and `comments_truncated` is true whenever
     `comments_returned` is less than `comment_count` — a reader must never infer the total from
     how many comments were returned, or the reverse.
+
+    `comments_order` is always the literal `"newest-first"`: both `fetch_agent_report` paths
+    (a bounded integer limit and the `"all"` page-through) now fetch with `orderBy=-created`, so
+    `report["comments"][0]` is always the newest comment regardless of which option the caller
+    passed. This key exists so a reader never has to infer the order from the option value.
     """
     fields = issue.get("fields") or {}
     status = fields.get("status") or {}
@@ -92,6 +97,7 @@ def build_agent_report(
         "created": fields.get("created"),
         "updated": fields.get("updated"),
         "comments": [_comment_summary(comment) for comment in comment_list],
+        "comments_order": "newest-first",
         "comment_count": comment_total,
         "comments_returned": comments_returned,
         "comments_truncated": comments_truncated,
@@ -114,15 +120,19 @@ def fetch_agent_report(
     """Fetch one issue plus its comments and transitions and build the agent report for it.
 
     `comment_limit` controls how many comments the report carries, never how many the issue
-    actually has (see `build_agent_report`'s `comment_count`). An integer fetches the *newest*
-    `comment_limit` comments via `orderBy=-created` and returns them newest first — this used to
-    silently return the *oldest* comments while reporting the true total, which read as if a
-    freshly written comment had failed to save. The literal `"all"` pages through every comment
-    with `list_all_comments` and returns them oldest first, the API's natural chronological order.
+    actually has (see `build_agent_report`'s `comment_count`). Both branches now fetch with
+    `orderBy=-created` and so both return newest first: an integer fetches the newest
+    `comment_limit` comments via `list_comments`, and the literal `"all"` pages through every
+    comment via `list_all_comments`, newest page first. This used to differ by branch — an
+    integer limit returned newest first while `"all"` silently returned the *oldest* comments
+    first, so `report["comments"][0]` flipped meaning depending on which option was passed. An
+    agent reading that first comment to confirm one it had just written would see the newest
+    with `--comments 5` and the oldest with `--comments all`. See `comments_order` on the built
+    report, which now states the order explicitly rather than leaving it to be inferred.
     """
     issue = client.get_issue(issue_key, fields=AGENT_REPORT_FIELDS)
     if comment_limit == "all":
-        comments = client.list_all_comments(issue_key)
+        comments = client.list_all_comments(issue_key, order_by="-created")
     else:
         comments = client.list_comments(issue_key, limit=comment_limit, order_by="-created")
     transitions = client.get_transitions(issue_key)
