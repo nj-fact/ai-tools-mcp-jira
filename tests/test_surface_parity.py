@@ -314,9 +314,12 @@ def test_every_edit_issue_call_is_guarded_or_on_the_named_allowlist() -> None:
 # were in) through the separate Agile API, not a read-transform-whole-field PUT through
 # `_guarded_issue_put` -- so `_guarded_edit_methods()` correctly never picks them up, and no
 # `_NO_GUARD_ALLOWLIST` entry is needed for either. Their own correctness gate is the post-write
-# reread (`sprint_membership_report` / `sprint_verification_results`), which verifies the actual
-# membership outcome regardless of what any concurrent editor did in between, rather than a
-# stale-token comparison a 204-with-no-body response could not carry anyway.
+# reread (`sprint_membership_report`, folded into `sprint_verification_results` for `sprint-add`
+# and into `sprint_removal_blast_radius` / `sprint_removal_verification_results` for
+# `sprint-remove`, which also verifies every non-closed sprint the write actually clears, not
+# only the one named), which verifies the actual membership outcome regardless of what any
+# concurrent editor did in between, rather than a stale-token comparison a 204-with-no-body
+# response could not carry anyway.
 
 
 def test_sprint_writes_intentionally_bypass_the_concurrency_guard() -> None:

@@ -16,6 +16,7 @@ from jira_agent.client import (
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
+    SprintMultiRemovalError,
     SprintPreconditionError,
     adf_contains_media_id,
     create_issue_payload,
@@ -28,6 +29,8 @@ from jira_agent.client import (
     require_concurrency_token,
     select_transition,
     sprint_membership_report,
+    sprint_removal_blast_radius,
+    sprint_removal_verification_results,
     sprint_verification_results,
 )
 from jira_agent.config import load_config
@@ -2646,10 +2649,17 @@ def jira_add_issues_to_sprint(
     """Add one or more issues to a sprint. Defaults to dry-run.
 
     The Agile add endpoint returns 204 with no body, so Jira accepting the request is not proof
-    the issue ended up in the sprint. After execute=true, every key's sprint field is re-read and
-    `results` reports, per key, whether it is now confirmed in `sprint_id` (`verified`). `ok` is
-    false and a key can show `verified: false` even though the write itself succeeded, if the
-    reread does not confirm it -- that reread, not the 204, is what this tool treats as proof.
+    the issue ended up in the sprint. The write is audited as soon as Jira accepts it -- before
+    the post-write reread runs -- so a write that landed is never left with no audit record just
+    because that reread afterwards failed. After execute=true, every key's sprint field is
+    re-read and `results` reports, per key, whether it is now confirmed in `sprint_id`
+    (`verified`). `ok` is false and a key can show `verified: false` even though the write itself
+    succeeded, if the reread does not confirm it -- that reread, not the 204, is what this tool
+    treats as proof. If the reread itself fails, this returns `ok: false`,
+    `error_type: "sprint_verification_unavailable"`, and `verified: null` (there is no
+    `results` without a successful reread), saying the write was accepted but could not be
+    confirmed, rather than reporting the same shape as a genuine write failure that never wrote
+    anything.
     """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
@@ -2671,17 +2681,45 @@ def jira_add_issues_to_sprint(
 
             sprint_field = client.config.sprint_field
             client.add_issues_to_sprint(sprint_id, issue_keys)
-            results = sprint_verification_results(
-                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
-                expected_in_sprint=True,
-            )
+
+            verification_error: JiraApiError | None = None
+            results: list[dict[str, Any]] | None = None
+            try:
+                results = sprint_verification_results(
+                    sprint_membership_report(
+                        client, issue_keys, sprint_id, sprint_field=sprint_field
+                    ),
+                    expected_in_sprint=True,
+                )
+            except JiraApiError as exc:
+                verification_error = exc
+
             audit_write(
                 client.config,
                 action="add_issues_to_sprint",
                 issue_key=issue_keys[0],
                 payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
-                result={"verification": results},
+                result=(
+                    {"verification": results}
+                    if verification_error is None
+                    else {"verified": None, "verification_error": str(verification_error)}
+                ),
             )
+
+            if verification_error is not None:
+                return {
+                    "ok": False,
+                    "error_type": "sprint_verification_unavailable",
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "verified": None,
+                    "message": (
+                        "The sprint-add write was accepted by Jira, but the post-write "
+                        f"verification reread failed, so it could not be confirmed: "
+                        f"{verification_error}"
+                    ),
+                }
+
             ok = all(entry["verified"] for entry in results)
             return {
                 "ok": ok,
@@ -2700,23 +2738,40 @@ def jira_move_issues_to_backlog(
     sprint_id: int | str,
     issue_keys: list[str],
     execute: bool = False,
+    allow_multi_sprint_removal: bool = False,
 ) -> dict[str, Any]:
     """Remove one or more issues from sprint_id, moving them to the backlog. Defaults to dry-run.
 
     BREAKING CHANGE: this tool used to take only issue_keys and post them straight to the
     backlog endpoint. `sprint_id` is now required, and it is a PRECONDITION THIS TOOL ENFORCES,
-    NOT SOMETHING JIRA CHECKS: the underlying endpoint (`POST /rest/agile/1.0/backlog/issue`)
-    takes no sprint id at all and moves whatever keys it is given regardless of which sprint they
-    were in. Before any write (including the dry run, so it predicts what execute=true does),
-    every key's current sprint field is re-read, and the whole batch is refused -- via
+    NOT A FILTER JIRA APPLIES: the underlying endpoint (`POST /rest/agile/1.0/backlog/issue`)
+    takes no sprint id at all. It is documented as equivalent to removing the FUTURE and ACTIVE
+    sprints from the given issues -- ALL of them, on every key in the batch, not only the one
+    this tool was told to check. Closed sprints are unaffected. An issue can be in more than one
+    non-closed sprint at once (a long-lived issue on a board that has moved through several
+    sprints), so "the named sprint" and "every sprint this write actually clears" are not the
+    same set, and this tool never conflates them.
+
+    Before any write (including the dry run, so it predicts what execute=true does), every key's
+    current sprint field is re-read, and the whole batch is refused -- via
     `error_type: "sprint_precondition_failed"`, nothing written for any key -- if even one key is
     not currently in `sprint_id`; `report` lists exactly which sprint each mismatched key is
-    actually in.
+    actually in. Separately, and also by default, the whole batch is refused (via
+    `error_type: "sprint_multi_removal_refused"`) if any key sits in another non-closed sprint
+    besides `sprint_id`: without `allow_multi_sprint_removal=true`, that key would silently lose
+    a sprint membership nobody named. `dry_run=true` already lists, per key, every sprint it will
+    actually leave (`sprints_removed`), not only `sprint_id`, so this predicts the real blast
+    radius rather than under-reporting it.
 
-    The endpoint also returns 204 with no body, so after execute=true every key's sprint field is
-    re-read again and `results` reports, per key, whether it is now confirmed OUT of `sprint_id`
-    (`verified`). `ok` is false and a key can show `verified: false` even though the write itself
-    succeeded, if it still verifies as in `sprint_id` afterwards.
+    The endpoint returns 204 with no body. The write is audited as soon as Jira accepts it --
+    before the post-write reread runs -- so a write that landed is never left with no audit
+    record just because that reread afterwards failed. After execute=true, every key's sprint
+    field is re-read again and `results` reports, per key, whether it left every sprint the dry
+    run said it would (not merely `sprint_id`), naming any of those it is still in (`still_in`).
+    `ok` is false and a key can show `verified: false` even though the write itself succeeded, if
+    it still verifies as present in one of them afterwards. If the reread itself fails, this
+    returns `ok: false`, `error_type: "sprint_verification_unavailable"`, and `verified: null`,
+    saying the write was accepted but could not be confirmed.
     """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
@@ -2728,14 +2783,28 @@ def jira_move_issues_to_backlog(
             }
 
             sprint_field = client.config.sprint_field
-            precondition = sprint_membership_report(
-                client, issue_keys, sprint_id, sprint_field=sprint_field
+            precondition = sprint_removal_blast_radius(
+                sprint_membership_report(
+                    client, issue_keys, sprint_id, sprint_field=sprint_field
+                ),
+                sprint_id,
             )
             if any(not entry["in_sprint"] for entry in precondition):
                 exc = SprintPreconditionError(sprint_id, precondition)
                 return {
                     "ok": False,
                     "error_type": "sprint_precondition_failed",
+                    "message": str(exc),
+                    "sprint_id": sprint_id,
+                    "report": precondition,
+                }
+
+            at_risk = [entry for entry in precondition if entry["other_sprints"]]
+            if at_risk and not allow_multi_sprint_removal:
+                exc = SprintMultiRemovalError(sprint_id, precondition)
+                return {
+                    "ok": False,
+                    "error_type": "sprint_multi_removal_refused",
                     "message": str(exc),
                     "sprint_id": sprint_id,
                     "report": precondition,
@@ -2753,17 +2822,52 @@ def jira_move_issues_to_backlog(
                 }
 
             client.move_issues_to_backlog(issue_keys)
-            results = sprint_verification_results(
-                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
-                expected_in_sprint=False,
-            )
+
+            verification_error: JiraApiError | None = None
+            results: list[dict[str, Any]] | None = None
+            try:
+                post_write = sprint_removal_blast_radius(
+                    sprint_membership_report(
+                        client, issue_keys, sprint_id, sprint_field=sprint_field
+                    ),
+                    sprint_id,
+                )
+                results = sprint_removal_verification_results(precondition, post_write)
+            except JiraApiError as exc:
+                verification_error = exc
+
             audit_write(
                 client.config,
                 action="move_issues_to_backlog",
                 issue_key=issue_keys[0],
-                payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
-                result={"verification": results},
+                payload={
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "pre_write_sprints": {
+                        entry["key"]: entry["sprints"] for entry in precondition
+                    },
+                },
+                result=(
+                    {"verification": results}
+                    if verification_error is None
+                    else {"verified": None, "verification_error": str(verification_error)}
+                ),
             )
+
+            if verification_error is not None:
+                return {
+                    "ok": False,
+                    "error_type": "sprint_verification_unavailable",
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "verified": None,
+                    "message": (
+                        "The sprint-remove write was accepted by Jira, but the post-write "
+                        f"verification reread failed, so it could not be confirmed: "
+                        f"{verification_error}"
+                    ),
+                }
+
             ok = all(entry["verified"] for entry in results)
             return {
                 "ok": ok,

@@ -935,6 +935,118 @@ def sprint_verification_results(
     ]
 
 
+def active_or_future_sprints(sprints: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every non-closed (state `"future"` or `"active"`) entry in a parsed sprint list --
+    exactly what `POST /rest/agile/1.0/backlog/issue` is documented to clear from an issue's
+    sprint field. That endpoint takes no sprint id and is not scoped to one sprint at all: it is
+    documented as equivalent to removing the FUTURE and ACTIVE sprints from the given issues,
+    plural, and leaves closed sprints untouched. An issue can carry more than one non-closed
+    entry -- a board can have more than one active sprint in flight across its states, and a
+    long-lived issue accumulates future-sprint entries -- so this can return more than the one
+    sprint a `sprint-remove` caller named.
+    """
+    return [
+        sprint for sprint in sprints if isinstance(sprint, dict) and sprint.get("state") != "closed"
+    ]
+
+
+def sprint_removal_blast_radius(
+    report: list[dict[str, Any]], sprint_id: int | str
+) -> list[dict[str, Any]]:
+    """Attach the real `sprint-remove` blast radius to a `sprint_membership_report` result.
+
+    Every entry gains `"sprints_removed"` (every non-closed sprint the key is actually in --
+    what `move_issues_to_backlog` will really clear, per `active_or_future_sprints`) and
+    `"other_sprints"` (`sprints_removed` minus `sprint_id` itself). `other_sprints` is non-empty
+    exactly when the write would ALSO take the key out of a sprint nobody named -- the gap a
+    named-sprint-only precondition and verification used to miss entirely, because an issue can
+    be in more than one sprint at once and the backlog endpoint does not take a sprint id to
+    scope itself to just one of them.
+    """
+    target = str(sprint_id)
+    result: list[dict[str, Any]] = []
+    for entry in report:
+        sprints_removed = active_or_future_sprints(entry["sprints"])
+        other_sprints = [s for s in sprints_removed if str(s.get("id")) != target]
+        result.append(
+            {**entry, "sprints_removed": sprints_removed, "other_sprints": other_sprints}
+        )
+    return result
+
+
+def sprint_removal_verification_results(
+    precondition: list[dict[str, Any]], post_write: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Verify a `sprint-remove` write against everything the command told the caller it would
+    leave, not only the sprint id it was given.
+
+    `precondition` and `post_write` are both `sprint_removal_blast_radius` results, read before
+    and after the write. For each key, `still_in` names every sprint from the PRE-write
+    `sprints_removed` (the full predicted blast radius: the named sprint plus every other
+    non-closed one) that is still present in the fresh POST-write read; `verified` is True only
+    when that list is empty AND the post-write entry also confirms the key left the named
+    sprint specifically. That second condition is not redundant: it is what still catches a
+    `sprint_id` that named a CLOSED sprint, which the endpoint never touches and which
+    `active_or_future_sprints` therefore excludes from `sprints_removed` -- without it, naming a
+    closed sprint that does nothing would read as trivially "verified" rather than as the no-op
+    it actually was.
+    """
+    post_by_key = {entry["key"]: entry for entry in post_write}
+    results: list[dict[str, Any]] = []
+    for entry in precondition:
+        post_entry = post_by_key[entry["key"]]
+        removed_ids = {str(sprint.get("id")) for sprint in entry["sprints_removed"]}
+        still_in = [
+            sprint
+            for sprint in post_entry["sprints"]
+            if isinstance(sprint, dict) and str(sprint.get("id")) in removed_ids
+        ]
+        verified = not still_in and not post_entry["in_sprint"]
+        results.append(
+            {
+                "key": entry["key"],
+                "sprint_id": entry["sprint_id"],
+                "pre_write_sprints": entry["sprints"],
+                "sprints": post_entry["sprints"],
+                "in_sprint": post_entry["in_sprint"],
+                "sprints_removed": entry["sprints_removed"],
+                "other_sprints": entry["other_sprints"],
+                "still_in": still_in,
+                "expected_in_sprint": False,
+                "verified": verified,
+            }
+        )
+    return results
+
+
+class SprintMultiRemovalError(RuntimeError):
+    """`sprint-remove`'s default refusal when the write would ALSO clear a non-closed sprint
+    besides the one named. `POST /rest/agile/1.0/backlog/issue` removes every FUTURE and ACTIVE
+    sprint an issue is in, not only `sprint_id`, so a key that also sits in another such sprint
+    would silently lose that membership too unless this refuses first, before any write.
+
+    Carries the full `sprint_removal_blast_radius` report, not just the at-risk keys, so a
+    caller can show exactly what every key would additionally leave. `--allow-multi-sprint-removal`
+    (CLI) / `allow_multi_sprint_removal=True` (MCP) opts in and proceeds anyway.
+    """
+
+    def __init__(self, sprint_id: int | str, report: list[dict[str, Any]]) -> None:
+        at_risk = [entry for entry in report if entry["other_sprints"]]
+        detail = "; ".join(
+            f"{entry['key']} also in "
+            f"{', '.join(str(s.get('id')) for s in entry['other_sprints'])}"
+            for entry in at_risk
+        )
+        super().__init__(
+            f"Refusing to remove from sprint {sprint_id}: this would also clear at least one "
+            f"key from a sprint nobody named ({detail}). Pass --allow-multi-sprint-removal "
+            "(CLI) or allow_multi_sprint_removal=true (MCP) to proceed anyway."
+        )
+        self.sprint_id = sprint_id
+        self.report = report
+        self.at_risk = at_risk
+
+
 def text_to_adf(text: str) -> dict[str, Any]:
     return {
         "type": "doc",

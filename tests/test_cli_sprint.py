@@ -12,7 +12,7 @@ import json
 from typer.testing import CliRunner
 
 from jira_agent import cli
-from jira_agent.client import JiraConcurrentEditError
+from jira_agent.client import JiraApiError, JiraConcurrentEditError
 from jira_agent.config import JiraConfig
 
 
@@ -454,8 +454,16 @@ class _SprintStateFakeClient:
     def move_issues_to_backlog(self, issue_keys):
         self.remove_calls.append(list(issue_keys))
         if self._apply_writes:
+            # Models the real endpoint: `POST /rest/agile/1.0/backlog/issue` is documented as
+            # equivalent to removing the FUTURE and ACTIVE sprints from the given issues -- ALL
+            # of them, not only whichever one a caller had in mind -- and leaves closed sprints
+            # alone. A key carrying more than one non-closed entry (this fake supports that; see
+            # the multi-sprint tests below) loses every one of them, exactly like production.
             for issue_key in issue_keys:
-                self._sprints[issue_key] = []
+                current = self._sprints.get(issue_key, [])
+                self._sprints[issue_key] = [
+                    s for s in current if isinstance(s, dict) and s.get("state") == "closed"
+                ]
         return {}
 
 
@@ -619,11 +627,54 @@ def test_sprint_remove_cli_dry_run_writes_nothing(tmp_path, monkeypatch) -> None
             {"key": "FC-2", "project": "FC", "allowed_by": "project allowlist"},
         ],
         "precondition": [
-            {"key": "FC-1", "sprint_id": 7340, "sprints": [sprint], "in_sprint": True},
-            {"key": "FC-2", "sprint_id": 7340, "sprints": [sprint], "in_sprint": True},
+            {
+                "key": "FC-1",
+                "sprint_id": 7340,
+                "sprints": [sprint],
+                "in_sprint": True,
+                "sprints_removed": [sprint],
+                "other_sprints": [],
+            },
+            {
+                "key": "FC-2",
+                "sprint_id": 7340,
+                "sprints": [sprint],
+                "in_sprint": True,
+                "sprints_removed": [sprint],
+                "other_sprints": [],
+            },
         ],
         "dry_run": True,
     }
+    assert client.remove_calls == []
+
+
+def test_sprint_remove_cli_dry_run_lists_every_sprint_a_key_will_actually_leave(
+    tmp_path, monkeypatch
+) -> None:
+    """J1: FC-1 sits in both the named ACTIVE sprint 7340 and a FUTURE sprint 7500 nobody named.
+    `move_issues_to_backlog` clears both (it takes no sprint id and removes every non-closed
+    sprint an issue is in), so the dry run's own prose -- not only the JSON -- must say FC-1
+    leaves 7500 too, not just 7340: a dry run that only mentions the sprint it was told about
+    would under-report the blast radius of what `--execute` actually does.
+    """
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    other_future = {"id": 7500, "name": "Sprint 7500", "state": "future"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [target, other_future]})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sprint-remove", "7340", "FC-1", "--allow-multi-sprint-removal", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "7500" in result.stderr
+    assert "'Sprint 7500'" in result.stderr
+    payload = json.loads(result.stdout)
+    entry = payload["precondition"][0]
+    assert entry["sprints_removed"] == [target, other_future]
+    assert entry["other_sprints"] == [other_future]
     assert client.remove_calls == []
 
 
@@ -663,6 +714,166 @@ def test_sprint_remove_cli_precondition_refuses_whole_batch_when_a_key_is_elsewh
         assert client.remove_calls == []
 
 
+def test_sprint_remove_cli_precondition_refuses_a_key_in_no_sprint_alone(
+    tmp_path, monkeypatch
+) -> None:
+    """J6 regression: the batch test above always pairs a no-sprint key (FC-3) with a
+    wrong-sprint key (FC-2), so `any(not entry["in_sprint"] ...)` fires on FC-2 regardless of
+    whether FC-3's own case does anything at all. Mutating that condition so a key in NO sprint
+    passes the precondition on its own left every test in this module green, because no test
+    isolated the no-sprint case from a case that would already fail by itself. This one does:
+    FC-2 is the ONLY mismatch, and it is in no sprint, not some other sprint.
+    """
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [target], "FC-2": []})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprint-remove", "7340", "FC-1", "FC-2", "--json"])
+
+    assert result.exit_code == cli.SPRINT_PRECONDITION_EXIT_CODE, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "sprint_precondition_failed"
+    report_by_key = {entry["key"]: entry for entry in payload["report"]}
+    assert report_by_key["FC-1"]["in_sprint"] is True
+    assert report_by_key["FC-2"]["in_sprint"] is False
+    assert report_by_key["FC-2"]["sprints"] == []
+    assert client.remove_calls == []
+
+
+def test_sprint_remove_cli_refuses_by_default_when_a_key_is_also_in_another_active_sprint(
+    tmp_path, monkeypatch
+) -> None:
+    """J1: FC-1 is correctly in the named sprint 7340 (ACTIVE) but ALSO in sprint 7500 (FUTURE).
+    `move_issues_to_backlog` takes no sprint id and clears every non-closed sprint an issue is
+    in, so writing here would silently take FC-1 out of 7500 too -- a sprint nobody named. The
+    default must refuse the whole batch, on both the dry run and --execute, and name 7500.
+    """
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    other_future = {"id": 7500, "name": "Sprint 7500", "state": "future"}
+    closed = {"id": 6000, "name": "Sprint 6000", "state": "closed"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [target, other_future, closed]})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    for execute_flag in ([], ["--execute"]):
+        result = CliRunner().invoke(
+            cli.app, ["sprint-remove", "7340", "FC-1", "--json", *execute_flag]
+        )
+
+        assert result.exit_code == cli.SPRINT_MULTI_REMOVAL_EXIT_CODE, (
+            result.stdout + result.stderr
+        )
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["error_type"] == "sprint_multi_removal_refused"
+        assert payload["sprint_id"] == 7340
+        entry = payload["report"][0]
+        assert entry["other_sprints"] == [other_future]
+        # The closed sprint is never part of the blast radius: the endpoint does not touch it.
+        assert closed not in entry["sprints_removed"]
+        assert client.remove_calls == []
+
+
+def test_sprint_remove_cli_allow_multi_sprint_removal_opts_in_and_clears_both(
+    tmp_path, monkeypatch
+) -> None:
+    """J1: with the explicit opt-in, the same batch that the previous test refuses now proceeds,
+    and the closed sprint FC-1 also carries is left alone -- exactly what the (now-corrected)
+    fake models the real endpoint doing.
+    """
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    other_future = {"id": 7500, "name": "Sprint 7500", "state": "future"}
+    closed = {"id": 6000, "name": "Sprint 6000", "state": "closed"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [target, other_future, closed]})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sprint-remove", "7340", "FC-1", "--execute", "--allow-multi-sprint-removal", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert client.remove_calls == [["FC-1"]]
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    [entry] = payload["results"]
+    assert entry["verified"] is True
+    assert entry["still_in"] == []
+    # The closed sprint was never cleared: it is not part of what verification demanded either.
+    assert client._sprints["FC-1"] == [closed]
+
+
+def test_sprint_remove_cli_precondition_read_error_reports_json_not_a_traceback(
+    tmp_path, monkeypatch
+) -> None:
+    """J4: the precondition read (`sprint_membership_report`, called before any write and before
+    the dry-run/--execute branch) used to have no error handler of its own, so a `JiraApiError`
+    raised from it propagated uncaught -- a bare traceback on stderr and an EMPTY stdout under
+    `--json`, unlike every other Jira read in this command. It must go through the same
+    `_exit_api_error` machinery as everything else.
+    """
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": []})
+
+    def _raise_on_sprint_read(issue_key, *, sprint_field=None):
+        raise JiraApiError("Jira request failed before receiving a response: boom")
+
+    client.get_issue_sprints = _raise_on_sprint_read
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprint-remove", "7340", "FC-1", "--json"])
+
+    assert result.exit_code == 1, result.stdout + result.stderr
+    assert result.stdout.strip(), "--json stdout must not be empty on a precondition read error"
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "jira_api_error"
+
+
+def test_sprint_remove_cli_unverifiable_write_is_audited_and_reported_as_unknown(
+    tmp_path, monkeypatch
+) -> None:
+    """J2: the write itself (`move_issues_to_backlog`) succeeds, but the post-write reread that
+    verifies it fails (modelled here with a 429-style `JiraApiError`, matching the reviewer's
+    repro). This must NOT read as a failed write with no audit trail: the audit record for the
+    write must exist (this is what the ordering fix guarantees), `verified` must be `null`, not
+    `False`, and the exit code must be the verification-failure one, not the generic API-error
+    one -- a `--json` caller must be able to tell "confirmed absent" apart from "we don't know"
+    apart from "confirmed still present".
+    """
+    sprint = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [sprint]})
+    audited: list[dict[str, object]] = []
+    _install(monkeypatch, _config(tmp_path), client)
+    monkeypatch.setattr(cli, "audit_write", lambda config, **kwargs: audited.append(kwargs))
+
+    real_get_issue_sprints = client.get_issue_sprints
+    calls = {"n": 0}
+
+    def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
+        calls["n"] += 1
+        if calls["n"] > 1:  # first call is the precondition read; fail the post-write reread
+            raise JiraApiError("Jira API returned HTTP 429", status_code=429)
+        return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
+
+    client.get_issue_sprints = _flaky_get_issue_sprints
+
+    result = CliRunner().invoke(
+        cli.app, ["sprint-remove", "7340", "FC-1", "--execute", "--json"]
+    )
+
+    assert result.exit_code == cli.SPRINT_VERIFICATION_EXIT_CODE, result.stdout + result.stderr
+    assert client.remove_calls == [["FC-1"]]  # the write itself went through
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["verified"] is None
+    assert "accepted" in payload["message"]
+    # The write is audited even though verification could not run afterwards.
+    assert len(audited) == 1
+    assert audited[0]["action"] == "sprint_remove"
+    assert audited[0]["result"]["verified"] is None
+    assert "verification_error" in audited[0]["result"]
+
+
 def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_key(
     tmp_path, monkeypatch
 ) -> None:
@@ -688,8 +899,12 @@ def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_ke
         {
             "key": key,
             "sprint_id": 7340,
+            "pre_write_sprints": [sprint],
             "sprints": [],
             "in_sprint": False,
+            "sprints_removed": [sprint],
+            "other_sprints": [],
+            "still_in": [],
             "expected_in_sprint": False,
             "verified": True,
         }
@@ -699,7 +914,11 @@ def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_ke
         {
             "action": "sprint_remove",
             "issue_key": None,
-            "payload": {"sprint_id": 7340, "issue_keys": ["FC-1", "FC-2"]},
+            "payload": {
+                "sprint_id": 7340,
+                "issue_keys": ["FC-1", "FC-2"],
+                "pre_write_sprints": {"FC-1": [sprint], "FC-2": [sprint]},
+            },
             "result": {"verification": payload["results"]},
         }
     ]
@@ -877,10 +1096,14 @@ _SPRINT_ON_ISSUE = {"id": 7340, "name": "10 SEPA-Mandate, Disbursement", "state"
 
 
 class _IssueWithSprintFakeClient:
-    def __init__(self, _config=None) -> None:
+    def __init__(self, _config=None, *, sprint_field_returned: bool = True) -> None:
         self.config = _config
         self.get_issue_calls: list[list[str] | None] = []
         self.search_calls: list[list[str] | None] = []
+        # J8: models a wrong/unresolvable sprint field id (or JIRA_SPRINT_FIELD misconfigured):
+        # Jira returns HTTP 200 with the field simply left out, even though it was requested --
+        # `False` never adds the key to `fields_dict` regardless of what was asked for.
+        self._sprint_field_returned = sprint_field_returned
 
     def __enter__(self):
         return self
@@ -891,14 +1114,16 @@ class _IssueWithSprintFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         self.get_issue_calls.append(fields)
         fields_dict = {"summary": "S"}
-        if fields is None or "customfield_10020" in fields:
+        wants_sprint = fields is None or "customfield_10020" in fields
+        if wants_sprint and self._sprint_field_returned:
             fields_dict["customfield_10020"] = [_SPRINT_ON_ISSUE]
         return {"key": issue_key, "fields": fields_dict}
 
     def search_all_issues(self, jql, *, limit=None, fields=None, **_kwargs):
         self.search_calls.append(fields)
         fields_dict = {"summary": "S"}
-        if fields is None or "customfield_10020" in fields:
+        wants_sprint = fields is None or "customfield_10020" in fields
+        if wants_sprint and self._sprint_field_returned:
             fields_dict["customfield_10020"] = [_SPRINT_ON_ISSUE]
         return {
             "issues": [{"key": "FC-1", "fields": fields_dict}],
@@ -969,6 +1194,56 @@ def test_search_cli_explicit_fields_does_not_request_or_render_sprint(
     assert result.exit_code == 0, result.stdout + result.stderr
     assert client.search_calls == [["summary"]]
     assert "10 SEPA-Mandate, Disbursement" not in result.stdout
+
+
+def test_issue_cli_field_not_returned_renders_distinctly_and_warns(tmp_path, monkeypatch) -> None:
+    """J8: a wrong sprint field id (or a misconfigured JIRA_SPRINT_FIELD) makes Jira silently
+    drop the field from its response -- HTTP 200, field just absent, no error. Before the fix,
+    `_sprint_cell` rendered this identically to genuine "no sprint" (`-`), so every row of every
+    sprint-rendering command would read as "in no sprint" with nothing to say otherwise. The
+    table cell must say it does not know, and the existing "Jira did not return requested
+    field(s)" banner (already used by other missing fields on this command) must name it too.
+    """
+    client = _IssueWithSprintFakeClient(sprint_field_returned=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["issue", "FC-1"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "10 SEPA-Mandate, Disbursement" not in result.stdout
+    assert "field not returned" in result.stdout
+    assert "customfield_10020" in result.stdout
+    assert "did not return requested field" in result.stdout
+
+
+def test_search_cli_field_not_returned_renders_distinctly_and_warns(tmp_path, monkeypatch) -> None:
+    """J8, for the search-backed commands (`search`, `mine`, `fc-open`, `by-status`, `recent`,
+    `test-scope` all share `_run_search`): this used to have no missing-field warning at all,
+    unlike `issue`, so the same wrong-field-id scenario there had nothing telling the caller the
+    "-" it saw was actually "we don't know", across a whole page of rows, not one issue.
+    """
+    client = _IssueWithSprintFakeClient(sprint_field_returned=False)
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["search", "project = FC"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "10 SEPA-Mandate, Disbursement" not in result.stdout
+    assert "field not returned" in result.stdout
+    assert "customfield_10020" in result.stdout
+    assert "did not return requested field" in result.stdout
+
+
+def test_sprint_locations_skips_a_legacy_non_dict_sprint_entry(tmp_path, monkeypatch) -> None:
+    """J5: a legacy greenhopper sprint field can carry a plain string entry instead of an
+    object. `_sprint_cell` and `client.is_in_sprint` already filter those out; `_sprint_locations`
+    (used by the sprint-remove precondition and verification failure reporting) did not, and
+    `sprint.get(...)` on a plain string raises `AttributeError` instead of just skipping it.
+    """
+    assert cli._sprint_locations(["not-a-dict-legacy-entry"]) == "no sprint"
+    assert cli._sprint_locations(
+        ["legacy-string-entry", {"id": 1, "name": "Sprint 1"}]
+    ) == "1 'Sprint 1'"
 
 
 # --- config-fields ----------------------------------------------------------------------------

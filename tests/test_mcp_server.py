@@ -1915,8 +1915,17 @@ class SprintFakeClient:
     def move_issues_to_backlog(self, issue_keys):
         self.moved.append(list(issue_keys))
         if self._apply_writes:
+            # Models the real endpoint: `POST /rest/agile/1.0/backlog/issue` is documented as
+            # equivalent to removing the FUTURE and ACTIVE sprints from the given issues -- ALL
+            # of them, not only whichever one a caller had in mind -- and leaves closed sprints
+            # alone. Mirrors `_SprintStateFakeClient` in tests/test_cli_sprint.py.
             for issue_key in issue_keys:
-                self._sprints[issue_key] = []
+                current = self._sprints.get(issue_key, [])
+                self._sprints[issue_key] = [
+                    entry
+                    for entry in current
+                    if isinstance(entry, dict) and entry.get("state") == "closed"
+                ]
         return {}
 
 
@@ -2078,8 +2087,12 @@ def test_jira_move_issues_to_backlog_dry_run_then_execute(tmp_path, monkeypatch)
             {
                 "key": "FC-405",
                 "sprint_id": 42,
+                "pre_write_sprints": [{"id": 42, "name": "Sprint 42", "state": "active"}],
                 "sprints": [],
                 "in_sprint": False,
+                "sprints_removed": [{"id": 42, "name": "Sprint 42", "state": "active"}],
+                "other_sprints": [],
+                "still_in": [],
                 "expected_in_sprint": False,
                 "verified": True,
             }
@@ -2102,7 +2115,14 @@ def test_jira_move_issues_to_backlog_precondition_refuses_whole_batch_when_not_i
     assert result["error_type"] == "sprint_precondition_failed"
     assert result["sprint_id"] == 42
     assert result["report"] == [
-        {"key": "FC-405", "sprint_id": 42, "sprints": [], "in_sprint": False}
+        {
+            "key": "FC-405",
+            "sprint_id": 42,
+            "sprints": [],
+            "in_sprint": False,
+            "sprints_removed": [],
+            "other_sprints": [],
+        }
     ]
     assert client.moved == []
 
@@ -2126,6 +2146,76 @@ def test_jira_move_issues_to_backlog_execute_reports_failure_when_reread_still_s
     assert executed["results"][0]["verified"] is False
     assert executed["results"][0]["in_sprint"] is True
     assert client.moved == [["FC-405"]]
+
+
+def test_jira_move_issues_to_backlog_refuses_multi_sprint_removal_by_default(
+    tmp_path, monkeypatch
+) -> None:
+    """J1: FC-405 is correctly in the named sprint 42 (ACTIVE) but ALSO in sprint 77 (FUTURE).
+    `move_issues_to_backlog` takes no sprint id and clears every non-closed sprint an issue is
+    in, so executing here would silently take FC-405 out of 77 too. The default must refuse,
+    naming 77, and the opt-in flag must let the same batch through.
+    """
+    target = {"id": 42, "name": "Sprint 42", "state": "active"}
+    other_future = {"id": 77, "name": "Sprint 77", "state": "future"}
+    client = _install_sprint_client(
+        monkeypatch, tmp_path, initial_sprints={"FC-405": [target, other_future]}
+    )
+
+    refused = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
+
+    assert refused["ok"] is False
+    assert refused["error_type"] == "sprint_multi_removal_refused"
+    assert refused["report"][0]["other_sprints"] == [other_future]
+    assert client.moved == []
+
+    executed = mcp_server.jira_move_issues_to_backlog(
+        42, ["FC-405"], execute=True, allow_multi_sprint_removal=True
+    )
+
+    assert executed["ok"] is True
+    assert client.moved == [["FC-405"]]
+    assert executed["results"][0]["verified"] is True
+
+
+def test_jira_move_issues_to_backlog_unverifiable_write_is_audited_and_reported_as_unknown(
+    tmp_path, monkeypatch
+) -> None:
+    """J2: the write itself succeeds, but the post-write reread that verifies it fails. This
+    must not read as a failed write with no audit trail: the audit record for the write must
+    still exist, `verified` must be `null`, not `False`, and `error_type` must say verification
+    was unavailable rather than reuse the generic API-error shape a real write failure gets.
+    """
+    client = _install_sprint_client(
+        monkeypatch,
+        tmp_path,
+        initial_sprints={"FC-405": [{"id": 42, "name": "Sprint 42", "state": "active"}]},
+    )
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        mcp_server, "audit_write", lambda config, **kwargs: audited.append(kwargs)
+    )
+    real_get_issue_sprints = client.get_issue_sprints
+    calls = {"n": 0}
+
+    def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
+        calls["n"] += 1
+        if calls["n"] > 1:  # first call is the precondition read
+            raise JiraApiError("Jira API returned HTTP 429", status_code=429)
+        return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
+
+    client.get_issue_sprints = _flaky_get_issue_sprints
+
+    result = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "sprint_verification_unavailable"
+    assert result["verified"] is None
+    assert client.moved == [["FC-405"]]  # the write itself went through
+    assert len(audited) == 1
+    assert audited[0]["action"] == "move_issues_to_backlog"
+    assert audited[0]["result"]["verified"] is None
+    assert "verification_error" in audited[0]["result"]
 
 
 def test_jira_move_issues_to_backlog_refuses_an_empty_list(tmp_path, monkeypatch) -> None:
