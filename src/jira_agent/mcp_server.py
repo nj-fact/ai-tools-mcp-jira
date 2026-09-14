@@ -36,7 +36,7 @@ from jira_agent.mermaid import (
     mermaid_sources_from_adf,
     render_mermaid_png,
 )
-from jira_agent.reporting import agent_plan_comment_body, fetch_agent_report
+from jira_agent.reporting import adf_to_text, agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
     ensure_issue_write_allowed,
@@ -126,6 +126,27 @@ def _concurrent_edit_error(exc: JiraConcurrentEditError) -> dict[str, Any]:
 _SEARCH_PAGE_SIZE = 100
 
 
+def _normalize_is_last(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rename an aggregated search payload's completeness key to this file's `is_last`.
+
+    `client.search_all_issues` is being migrated from `isLast` to `is_last` independently of
+    this file, so this is tolerant of either spelling on input and always emits `is_last` on
+    output. Never invents a value: a payload carrying neither key stays `None`, rather than
+    the `True` this used to default to, so an aggregation that never confirmed completeness is
+    never reported as complete.
+    """
+    result = dict(payload)
+    if "is_last" in result:
+        value = result.pop("is_last")
+        result.pop("isLast", None)
+    elif "isLast" in result:
+        value = result.pop("isLast")
+    else:
+        value = None
+    result["is_last"] = value
+    return result
+
+
 def _search_result(
     client: JiraClient,
     jql: str,
@@ -135,21 +156,28 @@ def _search_result(
     project: str | None = None,
     next_page_token: str | None = None,
 ) -> dict[str, Any]:
-    """Run one JQL search and shape the result without ever inventing a match count.
+    """Run one JQL search and shape the result without ever inventing a match count or claim.
 
-    Always returns `returned` (the issue count actually in this response) and `isLast`, and
-    never a `total` — `/search/jql` does not provide one. A `limit` above one page pages
-    automatically via `search_all_issues` unless the caller is already resuming a manual walk
-    with `next_page_token`, in which case exactly one page is fetched.
+    Always returns `returned` (the issue count actually in this response) and `is_last`, and
+    never a `total` — `/search/jql` does not provide one. `is_last` is read from Jira's own
+    `isLast` field on a single page and renamed to this file's snake_case convention; a
+    delegated multi-page result from `search_all_issues` is normalized the same way regardless
+    of which spelling it returns (see `_normalize_is_last`). Either path reports `is_last` as
+    `None`, never `True`, when the response carried no completeness signal at all — reporting
+    completeness the API never confirmed is exactly the fabricated certainty this avoids. A
+    `limit` above one page pages automatically via `search_all_issues` unless the caller is
+    already resuming a manual walk with `next_page_token`, in which case exactly one page is
+    fetched.
     """
     if next_page_token is None and limit > _SEARCH_PAGE_SIZE:
-        return client.search_all_issues(
+        aggregated = client.search_all_issues(
             jql,
             limit=limit,
             fields=fields,
             project_key=project,
             page_size=_SEARCH_PAGE_SIZE,
         )
+        return _normalize_is_last(aggregated)
     page = client.search_issues(
         jql,
         limit=limit,
@@ -158,10 +186,11 @@ def _search_result(
         project_key=project,
     )
     issues = page.get("issues") or []
+    raw_is_last = page.get("isLast")
     result: dict[str, Any] = {
         "issues": issues,
         "returned": len(issues),
-        "isLast": bool(page.get("isLast", True)),
+        "is_last": bool(raw_is_last) if raw_is_last is not None else None,
     }
     next_token = page.get("nextPageToken")
     if next_token:
@@ -220,9 +249,11 @@ def jira_search_issues(
 
     `/search/jql` reports no match count at all, only `issues`, `isLast`, and an opaque
     `nextPageToken`; this never invents one. The result carries `returned` (the issue count in
-    this response) and `isLast`, plus `nextPageToken` when more remain and you are not already
-    paging past it automatically. A `limit` above 100 pages through every matching issue up to
-    that limit on its own; pass `next_page_token` yourself only to resume a manual page walk.
+    this response) and `is_last` (renamed from Jira's `isLast`; `None` when the response gave
+    no completeness signal, never defaulted to `True`), plus `nextPageToken` when more remain
+    and you are not already paging past it automatically. A `limit` above 100 pages through
+    every matching issue up to that limit on its own; pass `next_page_token` yourself only to
+    resume a manual page walk.
     """
     try:
         with _client() as client:
@@ -530,10 +561,23 @@ def jira_agent_report(
     actually has: the report always carries `comment_count` (the API's true total),
     `comments_returned` (how many are actually attached), and `comments_truncated` (true
     whenever comments_returned is less than comment_count), so a reader never has to infer one
-    from the other. An integer fetches the newest that many comments, newest first. The literal
-    "all" pages through every comment and returns them oldest first, the API's natural
-    chronological order.
+    from the other. Both an integer and the literal "all" return comments newest first: an
+    integer fetches that many of the newest comments, and "all" pages through every comment and
+    returns them newest first too, rather than the API's native oldest-first order. The report
+    also carries `comments_order`, always "newest-first", so a caller never has to infer the
+    order from the count alone.
+
+    comments_limit must be a non-negative integer, or the literal "all"; a negative integer is
+    refused with a structured error rather than reaching Jira as a negative maxResults.
     """
+    if isinstance(comments_limit, int) and comments_limit < 0:
+        return {
+            "ok": False,
+            "message": (
+                f"comments_limit must be a non-negative integer or 'all', got {comments_limit!r}."
+            ),
+        }
+
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -791,8 +835,12 @@ def jira_patch_description_section(
     request that already reads the description, so the token belongs to that exact read, and is
     passed back as a concurrency guard on the write: an edit that lands in between is refused
     with error_type "concurrent_edit" naming both timestamps, instead of being silently
-    reverted. Pass false to skip the guard and go back to the previous unconditional
-    read-then-overwrite behaviour.
+    reverted. When that same request's response omits `updated` entirely, there is no token to
+    guard with; this refuses with error_type "concurrent_edit_guard_unavailable" rather than
+    silently falling back to an unconditional write, and never issues a second read to get one,
+    since a second read is exactly the straddling read the same-request design avoids. Pass
+    false to skip the guard and go back to the previous unconditional read-then-overwrite
+    behaviour.
 
     section names a top-level heading and is matched with leading # characters optional, case
     insensitively, and whitespace-trimmed. An unknown heading and an ambiguous heading are
@@ -828,11 +876,24 @@ def jira_patch_description_section(
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, key)
             issue = client.get_issue(key, fields=["description", "updated"])
-            expect_updated = (
-                (issue.get("fields") or {}).get("updated") if guard_concurrent_edit else None
-            )
+            issue_fields = issue.get("fields") or {}
+            read_updated = issue_fields.get("updated")
+            if guard_concurrent_edit and read_updated is None:
+                return {
+                    "ok": False,
+                    "error_type": "concurrent_edit_guard_unavailable",
+                    "issue": key,
+                    "message": (
+                        "guard_concurrent_edit is true, but the same-request read that fetched "
+                        "the description did not return `updated`, so no concurrency-guard "
+                        "token is available. Refusing to write unguarded rather than falling "
+                        "back to a second read or an unconditional overwrite. Pass "
+                        "guard_concurrent_edit=false to opt out and write without the guard."
+                    ),
+                }
+            expect_updated = read_updated if guard_concurrent_edit else None
             patch = patch_adf_description_section(
-                (issue.get("fields") or {}).get("description"),
+                issue_fields.get("description"),
                 section=section,
                 mode=mode,
                 content=body,
@@ -1177,7 +1238,15 @@ def jira_list_comments(
     The response carries `returned` (the number of comments actually in this response) and
     `total` (the API's real total comment count) as separate fields; never infer one from the
     other.
+
+    limit (when an integer) must be at least 1, and start_at must be non-negative, matching the
+    CLI's `comments` command; either violation is refused with a structured error rather than
+    reaching Jira as a negative maxResults/startAt.
     """
+    if isinstance(limit, int) and limit < 1:
+        return {"ok": False, "message": f"limit must be at least 1 or 'all', got {limit!r}."}
+    if start_at < 0:
+        return {"ok": False, "message": f"start_at must be non-negative, got {start_at!r}."}
     try:
         with _client() as client:
             if limit == "all":
@@ -1316,6 +1385,10 @@ def jira_update_comment(
     the first. Jira keeps the original author and created instant and records the edit separately,
     so the correction stays attributable. The dry run returns the current body so the replacement
     can be compared against what it overwrites.
+
+    `current_body` is the current body flattened to plain text with the same flattener the CLI
+    uses, matching the CLI's `edit-comment` dry run rather than exposing raw ADF under a name
+    that reads as plain text. The raw ADF document is still available, under `current_body_adf`.
     """
     try:
         with _client() as client:
@@ -1336,7 +1409,8 @@ def jira_update_comment(
                     "issue": key,
                     "comment_id": comment_id,
                     "current_author": (current.get("author") or {}).get("displayName"),
-                    "current_body": current.get("body"),
+                    "current_body": adf_to_text(current.get("body")).strip(),
+                    "current_body_adf": current.get("body"),
                     "new_body": body,
                     "safety": safety,
                     "message": "Pass execute=true to replace this comment body in Jira.",
@@ -2088,7 +2162,9 @@ def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dic
     """Delete one comment from a Jira issue. Defaults to dry-run.
 
     Reads the comment first, matching the jira_update_comment convention, so both the dry run
-    and a refusal on a missing comment show what would be deleted.
+    and a refusal on a missing comment show what would be deleted. `current_body` is flattened
+    to plain text with the same flattener the CLI uses, matching its `delete-comment` dry run;
+    the raw ADF document is still available, under `current_body_adf`.
     """
     try:
         with _client() as client:
@@ -2109,7 +2185,8 @@ def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dic
                     "issue": key,
                     "comment_id": comment_id,
                     "current_author": (current.get("author") or {}).get("displayName"),
-                    "current_body": current.get("body"),
+                    "current_body": adf_to_text(current.get("body")).strip(),
+                    "current_body_adf": current.get("body"),
                     "safety": safety,
                     "message": "Pass execute=true to delete this comment in Jira.",
                 }
@@ -2243,19 +2320,49 @@ def jira_list_board_sprints(
         return _error(exc)
 
 
+# Sentinel so a sprint-field key genuinely absent from `fields` is distinguishable from one
+# present with a `None` or empty-list value; mirrors the CLI's own `_SPRINT_FIELD_MISSING`.
+_SPRINT_FIELD_MISSING = object()
+
+
+def _sprint_field_or_missing(fields: dict[str, Any], sprint_field: str) -> Any:
+    """Read a sprint custom field, distinguishing absent from present-but-empty.
+
+    `dict.get(key, _SPRINT_FIELD_MISSING)` returns the sentinel only when the key was never in
+    Jira's response at all, so a caller can tell "this site's sprint field id is probably wrong,
+    or not visible to this credential" apart from "the field is there and this issue really has
+    no sprint" — two states `JiraClient.get_issue_sprints` documents that it collapses into the
+    same empty list.
+    """
+    return fields.get(sprint_field, _SPRINT_FIELD_MISSING)
+
+
 @mcp.tool
 def jira_get_issue_sprints(key: str, sprint_field: str = DEFAULT_SPRINT_FIELD) -> dict[str, Any]:
     """Return the sprint objects on one issue's sprint field.
 
     sprint_field defaults to customfield_10020, the id probed on this Jira site; pass a
     different id if this site's Agile sprint field uses another custom field id.
+
+    `sprint_field_present` tells apart two states an empty `sprints` list alone cannot: the
+    field absent from Jira's response entirely (this site's sprint field id is probably
+    different, or the field is not visible with the caller's permissions) and the field present
+    with an empty list (the issue genuinely is in no sprint). Reads the issue directly rather
+    than through `JiraClient.get_issue_sprints`, which documents that it collapses this
+    distinction into the same `[]` either way, matching the CLI's `issue-sprint` command, which
+    makes the same choice for the same reason.
     """
     try:
         with _client() as client:
+            issue = client.get_issue(key, fields=[sprint_field])
+            raw = _sprint_field_or_missing(issue.get("fields") or {}, sprint_field)
+            field_present = raw is not _SPRINT_FIELD_MISSING
             return {
                 "ok": True,
                 "issue": key,
-                "sprints": client.get_issue_sprints(key, sprint_field=sprint_field),
+                "sprint_field": sprint_field,
+                "sprint_field_present": field_present,
+                "sprints": raw if isinstance(raw, list) else [],
             }
     except JiraApiError as exc:
         return _error(exc)

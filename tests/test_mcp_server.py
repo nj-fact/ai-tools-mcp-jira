@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from jira_agent import mcp_server
 from jira_agent.client import JiraApiError, JiraConcurrentEditError, text_to_adf
 from jira_agent.config import JiraConfig
@@ -169,10 +171,12 @@ class PatchFakeClient:
         duplicate_heading: bool = False,
         updated: str = "2026-09-01T00:00:00.000+0000",
         server_updated: str | None = None,
+        omit_updated: bool = False,
     ) -> None:
         self.duplicate_heading = duplicate_heading
         self.updated = updated
         self.server_updated = server_updated if server_updated is not None else updated
+        self.omit_updated = omit_updated
         self.writes: list[dict[str, object]] = []
         self.expect_updated_calls: list[str | None] = []
 
@@ -183,14 +187,13 @@ class PatchFakeClient:
         return None
 
     def get_issue(self, issue_key: str, *, fields=None, expand=None) -> dict[str, object]:
-        return {
-            "key": issue_key,
-            "fields": {
-                "project": {"key": "FC"},
-                "description": description_document(duplicate_heading=self.duplicate_heading),
-                "updated": self.updated,
-            },
+        fields_dict: dict[str, object] = {
+            "project": {"key": "FC"},
+            "description": description_document(duplicate_heading=self.duplicate_heading),
         }
+        if not self.omit_updated:
+            fields_dict["updated"] = self.updated
+        return {"key": issue_key, "fields": fields_dict}
 
     def edit_issue_adf_description(
         self, issue_key: str, description, *, expect_updated: str | None = None
@@ -746,6 +749,68 @@ def test_jira_patch_description_section_guard_concurrent_edit_false_skips_the_gu
     assert len(client.writes) == 1
 
 
+def test_jira_patch_description_section_refuses_when_guard_requested_but_updated_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    """F2-adjacent: the CLI's patch-description-section has this same defect (a same-request
+    read that silently passes expect_updated=None when Jira's response omits `updated`, leaving
+    the write completely unguarded while the caller believes it is protected). This must refuse
+    instead, and must not issue a second read to try to recover a token."""
+    client = _install_patch_client(monkeypatch, tmp_path, omit_updated=True)
+
+    result = mcp_server.jira_patch_description_section(
+        key="FC-385",
+        section="Observed",
+        content="## Observed\n\nGuarded write.",
+        execute=True,
+    )
+
+    assert result == {
+        "ok": False,
+        "error_type": "concurrent_edit_guard_unavailable",
+        "issue": "FC-385",
+        "message": result["message"],
+    }
+    assert "omitted" in result["message"] or "did not return" in result["message"]
+    assert "guard_concurrent_edit=false" in result["message"]
+    assert client.writes == []
+    assert client.expect_updated_calls == []
+
+
+def test_jira_patch_description_section_refuses_at_dry_run_too_when_guard_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_patch_client(monkeypatch, tmp_path, omit_updated=True)
+
+    result = mcp_server.jira_patch_description_section(
+        key="FC-385",
+        section="Observed",
+        content="## Observed\n\nGuarded write.",
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit_guard_unavailable"
+    assert client.writes == []
+
+
+def test_jira_patch_description_section_guard_false_ignores_missing_updated(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_patch_client(monkeypatch, tmp_path, omit_updated=True)
+
+    result = mcp_server.jira_patch_description_section(
+        key="FC-385",
+        section="Observed",
+        content="## Observed\n\nUnguarded write.",
+        guard_concurrent_edit=False,
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert client.expect_updated_calls == [None]
+    assert len(client.writes) == 1
+
+
 class EditIssueFakeClient:
     """A Jira client for jira_edit_issue's concurrency guard, mirroring PatchFakeClient."""
 
@@ -890,6 +955,91 @@ def test_jira_agent_report_accepts_all_as_comment_limit_and_returns_true_counts(
     assert result["report"]["comments_truncated"] is False
 
 
+def test_jira_agent_report_refuses_a_negative_comments_limit(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(
+        mcp_server,
+        "fetch_agent_report",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("must not reach Jira")),
+    )
+
+    result = mcp_server.jira_agent_report(key="FC-406", comments_limit=-1)
+
+    assert result == {
+        "ok": False,
+        "message": "comments_limit must be a non-negative integer or 'all', got -1.",
+    }
+
+
+def test_jira_agent_report_docstring_claims_newest_first_for_both_paths() -> None:
+    """F1: the docstring is what a caller reads to decide how to interpret the comment list."""
+    doc = mcp_server.jira_agent_report.__doc__ or ""
+    assert "newest first" in doc.lower()
+    assert "comments_order" in doc
+
+
+@pytest.mark.xfail(
+    reason=(
+        "F1: reporting.fetch_agent_report's 'all' branch does not yet pass "
+        "order_by='-created' to list_all_comments, and build_agent_report does not yet carry "
+        "comments_order. That fix belongs to reporting.py, owned by another worker on the CLI "
+        "surface of this same remediation; this pins the contract jira_agent_report's docstring "
+        "now promises, against the real (unmocked) reporting.fetch_agent_report/"
+        "build_agent_report, using only a fake JiraClient. strict=True so this turns into a "
+        "hard failure the day reporting.py's fix lands, forcing the marker's removal rather "
+        "than silently passing unnoticed."
+    ),
+    strict=True,
+)
+def test_jira_agent_report_all_path_returns_comments_newest_first(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, *, fields=None, expand=None):
+            return {
+                "key": issue_key,
+                "fields": {
+                    "summary": "S",
+                    "status": {"name": "Open"},
+                    "issuetype": {"name": "Task"},
+                    "project": {"key": "FC"},
+                },
+            }
+
+        def list_all_comments(self, issue_key, *, order_by=None):
+            # A faithful fake of the real client: without an explicit order_by, Jira's own
+            # order is oldest-first, so a fake that ignores order_by reproduces that honestly.
+            oldest_first = [
+                {"id": "1", "created": "2026-01-01T00:00:00.000+0000"},
+                {"id": "2", "created": "2026-01-02T00:00:00.000+0000"},
+            ]
+            comments = list(reversed(oldest_first)) if order_by == "-created" else oldest_first
+            return {"comments": comments, "total": 2}
+
+        def get_transitions(self, issue_key):
+            return {"transitions": []}
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", FakeClient)
+
+    result = mcp_server.jira_agent_report(key="FC-1", comments_limit="all")
+
+    assert result["ok"] is True
+    ids = [comment["id"] for comment in result["report"]["comments"]]
+    assert ids == ["2", "1"], "the 'all' path must return comments newest-first"
+    assert result["report"].get("comments_order") == "newest-first"
+
+
 def test_jira_get_issue_default_fields_include_parent(tmp_path, monkeypatch) -> None:
     config = make_config(tmp_path)
     calls: dict[str, object] = {}
@@ -966,6 +1116,7 @@ class SearchFakeClient:
                 "project_key": project_key,
             }
         )
+        # This is the raw Jira response shape, so it keeps Jira's own "isLast" spelling.
         return {"issues": [{"key": "FC-1"}, {"key": "FC-2"}], "isLast": True}
 
     def search_all_issues(self, jql, *, limit=None, fields=None, page_size=100, project_key=None):
@@ -978,6 +1129,7 @@ class SearchFakeClient:
                 "project_key": project_key,
             }
         )
+        # Simulates today's `client.search_all_issues`, which still returns `isLast`.
         return {
             "issues": [{"key": f"FC-{n}"} for n in range(1, 151)],
             "returned": 150,
@@ -1003,10 +1155,36 @@ def test_jira_search_issues_never_invents_a_total_and_reports_returned_and_is_la
 
     assert result["ok"] is True
     assert "total" not in result["result"]
+    assert "isLast" not in result["result"]
     assert result["result"]["returned"] == 2
-    assert result["result"]["isLast"] is True
+    assert result["result"]["is_last"] is True
     assert client.search_issues_calls[0]["limit"] == 20
     assert client.search_all_issues_calls == []
+
+
+def test_jira_search_issues_single_page_reports_is_last_none_when_signal_is_absent(
+    tmp_path, monkeypatch
+) -> None:
+    """F3b: a page with no completeness signal at all must read as unknown, not complete."""
+    config = make_config(tmp_path)
+
+    class NoSignalClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_issues(self, jql, *, limit, fields, next_page_token=None, project_key=None):
+            return {"issues": [{"key": "FC-1"}]}
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: NoSignalClient())
+
+    result = mcp_server.jira_search_issues("project = FC", limit=20)
+
+    assert result["result"]["returned"] == 1
+    assert result["result"]["is_last"] is None
 
 
 def test_jira_search_issues_pages_automatically_past_one_page(tmp_path, monkeypatch) -> None:
@@ -1017,9 +1195,43 @@ def test_jira_search_issues_pages_automatically_past_one_page(tmp_path, monkeypa
     assert client.search_all_issues_calls[0]["limit"] == 250
     assert client.search_issues_calls == []
     assert result["result"]["returned"] == 150
-    assert result["result"]["isLast"] is False
+    assert result["result"]["is_last"] is False
+    assert "isLast" not in result["result"]
     assert result["result"]["nextPageToken"] == "tok-2"
     assert "total" not in result["result"]
+
+
+def test_jira_search_issues_pages_automatically_tolerates_is_last_spelling_too(
+    tmp_path, monkeypatch
+) -> None:
+    """F3: once `client.search_all_issues` is migrated to `is_last`, this must still work."""
+    config = make_config(tmp_path)
+
+    class FutureSpellingClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_all_issues(
+            self, jql, *, limit=None, fields=None, page_size=100, project_key=None
+        ):
+            return {
+                "issues": [{"key": f"FC-{n}"} for n in range(1, 151)],
+                "returned": 150,
+                "is_last": False,
+                "nextPageToken": "tok-2",
+            }
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: FutureSpellingClient())
+
+    result = mcp_server.jira_search_issues("project = FC", limit=250)
+
+    assert result["result"]["is_last"] is False
+    assert "isLast" not in result["result"]
+    assert result["result"]["nextPageToken"] == "tok-2"
 
 
 def test_jira_search_issues_manual_next_page_token_does_not_switch_to_auto_paging(
@@ -1152,6 +1364,32 @@ def test_jira_list_comments_all_pages_through_every_comment(tmp_path, monkeypatc
     assert result["total"] == 18
 
 
+def test_jira_list_comments_refuses_a_negative_limit(tmp_path, monkeypatch) -> None:
+    client = _install_comments_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_list_comments("FC-402", limit=-1)
+
+    assert result == {"ok": False, "message": "limit must be at least 1 or 'all', got -1."}
+    assert client.list_comments_calls == []
+    assert client.list_all_comments_calls == []
+
+
+def test_jira_list_comments_refuses_a_negative_start_at(tmp_path, monkeypatch) -> None:
+    client = _install_comments_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_list_comments("FC-402", start_at=-5)
+
+    assert result == {"ok": False, "message": "start_at must be non-negative, got -5."}
+    assert client.list_comments_calls == []
+
+
+_COMMENT_BODY_ADF = {
+    "type": "doc",
+    "version": 1,
+    "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Original comment"}]}],
+}
+
+
 class DeleteCommentFakeClient:
     def __init__(self, _config, *, missing: bool = False) -> None:
         self.config = _config
@@ -1171,7 +1409,11 @@ class DeleteCommentFakeClient:
     def get_comment(self, issue_key, comment_id):
         if self.missing:
             raise JiraApiError("not found", status_code=404)
-        return {"id": comment_id, "author": {"displayName": "Agent"}, "body": {"type": "doc"}}
+        return {
+            "id": comment_id,
+            "author": {"displayName": "Agent"},
+            "body": _COMMENT_BODY_ADF,
+        }
 
     def delete_comment(self, issue_key, comment_id):
         self.deleted.append((issue_key, comment_id))
@@ -1200,6 +1442,19 @@ def test_jira_delete_comment_dry_run_shows_current_body_without_deleting(
     assert client.deleted == []
 
 
+def test_jira_delete_comment_dry_run_flattens_current_body_like_the_cli(
+    tmp_path, monkeypatch
+) -> None:
+    """F8: current_body must be plain text, matching the CLI's delete-comment dry run."""
+    _install_delete_comment_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_delete_comment("FC-403", "555")
+
+    assert result["current_body"] == "Original comment"
+    assert isinstance(result["current_body"], str)
+    assert result["current_body_adf"] == _COMMENT_BODY_ADF
+
+
 def test_jira_delete_comment_execute_deletes(tmp_path, monkeypatch) -> None:
     client = _install_delete_comment_client(monkeypatch, tmp_path)
 
@@ -1216,6 +1471,81 @@ def test_jira_delete_comment_refuses_a_missing_comment(tmp_path, monkeypatch) ->
 
     assert result == {"ok": False, "message": "Comment 999 is not present on FC-403."}
     assert client.deleted == []
+
+
+class UpdateCommentFakeClient:
+    def __init__(self, _config, *, missing: bool = False) -> None:
+        self.config = _config
+        self.missing = missing
+        self.updated: list[tuple[str, str, str]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        assert fields == ["project"]
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def get_comment(self, issue_key, comment_id):
+        if self.missing:
+            raise JiraApiError("not found", status_code=404)
+        return {
+            "id": comment_id,
+            "author": {"displayName": "Agent"},
+            "body": _COMMENT_BODY_ADF,
+        }
+
+    def update_comment(self, issue_key, comment_id, body):
+        self.updated.append((issue_key, comment_id, body))
+        return {"id": comment_id, "updated": "2026-09-14T00:00:00.000+0000"}
+
+
+def _install_update_comment_client(monkeypatch, tmp_path, **kwargs) -> UpdateCommentFakeClient:
+    config = make_config(tmp_path)
+    client = UpdateCommentFakeClient(config, **kwargs)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+    return client
+
+
+def test_jira_update_comment_dry_run_flattens_current_body_like_the_cli(
+    tmp_path, monkeypatch
+) -> None:
+    """F8: current_body must be plain text, matching the CLI's edit-comment dry run, with the
+    raw ADF still available under a clearly different key rather than lost."""
+    client = _install_update_comment_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_update_comment("FC-403", "555", "Replacement text")
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["current_body"] == "Original comment"
+    assert isinstance(result["current_body"], str)
+    assert result["current_body_adf"] == _COMMENT_BODY_ADF
+    assert result["new_body"] == "Replacement text"
+    assert client.updated == []
+
+
+def test_jira_update_comment_execute_replaces_the_body(tmp_path, monkeypatch) -> None:
+    client = _install_update_comment_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_update_comment("FC-403", "555", "Replacement text", execute=True)
+
+    assert result["ok"] is True
+    assert client.updated == [("FC-403", "555", "Replacement text")]
+
+
+def test_jira_update_comment_refuses_a_missing_comment(tmp_path, monkeypatch) -> None:
+    client = _install_update_comment_client(monkeypatch, tmp_path, missing=True)
+
+    result = mcp_server.jira_update_comment("FC-403", "999", "Replacement text", execute=True)
+
+    assert result == {"ok": False, "message": "Comment 999 is not present on FC-403."}
+    assert client.updated == []
 
 
 class IssueTypeFakeClient:
@@ -1335,10 +1665,12 @@ def test_jira_set_issue_type_refuses_a_concurrent_edit(tmp_path, monkeypatch) ->
 
 
 class SprintFakeClient:
-    def __init__(self, _config) -> None:
+    def __init__(self, _config, *, sprint_field_present: bool = True) -> None:
         self.config = _config
         self.added: list[tuple[object, list[str]]] = []
         self.moved: list[list[str]] = []
+        self.sprint_field_present = sprint_field_present
+        self.sprint_field_value: object = [{"id": 42, "name": "Sprint 42"}]
 
     def __enter__(self):
         return self
@@ -1353,13 +1685,14 @@ class SprintFakeClient:
         assert board_id == 7
         return {"values": [{"id": 42, "name": "Sprint 42", "state": state or "active"}]}
 
-    def get_issue_sprints(self, issue_key, *, sprint_field="customfield_10020"):
-        assert issue_key == "FC-405"
-        return [{"id": 42, "name": "Sprint 42"}]
-
     def get_issue(self, issue_key, *, fields=None, expand=None):
-        assert fields == ["project"]
-        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        assert fields == ["customfield_10020"]
+        fields_dict: dict[str, object] = {}
+        if self.sprint_field_present:
+            fields_dict["customfield_10020"] = self.sprint_field_value
+        return {"key": issue_key, "fields": fields_dict}
 
     def add_issues_to_sprint(self, sprint_id, issue_keys):
         self.added.append((sprint_id, list(issue_keys)))
@@ -1370,9 +1703,9 @@ class SprintFakeClient:
         return {}
 
 
-def _install_sprint_client(monkeypatch, tmp_path) -> SprintFakeClient:
+def _install_sprint_client(monkeypatch, tmp_path, **kwargs) -> SprintFakeClient:
     config = make_config(tmp_path)
-    client = SprintFakeClient(config)
+    client = SprintFakeClient(config, **kwargs)
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
     monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
     monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
@@ -1402,7 +1735,34 @@ def test_jira_get_issue_sprints_returns_the_issues_sprints(tmp_path, monkeypatch
 
     result = mcp_server.jira_get_issue_sprints("FC-405")
 
-    assert result == {"ok": True, "issue": "FC-405", "sprints": [{"id": 42, "name": "Sprint 42"}]}
+    assert result == {
+        "ok": True,
+        "issue": "FC-405",
+        "sprint_field": "customfield_10020",
+        "sprint_field_present": True,
+        "sprints": [{"id": 42, "name": "Sprint 42"}],
+    }
+
+
+def test_jira_get_issue_sprints_marks_field_absent_rather_than_an_empty_list(
+    tmp_path, monkeypatch
+) -> None:
+    """F14: JiraClient.get_issue_sprints documents that it collapses "field absent" and "field
+    present but empty" into the same `[]`, and advises reading the field off get_issue directly
+    when that distinction matters -- exactly what the CLI's issue-sprint command already does.
+    This tool must make the same choice rather than silently reporting "no sprints" for what may
+    really be a wrong sprint_field id or a permissions gap."""
+    _install_sprint_client(monkeypatch, tmp_path, sprint_field_present=False)
+
+    result = mcp_server.jira_get_issue_sprints("FC-405")
+
+    assert result == {
+        "ok": True,
+        "issue": "FC-405",
+        "sprint_field": "customfield_10020",
+        "sprint_field_present": False,
+        "sprints": [],
+    }
 
 
 def test_jira_add_issues_to_sprint_dry_run_then_execute(tmp_path, monkeypatch) -> None:
