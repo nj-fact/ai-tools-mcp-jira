@@ -240,6 +240,13 @@ to `customfield_10028`. That numeric id differs per Jira site: look yours up und
 `/rest/api/3/field` and set the variable in `.env` if it is not the default. Whole values are sent as
 integers, halves such as `0.5` are preserved, and `edit-issue` takes the same option.
 
+Every sprint-reading and sprint-writing command or tool reads and renders the field named by
+`JIRA_SPRINT_FIELD`, which defaults to `customfield_10020` (the id probed on this Jira site,
+schema `com.pyxis.greenhopper.jira:gh-sprint`). That id is also per-site: if a wrong id is
+configured, Jira returns HTTP 200 with the field silently absent rather than an error, so check
+`config-fields` (or `jira_config_fields`) to see which id is actually in effect before trusting a
+row that renders "in no sprint."
+
 ## Safe parent and issue-link reconciliation
 
 `edit-issue` leaves an issue parent unchanged when `--parent` is omitted and sets a parent when
@@ -451,6 +458,10 @@ Available MCP tools:
 - `jira_render_mermaid_diagrams`
 - `jira_changelog`
 - `jira_transition_issue`
+- `jira_get_issue_sprints`
+- `jira_add_issues_to_sprint`
+- `jira_move_issues_to_backlog`
+- `jira_config_fields`
 
 Run an end-to-end MCP smoke test:
 
@@ -509,9 +520,17 @@ the workaround was creating a duplicate issue and retiring the original).
   modes say whether more sprints remain instead of showing 50 and staying silent.
 - `issue-sprint <KEY>` — read-only, no `--execute`. Reports which sprint(s) an issue is in, and
   renders three distinct states rather than collapsing any two of them: the sprint field absent
-  from the Jira response entirely (`sprint_field_present: false`), the field present but an empty
-  list (`sprint_field_present: true`, `sprints: []`, the issue is in no sprint), and the field
-  present with one or more sprints.
+  from the Jira response entirely (`sprint_field_present: false`), the field present with `null`
+  or an empty list (`sprint_field_present: true`, `sprints: []`; this Jira site returns `null`,
+  not `[]`, for "in no sprint", verified via `Sprint IS EMPTY` JQL, and both render identically
+  here), and the field present with one or more sprints. The `issue`, `search`, `mine`,
+  `fc-open`, `by-status`, `recent`, and `test-scope` commands keep the same first distinction in
+  their own Sprint column: a field genuinely absent from a row (this Jira site's sprint field id
+  may differ from the configured one, or `JIRA_SPRINT_FIELD` may be misconfigured — Jira returns
+  HTTP 200 and silently drops an unrecognized field id, with no error of its own) renders as
+  `? (field not returned)`, never as the same `-` a genuine empty sprint list gets, and triggers
+  the same "Jira did not return requested field(s)" warning `issue` already prints for any other
+  missing field.
 - `sprint-add <SPRINT_ID> <KEY>...` — add one or more issues to a sprint. This is a single
   batched `POST /sprint/{id}/issue` call carrying every key at once, not a per-issue loop, so
   there is no "key 7 of 13 failed, the rest already moved" state to report on the Jira side. The
@@ -519,9 +538,27 @@ the workaround was creating a duplicate issue and retiring the original).
   `--execute` writes, so a clean dry run predicts what `--execute` does; a key that fails the
   gate stops the command before any issue, including earlier ones in the same invocation, is
   written, and the dry run reports the same per-key `safety` result `--execute` would have used.
-- `sprint-remove <KEY>...` — move one or more issues to the backlog, which is how the Jira Agile
-  API removes an issue from its sprint. Same single-batched-call and check-every-key-first
-  behaviour as `sprint-add`.
+  The write is audited as soon as Jira accepts it, before the post-write reread that verifies it
+  runs; if that reread itself fails, the write is reported as accepted but unverified
+  (`verified: null`, exit code 6) rather than as a failed write with no audit record.
+- `sprint-remove <SPRINT_ID> <KEY>...` — move one or more issues to the backlog. `SPRINT_ID` is a
+  **precondition this command enforces, not a filter Jira applies**: the underlying endpoint
+  (`POST /rest/agile/1.0/backlog/issue`) takes no sprint id at all. It is documented as
+  equivalent to removing the FUTURE and ACTIVE sprints from the given issues — ALL of them, on
+  every key, not only the one named — and it leaves CLOSED sprints untouched. An issue can be in
+  more than one non-closed sprint at once (a long-lived issue on a board that has moved through
+  several sprints), so before any write every key's sprint field is re-read and the whole batch
+  is refused, nothing written for any key, if either: a key is not currently in `SPRINT_ID`
+  (exit code 5), or a key sits in another non-closed sprint besides `SPRINT_ID` (exit code 7) —
+  that write would silently clear a sprint nobody named. Pass `--allow-multi-sprint-removal` to
+  proceed anyway once you have seen what it would additionally clear. The dry run lists, per key,
+  every sprint it will actually leave, not only `SPRINT_ID`. Like `sprint-add`, the write is
+  audited as soon as Jira accepts it, before the post-write reread; `results` reports, per key,
+  whether it left every sprint the dry run said it would, naming any it is still in, and an
+  unverifiable reread is reported as `verified: null` (exit code 6) rather than a failed write.
+  Reading `SPRINT_ID` membership is itself a check-then-act race, not an atomic guarantee: a
+  concurrent change between that read and the write is not caught, the same hedge that applies
+  to the concurrency guard elsewhere in this README.
 - `issue-type <KEY> <NEW_TYPE>` — change one issue's issue type. Defaults to dry-run; pass
   `--execute` to write. Before writing, it calls `is_issue_type_allowed` and refuses locally, with
   no Jira round trip, listing the allowed values from `editmeta` when `NEW_TYPE` is not among
@@ -532,6 +569,22 @@ the workaround was creating a duplicate issue and retiring the original).
   the target type) surfaces Jira's own error text rather than being swallowed.
 - `issue-type-options <KEY>` — read-only. Lists the issue types `<KEY>` may become, from the same
   `editmeta` allowed-values list `issue-type` checks against.
+- `config-fields` — read-only, no Jira call. Shows the custom field ids this tool has resolved
+  from config: `story_points_field` and `sprint_field`, both instance-specific Jira custom field
+  ids resolved the same way (a `JIRA_STORY_POINTS_FIELD` / `JIRA_SPRINT_FIELD` env var, or this
+  site's probed default), so a caller can check which ids are actually in effect before running
+  anything that writes rather than guessing.
+
+`sprint-add` and `sprint-remove` add three exit codes beyond the general ones (1 generic API
+error, 2 bad arguments, 3 write-safety refusal, 4 concurrent-edit refusal): 5 fires before any
+write when a key is not currently in `SPRINT_ID` (`sprint-remove` only); 6 fires after a write
+Jira accepted when the post-write reread did not confirm it, OR when that reread itself failed
+and the write's outcome is therefore unknown rather than failed (`verified: null`); 7 fires
+before any write, like 5, but for a different reason specific to `sprint-remove` — a key IS in
+`SPRINT_ID` but ALSO in another non-closed sprint the write would silently clear too. Under
+`--json`, the three failure states carry distinct `error_type` values —
+`sprint_precondition_failed`, `sprint_multi_removal_refused`, and
+`sprint_verification_unavailable` — so a script never has to parse prose to tell them apart.
 
 Sprint and issue-type writes follow the same dry-run-by-default, `--execute`-to-write,
 `JIRA_WRITE_PROJECT_KEYS`/`JIRA_WRITE_ISSUE_KEYS`-gated, and audit-logged rules as every other

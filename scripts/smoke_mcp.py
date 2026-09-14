@@ -41,6 +41,10 @@ EXPECTED_TOOLS = {
     "jira_render_mermaid_diagrams",
     "jira_changelog",
     "jira_transition_issue",
+    "jira_get_issue_sprints",
+    "jira_add_issues_to_sprint",
+    "jira_move_issues_to_backlog",
+    "jira_config_fields",
 }
 
 
