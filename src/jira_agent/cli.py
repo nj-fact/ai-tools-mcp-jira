@@ -1212,6 +1212,22 @@ def render_mermaid(
         Path | None,
         typer.Option("--output-dir", help="Directory for rendered PNG files."),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Uploading each rendered PNG is itself a write that moves this issue's own "
+                "`updated` on the Jira side, so the token cannot come from the read that finds "
+                "the Mermaid blocks to render. Instead, after every upload this re-reads the "
+                "description and `updated` together in one request, builds the write from THAT "
+                "read, and refuses the write (exit code 4) if `updated` no longer matches "
+                "immediately before it. This is a check-then-act narrowing of the race window, "
+                "not an atomic compare-and-swap: Jira Cloud has no conditional write here, so a "
+                "change landing in that narrower window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Render, upload, and embed the diagrams in Jira."),
@@ -1221,7 +1237,19 @@ def render_mermaid(
         typer.Option("--json", help="Print the machine-readable result."),
     ] = False,
 ) -> None:
-    """Render and embed all Mermaid blocks in an existing issue. Defaults to dry-run."""
+    """Render and embed all Mermaid blocks in an existing issue. Defaults to dry-run.
+
+    This rewrites the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded, but like `embed-diagram`,
+    the token cannot come from the same read that finds the Mermaid blocks to render: uploading
+    each rendered PNG is itself a write that moves this issue's own `updated` on the Jira side.
+    The guard token is instead read together with a fresh description immediately after the last
+    upload, so the write is built from that same fresh document. This means a concurrent edit
+    landing before that post-upload read is incorporated into the write rather than lost; it is
+    not an atomic compare-and-swap, and a change landing between that read and the write is still
+    lost, since Jira Cloud offers no conditional write on this resource. Pass
+    --no-concurrency-guard for the old unguarded behaviour.
+    """
     config = _config()
     try:
         with JiraClient(config) as client:
@@ -1272,6 +1300,7 @@ def render_mermaid(
                 attachments=issue.get("fields", {}).get("attachment") or [],
                 output_dir=destination,
                 runtime=runtime,
+                guard_concurrent_edit=concurrency_guard,
             )
             audit_write(
                 config,
@@ -1281,9 +1310,14 @@ def render_mermaid(
                     "files": result["files"],
                     "attachment_ids": result["attachment_ids"],
                     "deleted_attachment_ids": result["deleted_attachment_ids"],
+                    "concurrency_guard": concurrency_guard,
                 },
                 result=result["result"],
             )
+    except JiraConcurrentEditError as exc:
+        _exit_concurrent_edit_error(exc, json_mode=json_output)
+    except JiraMissingConcurrencyTokenError as exc:
+        _exit_missing_concurrency_token_error(exc, json_mode=json_output)
     except JiraWriteSafetyError as exc:
         _exit_safety_error(exc, json_mode=json_output)
     except JiraApiError as exc:
@@ -1540,8 +1574,9 @@ def human_brief(
 
             # Read as late as possible, immediately before the write, to keep the race window
             # this narrows as small as this process can make it. issue_version raises
-            # JiraApiError on its own when it cannot read a usable token, so a missing token
-            # refuses here rather than silently falling back to an unguarded write.
+            # JiraMissingConcurrencyTokenError when it cannot read a usable token — itself a
+            # JiraApiError only via subclassing, not a bare one — so a missing token refuses
+            # here rather than silently falling back to an unguarded write.
             expect_updated = client.issue_version(issue_key) if concurrency_guard else None
 
             data = client.edit_issue(issue_key, description=body, expect_updated=expect_updated)
@@ -2253,6 +2288,8 @@ def patch_description_section(
             )
         except JiraConcurrentEditError as exc:
             _exit_concurrent_edit_error(exc, json_mode=json_output)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
@@ -2785,11 +2822,15 @@ def embed_diagram(
         typer.Option(
             "--concurrency-guard/--no-concurrency-guard",
             help=(
-                "Capture the issue's `updated` timestamp in the same read as the description, "
-                "then refuse the write (exit code 4) if it no longer matches immediately before "
-                "the write. This is a check-then-act narrowing of the race window, not an "
-                "atomic compare-and-swap: Jira Cloud has no conditional write here, so a change "
-                "landing in that window is still lost. Default: guarded."
+                "Uploading the file is itself a write that moves this issue's own `updated`, so "
+                "the token cannot come from the FIRST read (the one that only resolves "
+                "--delete-filename and feeds the dry-run display). Instead, after the upload, "
+                "this re-reads the description and `updated` together in one request and builds "
+                "the write from THAT read, then refuses the write (exit code 4) if `updated` no "
+                "longer matches immediately before it. This is a check-then-act narrowing of the "
+                "race window, not an atomic compare-and-swap: Jira Cloud has no conditional write "
+                "here, so a change landing in that narrower window is still lost. "
+                "Default: guarded."
             ),
         ),
     ] = True,
@@ -2802,14 +2843,20 @@ def embed_diagram(
 
     This rewrites the whole description field, so a concurrent edit to that field would
     otherwise be silently overwritten. By default the write is guarded, but unlike
-    `embed-existing-png` and `upsert-image-gallery`, the token cannot come from the same read
-    that fetches the description and attachments: uploading the file is itself a write that
-    moves this issue's own `updated` on the Jira side, so a token read before the upload is
-    stale by construction, and every guarded execution would refuse itself as a phantom
-    concurrent edit after already uploading the attachment, orphaning it. The guard token is
-    instead captured with `issue_version` immediately before the write, after the upload, the
-    same discipline `human-brief` and `edit-issue` use for their own single read. Pass
-    --no-concurrency-guard for the old unguarded behaviour.
+    `embed-existing-png` and `upsert-image-gallery`, the token cannot come from the FIRST read
+    (the one that fetches attachments to resolve `--delete-filename` and populate the dry-run
+    display): uploading the file is itself a write that moves this issue's own `updated` on the
+    Jira side, so a token read before the upload is stale by construction, and a description
+    built from that same first read would already be out of date by the time of the write.
+
+    Instead, after the upload this re-reads the description and `updated` together in one
+    request, and builds the write from THAT read. The guard therefore covers only the span from
+    this post-upload read to the write: a concurrent edit landing before that read is
+    incorporated into the write rather than lost, because the description being rewritten is the
+    fresh one, not the first-read one. This is still check-then-act, not an atomic
+    compare-and-swap — Jira Cloud has no conditional write on this resource, so a change landing
+    between the post-upload read and the write is still lost. Pass --no-concurrency-guard for the
+    old unguarded behaviour.
     """
     config = _config()
     issue_key = key or config.test_issue_key
@@ -2831,8 +2878,12 @@ def embed_diagram(
     delete_ids = set(_csv_list(delete_attachment_id) or [])
 
     with JiraClient(config) as client:
+        uploaded_ids: list[str] = []
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
+            # First read: legitimately only for resolving --delete-filename to attachment ids
+            # and for the dry-run display. Its `description` is never written; see the write
+            # below, which reads a fresh copy after the upload.
             issue = client.get_issue(issue_key, fields=["description", "attachment"])
             attachments = issue.get("fields", {}).get("attachment") or []
             for attachment in attachments:
@@ -2851,8 +2902,16 @@ def embed_diagram(
             uploaded = client.add_attachment(issue_key, file_path)
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
+            uploaded_ids.append(attachment_id)
             media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
-            existing_description = issue.get("fields", {}).get("description") or {
+            # The upload above already changed this issue's `updated` on the Jira side, so
+            # content and guard token are read together HERE, after the last mutation this
+            # command makes before its write, rather than built from the first (now possibly
+            # stale) read above. This is what makes the guard meaningful: the token and the
+            # document it is meant to protect come from the same request.
+            fresh_issue = client.get_issue(issue_key, fields=["description", "updated"])
+            fresh_fields = fresh_issue.get("fields") or {}
+            existing_description = fresh_fields.get("description") or {
                 "type": "doc",
                 "version": 1,
                 "content": [],
@@ -2864,16 +2923,29 @@ def embed_diagram(
                 width=width,
                 height=height,
             )
-            # The upload above already changed this issue's `updated` on the Jira side, so a
-            # token read before it (the old bug) is stale by construction and would refuse this
-            # write every time, having already orphaned the attachment. Read the token here
-            # instead: after the last write that changes the issue, immediately before the PUT
-            # it guards.
-            expect_updated = client.issue_version(issue_key) if concurrency_guard else None
+            expect_updated = require_concurrency_token(
+                issue_key, fresh_fields.get("updated"), guard_enabled=concurrency_guard
+            )
             result = client.edit_issue_adf_description(
                 issue_key, description, expect_updated=expect_updated
             )
-            deleted: list[str] = []
+        except JiraConcurrentEditError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
+            _exit_concurrent_edit_error(exc, json_mode=False)
+        except JiraMissingConcurrencyTokenError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
+            _exit_missing_concurrency_token_error(exc, json_mode=False)
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
+            _exit_api_error(exc)
+
+        # The write above already succeeded and the new attachment is now referenced by the
+        # live description, so a failure from here on (deleting OTHER, already-superseded
+        # attachments) must not roll back the upload this call just committed.
+        deleted: list[str] = []
+        try:
             for item_id in sorted(delete_ids - {attachment_id}):
                 client.delete_attachment(item_id, issue_key=issue_key)
                 deleted.append(item_id)
@@ -2891,12 +2963,6 @@ def embed_diagram(
                 },
                 result=result,
             )
-        except JiraConcurrentEditError as exc:
-            _exit_concurrent_edit_error(exc, json_mode=False)
-        except JiraMissingConcurrencyTokenError as exc:
-            _exit_missing_concurrency_token_error(exc, json_mode=False)
-        except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
         except JiraApiError as exc:
             _exit_api_error(exc)
 
@@ -3806,8 +3872,8 @@ def issue_type(
     Jira's response to that same read carries no usable `updated` timestamp, `issue_version`
     raises `JiraMissingConcurrencyTokenError`, caught here the same way `human-brief` and
     `edit-issue` catch it, so the same condition produces the same
-    `concurrency_guard_unavailable` refusal on every guarded command rather than a generic exit-1
-    "Jira API error" on this one.
+    `concurrent_edit_guard_unavailable` refusal on every guarded command rather than a generic
+    exit-1 "Jira API error" on this one.
     """
     with _client() as client:
         try:
@@ -3956,6 +4022,22 @@ def _run_search(
             )
 
 
+def _cleanup_uploaded_attachments(
+    client: JiraClient, issue_key: str, attachment_ids: list[str]
+) -> None:
+    """Best-effort delete of attachments this command uploaded when the write that would have
+    referenced them never happened — a refused concurrency guard or any other failure between
+    the upload and the write. Mirrors `mcp_server._cleanup_uploaded_attachments`. Deliberately
+    swallows its own `JiraApiError` so a failed cleanup attempt can never mask the original error
+    that is about to be reported and cause the exit.
+    """
+    for attachment_id in attachment_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+        except JiraApiError:
+            pass
+
+
 def _exit_api_error(exc: JiraApiError, *, json_mode: bool = False) -> None:
     """Report a Jira API failure and exit 1, on both output channels when `json_mode` is set.
 
@@ -4051,7 +4133,7 @@ def _exit_missing_concurrency_token_error(
         _emit_json(
             {
                 "ok": False,
-                "error_type": "concurrency_guard_unavailable",
+                "error_type": "concurrent_edit_guard_unavailable",
                 "issue": exc.issue_key,
                 "dry_run": False,
             }

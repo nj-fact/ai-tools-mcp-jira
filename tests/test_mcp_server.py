@@ -2276,17 +2276,32 @@ def test_jira_upsert_image_gallery_refuses_when_updated_missing(tmp_path, monkey
 
 class EmbedDiagramMcpFakeClient:
     """Mirrors tests/test_cli_concurrency.py's `_make_embed_diagram_fake_client`: models Jira's
-    real behaviour where uploading an attachment moves the issue's own `updated`, so
-    `add_attachment` bumps this fake's live state and `issue_version` -- the guard's dedicated
-    late read -- reports it.
+    real behaviour where uploading an attachment moves the issue's own `updated`, and a genuine
+    concurrent editor can change the live `description` in the same window
+    (`concurrent_description`, applied at the same point `add_attachment` bumps `updated`). The
+    fixed tool's SECOND `get_issue` read (fields=["description", "updated"]), after the upload,
+    must observe this live state, not whatever the FIRST read saw. `issue_version` mirrors the
+    same live `updated` state for any code path that still reads it directly.
     """
 
-    def __init__(self, _config, *, after_upload_updated, at_put_time_updated=None):
-        self.state = {"updated": "T-before-upload"}
+    def __init__(
+        self,
+        _config,
+        *,
+        after_upload_updated,
+        at_put_time_updated=None,
+        initial_description=None,
+        concurrent_description=None,
+    ):
+        self.state = {
+            "updated": "T-before-upload",
+            "description": initial_description or {"type": "doc", "version": 1, "content": []},
+        }
         self.after_upload_updated = after_upload_updated
         self.at_put_time_updated = (
             at_put_time_updated if at_put_time_updated is not None else after_upload_updated
         )
+        self.concurrent_description = concurrent_description
         self.writes: list[dict[str, object]] = []
         self.deleted: list[str] = []
 
@@ -2299,18 +2314,21 @@ class EmbedDiagramMcpFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
-        assert fields is not None and "description" in fields and "attachment" in fields, fields
-        return {
+        assert fields is not None, fields
+        payload: dict[str, object] = {
             "key": issue_key,
-            "fields": {
-                "description": {"type": "doc", "version": 1, "content": []},
-                "attachment": [],
-                "updated": self.state["updated"],
-            },
+            "fields": {"updated": self.state["updated"]},
         }
+        if "description" in fields:
+            payload["fields"]["description"] = self.state["description"]
+        if "attachment" in fields:
+            payload["fields"]["attachment"] = []
+        return payload
 
     def add_attachment(self, issue_key, file_path):
         self.state["updated"] = self.after_upload_updated
+        if self.concurrent_description is not None:
+            self.state["description"] = self.concurrent_description
         return [{"id": "9001", "filename": Path(file_path).name}]
 
     def attachment_media_id(self, attachment_id, *, issue_key):
@@ -2412,13 +2430,88 @@ def test_jira_embed_diagram_guard_false_ignores_missing_updated(tmp_path, monkey
     assert len(client.writes) == 1
 
 
+def test_jira_embed_diagram_incorporates_concurrent_edit_landing_before_post_upload_read(
+    tmp_path, monkeypatch
+) -> None:
+    """H1 regression on the MCP surface. Round 2's bug: build from the first (pre-upload) read,
+    guard token from a later, separate `issue_version` call. The token would match (nothing
+    changed the issue after the upload), so the write would go ahead and report a guarded
+    success while silently dropping a concurrent editor's paragraph that arrived between the
+    first read and the upload. The fix builds the write from the post-upload read instead, so
+    this same edit must be INCORPORATED.
+    """
+    initial_description = {"type": "doc", "version": 1, "content": [_paragraph("Original content")]}
+    concurrent_description = {
+        "type": "doc",
+        "version": 1,
+        "content": [_paragraph("Original content"), _paragraph("Concurrent editor's note")],
+    }
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        initial_description=initial_description,
+        concurrent_description=concurrent_description,
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is True, result
+    assert len(client.writes) == 1
+    written_description = client.writes[0]["description"]
+    written_texts = [
+        item.get("text")
+        for block in written_description["content"]
+        if block.get("type") == "paragraph"
+        for item in block.get("content", [])
+    ]
+    assert "Concurrent editor's note" in written_texts, (
+        "the concurrent editor's paragraph must survive the write, not be silently dropped: "
+        f"{written_description}"
+    )
+
+
+def test_jira_embed_diagram_refused_write_leaves_no_attachment_behind(
+    tmp_path, monkeypatch
+) -> None:
+    """H2 regression: before this fix, jira_embed_diagram's except clauses never cleaned up the
+    attachment it had already uploaded when the guarded write refused (unlike
+    jira_render_mermaid_diagrams, which already did). A refused write must not orphan the
+    upload.
+    """
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        at_put_time_updated="2026-01-01T00:05:00.000+0000",
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "concurrent_edit"
+    assert client.writes == []
+    assert client.deleted == ["9001"], "the uploaded attachment must be cleaned up, not orphaned"
+
+
 class MermaidFakeClient:
     """Fake for jira_render_mermaid_diagrams. Each `add_attachment` call (one per rendered
     diagram) bumps the live `updated` state, modelling Jira's real behaviour; `issue_version`
     reports it, exactly like `EmbedDiagramMcpFakeClient` above.
     """
 
-    def __init__(self, _config, *, after_upload_updated, at_put_time_updated=None):
+    def __init__(
+        self,
+        _config,
+        *,
+        after_upload_updated,
+        at_put_time_updated=None,
+        concurrent_description=None,
+    ):
         self.state = {"updated": "T-before-upload"}
         self.after_upload_updated = after_upload_updated
         self.at_put_time_updated = (
@@ -2435,6 +2528,7 @@ class MermaidFakeClient:
                 }
             ],
         }
+        self.concurrent_description = concurrent_description
         self.writes: list[dict[str, object]] = []
         self.uploaded: list[str] = []
         self.deleted: list[str] = []
@@ -2449,16 +2543,23 @@ class MermaidFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
-        return {
+        payload: dict[str, object] = {
             "key": issue_key,
-            "fields": {"description": self.description, "attachment": []},
+            "fields": {"updated": self.state["updated"]},
         }
+        if fields is None or "description" in fields:
+            payload["fields"]["description"] = self.description
+        if fields is not None and "attachment" in fields:
+            payload["fields"]["attachment"] = []
+        return payload
 
     def add_attachment(self, issue_key, path):
         self._next_id += 1
         attachment_id = str(self._next_id)
         self.uploaded.append(attachment_id)
         self.state["updated"] = self.after_upload_updated
+        if self.concurrent_description is not None:
+            self.description = self.concurrent_description
         return [{"id": attachment_id, "filename": Path(path).name}]
 
     def attachment_media_id(self, attachment_id, *, issue_key):
@@ -2562,3 +2663,48 @@ def test_jira_render_mermaid_diagrams_refuses_when_guard_on_and_updated_missing(
     assert result["error_type"] == "concurrent_edit_guard_unavailable"
     assert client.writes == []
     assert client.deleted == client.uploaded
+
+
+def test_jira_render_mermaid_diagrams_incorporates_concurrent_edit_landing_before_post_upload_read(
+    tmp_path, monkeypatch
+) -> None:
+    """H1 regression on the MCP surface's mermaid tool: a concurrent editor's change lands
+    between the first read (which only finds the Mermaid block to render) and the post-upload
+    second read that now supplies both content and guard token. The write must incorporate it.
+    """
+    concurrent_description = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _paragraph("Concurrent editor's note"),
+            {
+                "type": "codeBlock",
+                "attrs": {"language": "mermaid"},
+                "content": [{"type": "text", "text": "graph TD; A-->B;"}],
+            },
+        ],
+    }
+    client = _install_mermaid_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        concurrent_description=concurrent_description,
+    )
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is True, result
+    assert len(client.writes) == 1
+    written_description = client.writes[0]["description"]
+    written_texts = [
+        item.get("text")
+        for block in written_description["content"]
+        if block.get("type") == "paragraph"
+        for item in block.get("content", [])
+    ]
+    assert "Concurrent editor's note" in written_texts, (
+        "the concurrent editor's paragraph must survive the write, not be silently dropped: "
+        f"{written_description}"
+    )

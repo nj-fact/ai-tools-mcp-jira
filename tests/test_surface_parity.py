@@ -20,8 +20,12 @@ finding class itself.
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
+import pkgutil
+from types import ModuleType
 
+import jira_agent
 from jira_agent import cli, mcp_server
 from jira_agent import client as client_module
 
@@ -67,6 +71,40 @@ def test_no_stale_key_spelling_survives_in_either_surface_source() -> None:
         assert banned not in mcp_source, f"{banned} reappeared in mcp_server.py"
 
 
+# H3: one condition ("the guard is on but the read carried no usable `updated` token"), pinned to
+# exactly one spelling. cli.py used to emit "concurrency_guard_unavailable" while mcp_server.py
+# (and client.py's own docstring, and every test written against the MCP surface) used
+# "concurrent_edit_guard_unavailable" for the identical refusal. Pin the chosen spelling so it
+# cannot drift back to two names for one contract.
+_CONCURRENT_EDIT_GUARD_UNAVAILABLE = "concurrent_edit_guard_unavailable"
+_BANNED_GUARD_UNAVAILABLE_SPELLING = "concurrency_guard_unavailable"
+
+
+def test_guard_unavailable_error_type_is_pinned_to_one_spelling_on_both_surfaces() -> None:
+    cli_source = inspect.getsource(cli)
+    mcp_source = inspect.getsource(mcp_server)
+    client_source = inspect.getsource(client_module)
+
+    assert f'"{_CONCURRENT_EDIT_GUARD_UNAVAILABLE}"' in cli_source, (
+        "cli.py must emit the shared concurrent_edit_guard_unavailable error_type"
+    )
+    assert f'"{_CONCURRENT_EDIT_GUARD_UNAVAILABLE}"' in mcp_source, (
+        "mcp_server.py must emit the shared concurrent_edit_guard_unavailable error_type"
+    )
+
+    for label, source in (("cli.py", cli_source), ("mcp_server.py", mcp_source)):
+        assert f'"{_BANNED_GUARD_UNAVAILABLE_SPELLING}"' not in source, (
+            f'the retired spelling "{_BANNED_GUARD_UNAVAILABLE_SPELLING}" reappeared in {label}'
+        )
+        assert f"`{_BANNED_GUARD_UNAVAILABLE_SPELLING}`" not in source, (
+            f'the retired spelling reappeared in {label} prose (backticked, not just as a key)'
+        )
+
+    # client.py's docstring names the CLI commands that get their token through issue_version and
+    # must quote the SAME spelling used on both surfaces above, not a third one.
+    assert f"`{_CONCURRENT_EDIT_GUARD_UNAVAILABLE}`" in client_source
+
+
 def test_search_backed_paths_share_the_same_completeness_keys_never_a_total() -> None:
     """Both surfaces must spell "how many issues came back" and "did this response return
     everything" the same way — `returned` and `is_last` — never Jira's raw `isLast`, and never a
@@ -102,6 +140,22 @@ def test_search_all_issues_docstring_matches_its_own_contract() -> None:
     assert "nextPageToken" in doc
 
 
+def test_embed_diagram_help_and_docstring_agree_with_the_post_upload_read_fix() -> None:
+    """H6: `embed-diagram`'s `--concurrency-guard` option help disagreed with its own code twice
+    across two rounds -- round 1 claimed the token came from the same read as the description
+    when it was captured before the upload (stale by construction), and round 2's text still said
+    "the same read as the description" while the token actually came from a separate, later
+    `issue_version` call. An agent reads `--help`, not the docstring, so pin the option help
+    text directly rather than only the function docstring below it.
+    """
+    source = inspect.getsource(cli.embed_diagram)
+    assert "FIRST read" in source, "must name which read the token cannot come from"
+    assert "atomic compare-and-swap" in source, "must not overclaim atomicity"
+    assert "same read as the description" not in source, (
+        "the old, now-false claim (token and description share the FIRST read) must not reappear"
+    )
+
+
 # --- G8: a mechanical guard against the next unguarded whole-field rewrite -------------------
 #
 # G2 found five MCP tools that read a description (or labels/attachment set), transformed it,
@@ -112,7 +166,40 @@ def test_search_all_issues_docstring_matches_its_own_contract() -> None:
 # is worse than none. This enumerates every call, mechanically, so a new one is caught by the
 # suite instead of by the next adversarial review.
 
-_GUARDED_EDIT_METHODS = frozenset({"edit_issue", "edit_issue_adf_description"})
+def _guarded_edit_methods() -> frozenset[str]:
+    """H8: derive the guarded-method set from `JiraClient` itself rather than hand-keeping it.
+
+    `_guarded_issue_put` is what actually gates a write on `expect_updated` at runtime,
+    so a method is "guarded" in the sense this file cares about exactly when its own body
+    calls `self._guarded_issue_put(...)`. Hand-keeping this set as a literal (as a previous round
+    did with `{"edit_issue", "edit_issue_adf_description"}`) silently missed `set_issue_type`,
+    which routes through the exact same gate; deriving it here means a fourth such method added
+    to the client is picked up automatically, the same way H5 makes a fourth *caller* module
+    picked up automatically below.
+    """
+    tree = ast.parse(inspect.getsource(client_module))
+    methods: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef) or node.name != "JiraClient":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            for call in ast.walk(item):
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "_guarded_issue_put"
+                    and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id == "self"
+                ):
+                    methods.add(item.name)
+                    break
+    assert methods, "derived an empty guarded-method set from JiraClient; parsing regressed"
+    return frozenset(methods)
+
+
+_GUARDED_EDIT_METHODS = _guarded_edit_methods()
 
 # (module label, enclosing function name, client method name) -> why this specific call is
 # deliberately unguarded. A call landing here is a decision, recorded once, not an oversight;
@@ -129,6 +216,23 @@ _NO_GUARD_ALLOWLIST: dict[tuple[str, str, str], str] = {
         "read-transform-whole-field rewrite."
     ),
 }
+
+
+def _package_modules() -> dict[str, ModuleType]:
+    """H5: every importable module under `jira_agent`, keyed by its short name.
+
+    A previous round's parity test hand-kept `{"cli": ..., "mcp_server": ...}`, so `mermaid.py`
+    calling `edit_issue_adf_description` unguarded (H5) was invisible to it — the walk never
+    looked there. Deriving the module list from the package itself means a fifth module that
+    starts calling a guarded method is covered the moment it exists, with nothing to remember to
+    add here.
+    """
+    modules: dict[str, ModuleType] = {}
+    for module_info in pkgutil.iter_modules(jira_agent.__path__, prefix=f"{jira_agent.__name__}."):
+        module = importlib.import_module(module_info.name)
+        short_name = module_info.name.rsplit(".", 1)[-1]
+        modules[short_name] = module
+    return modules
 
 
 class _EditCallVisitor(ast.NodeVisitor):
@@ -169,12 +273,15 @@ def _edit_calls(source: str) -> list[tuple[str, str, bool]]:
 
 
 def test_every_edit_issue_call_is_guarded_or_on_the_named_allowlist() -> None:
-    """A new call to `edit_issue` / `edit_issue_adf_description` that omits `expect_updated`
-    must fail this test, not pass silently the way G2's five missing guards did. Verified by
-    deliberately introducing an unguarded call during remediation and confirming this test (and
-    only this test in this class) catches it before reverting.
+    """A new call to `edit_issue` / `edit_issue_adf_description` / `set_issue_type` that omits
+    `expect_updated`, in ANY module under `jira_agent` (not just `cli`/`mcp_server`), must fail
+    this test, not pass silently the way G2's five missing guards did, or the way H5's unguarded
+    `mermaid.embed_mermaid_diagrams` call did against the previous, hand-kept two-module version
+    of this test. Verified by deliberately introducing an unguarded call during remediation and
+    confirming this test (and only this test in this class) catches it before reverting.
     """
-    modules = {"cli": inspect.getsource(cli), "mcp_server": inspect.getsource(mcp_server)}
+    modules = {name: inspect.getsource(module) for name, module in _package_modules().items()}
+    assert "mermaid" in modules, "the module map must include mermaid.py (H5)"
     unresolved: list[str] = []
     seen_allowlist_keys: set[tuple[str, str, str]] = set()
 

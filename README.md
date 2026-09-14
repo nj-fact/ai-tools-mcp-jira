@@ -349,16 +349,18 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   `--no-render-mermaid`) and retrofit an existing issue with `render-mermaid`
 - Insert or replace a linked screenshot gallery from existing attachments with
   `upsert-image-gallery`
-- `embed-diagram`, `embed-existing-png`, and `upsert-image-gallery` each rewrite the whole
-  description field, exactly like `patch-description-section`, and are guarded the same way by
-  default. `embed-existing-png` and `upsert-image-gallery` perform no Jira-changing call between
-  their read and their write, so the same read that fetches the description and attachments also
-  fetches `updated`. `embed-diagram` cannot do that: uploading the file is itself a write that
-  moves the issue's own `updated`, so a token read before the upload would be stale by
-  construction and would refuse the write every time, after already uploading the attachment,
-  orphaning it. Its token is instead captured immediately before the write, after the upload. All
-  three refuse the write (exit code 4) if `updated` no longer matches immediately beforehand, and
-  `--no-concurrency-guard` opts out of any of them.
+- `embed-diagram`, `embed-existing-png`, `upsert-image-gallery`, and `render-mermaid` each
+  rewrite the whole description field, exactly like `patch-description-section`, and are guarded
+  the same way by default. `embed-existing-png` and `upsert-image-gallery` perform no
+  Jira-changing call between their read and their write, so the same read that fetches the
+  description and attachments also fetches `updated`. `embed-diagram` and `render-mermaid`
+  cannot do that: uploading a file is itself a write that moves the issue's own `updated`, so a
+  description and token both taken from their first read (before the upload) would already be
+  stale by the time of the write. Each instead re-reads the description and `updated`
+  together, in one request, immediately after its own upload(s), and builds the write from that
+  fresh read; a concurrent edit landing before that post-upload read is incorporated into the
+  write rather than lost. All four refuse the write (exit code 4) if `updated` no longer matches
+  immediately before it, and `--no-concurrency-guard` opts out of any of them.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
@@ -461,21 +463,21 @@ The smoke test starts `jira-agent-mcp` over stdio, verifies the expected tool li
 
 ## Concurrency guard on whole-field rewrites
 
-`edit-issue`, `patch-description-section`, `human-brief`, `embed-diagram`, `embed-existing-png`,
-and `upsert-image-gallery` each read an issue, then write a whole field back. By default all six
-are guarded: the command captures the issue's `updated` timestamp — as part of its read where
-nothing changes the issue in between, or with a dedicated read immediately before the write when
-something does (`embed-diagram`'s own upload) — then refuses the write with exit code 4
-(distinct from the generic API error's 1 and the write-safety error's 3) if `updated` no longer
-matches immediately before the write. `issue-type` carries the same guard unconditionally, with
-no opt-out flag. The refusal names the issue and both timestamps in prose, and, under `--json`,
-in a JSON document carrying `error_type: "concurrent_edit"`, `expected_updated`, `found_updated`,
-and `dry_run`.
+`edit-issue`, `patch-description-section`, `human-brief`, `drift-labels`, `embed-diagram`,
+`embed-existing-png`, `upsert-image-gallery`, and `render-mermaid` each read an issue, then write
+a whole field back. By default all eight are guarded: the command captures the issue's `updated`
+timestamp — as part of its read where nothing changes the issue in between, or with a dedicated
+read immediately before the write when something does (`embed-diagram` and `render-mermaid`'s
+own uploads) — then refuses the write with exit code 4 (distinct from the generic API error's 1
+and the write-safety error's 3) if `updated` no longer matches immediately before the write.
+`issue-type` carries the same guard unconditionally, with no opt-out flag. The refusal names the
+issue and both timestamps in prose, and, under `--json`, in a JSON document carrying
+`error_type: "concurrent_edit"`, `expected_updated`, `found_updated`, and `dry_run`.
 
 This is a check-then-act narrowing of the race window, not an atomic compare-and-swap: Jira
 Cloud exposes no conditional write (no ETag / If-Match) on the issue resource, so a change that
 lands inside that narrowed window is still silently lost. Pass `--no-concurrency-guard` on any of
-the six opt-out-capable commands for the previous unguarded behaviour.
+the eight opt-out-capable commands for the previous unguarded behaviour.
 
 Two comment commands fill a gap where only `add-comment` existed:
 

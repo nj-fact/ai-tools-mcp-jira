@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from jira_agent.client import JiraApiError, png_dimensions, replace_diagram_with_media
+from jira_agent.client import (
+    JiraApiError,
+    png_dimensions,
+    replace_diagram_with_media,
+    require_concurrency_token,
+)
 
 
 @dataclass(frozen=True)
@@ -133,11 +138,29 @@ def embed_mermaid_diagrams(
     filenames: list[str] | None = None,
     alt_texts: list[str] | None = None,
     runtime: MermaidRuntime | None = None,
+    guard_concurrent_edit: bool = True,
 ) -> dict[str, Any]:
-    """Render, upload, and embed every top-level Mermaid block.
+    """Render, upload, and embed every top-level Mermaid block. Guarded by default.
 
-    All diagrams are rendered before the first Jira write. Uploads are rolled
-    back if a later upload or the description update fails.
+    All diagrams are rendered before the first Jira write. Uploads are rolled back if a later
+    upload, the guard-token read, or the description write fails.
+
+    `description` is read only to find the Mermaid source blocks to render and to size the
+    attachment list; it is NOT what gets written. Uploading each rendered PNG is itself a write
+    that moves this issue's own `updated` on the Jira side, so a guard token captured before or
+    during the uploads (and the `description` argument itself, however it was obtained) would be
+    stale by construction and would refuse the write after every attachment had already been
+    uploaded, orphaning them.
+
+    Instead, after every upload this function re-reads the issue's current `description` and
+    `updated` together in one request, rebuilds the final ADF from THAT read, and guards the
+    write with THAT same read's token. The guard therefore covers only the span from this
+    post-upload read to the write; a concurrent edit landing before that read is incorporated
+    into the write rather than lost, because the final ADF is built from the fresh document, not
+    from the possibly-stale `description` argument. This is still check-then-act, not atomic:
+    Jira Cloud's issue PUT has no conditional-write mechanism, and a change landing between the
+    post-upload read and the write is still lost. Pass `guard_concurrent_edit=False` for the old
+    unguarded behaviour.
     """
     sources = mermaid_sources_from_adf(description)
     if not sources:
@@ -169,7 +192,7 @@ def embed_mermaid_diagrams(
     }
     uploaded_ids: list[str] = []
     uploaded_attachments: list[dict[str, Any]] = []
-    updated_description = description
+    media: list[tuple[str, str, int, int]] = []
     try:
         for path, alt in zip(paths, alts, strict=True):
             uploaded = client.add_attachment(issue_key, path)
@@ -181,6 +204,19 @@ def embed_mermaid_diagrams(
             uploaded_attachments.append(attachment)
             media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
             width, height = png_dimensions(path)
+            media.append((media_id, alt, width, height))
+
+        # Every upload above already moved this issue's `updated` on the Jira side, so content
+        # and guard token are read together here, after the last mutation this function makes,
+        # rather than built from the (now possibly stale) `description` argument.
+        fresh_issue = client.get_issue(issue_key, fields=["description", "updated"])
+        fresh_fields = fresh_issue.get("fields") or {}
+        updated_description = fresh_fields.get("description") or {
+            "type": "doc",
+            "version": 1,
+            "content": [],
+        }
+        for media_id, alt, width, height in media:
             updated_description = replace_diagram_with_media(
                 updated_description,
                 media_id=media_id,
@@ -188,8 +224,13 @@ def embed_mermaid_diagrams(
                 width=width,
                 height=height,
             )
+        expect_updated = require_concurrency_token(
+            issue_key, fresh_fields.get("updated"), guard_enabled=guard_concurrent_edit
+        )
 
-        result = client.edit_issue_adf_description(issue_key, updated_description)
+        result = client.edit_issue_adf_description(
+            issue_key, updated_description, expect_updated=expect_updated
+        )
     except (JiraApiError, OSError, ValueError):
         for attachment_id in uploaded_ids:
             try:

@@ -22,12 +22,15 @@ from typing import Any
 from typer.testing import CliRunner
 
 from jira_agent import cli
+from jira_agent import mermaid as mermaid_module
 from jira_agent.client import (
+    JiraApiError,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
     adf_contains_media_id,
 )
 from jira_agent.config import JiraConfig
+from jira_agent.mermaid import MermaidRuntime
 
 ISSUE_KEY = "FC-1"
 READ_UPDATED = "2026-01-01T00:00:00.000+0000"
@@ -75,9 +78,19 @@ def _sample_description() -> dict[str, Any]:
     }
 
 
-def _make_patch_fake_client(*, read_updated: str, server_updated: str) -> tuple[type, list[dict]]:
+def _make_patch_fake_client(
+    *, read_updated: str, server_updated: str, put_time_missing_token: bool = False
+) -> tuple[type, list[dict]]:
     """Fake client for patch-description-section. ``writes`` records only completed writes,
-    exactly like the real client only calls its PUT after the guard check passes."""
+    exactly like the real client only calls its PUT after the guard check passes.
+
+    ``put_time_missing_token`` models H4: the FIRST read (``get_issue`` above) returned a
+    perfectly usable ``read_updated``, so ``require_concurrency_token`` never objects, but the
+    real client's own ``_guarded_issue_put`` re-reads ``updated`` immediately before its PUT and
+    can *itself* find no usable token there -- a later, independent failure from the one
+    ``read_updated=None`` models. That must still produce the shared guard-unavailable refusal,
+    not the generic API-error path.
+    """
     writes: list[dict[str, Any]] = []
 
     class FakeClient:
@@ -100,6 +113,8 @@ def _make_patch_fake_client(*, read_updated: str, server_updated: str) -> tuple[
         def edit_issue_adf_description(
             self, issue_key: str, description: dict[str, Any], *, expect_updated: str | None = None
         ) -> dict[str, Any]:
+            if expect_updated is not None and put_time_missing_token:
+                raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
             if expect_updated is not None and expect_updated != server_updated:
                 raise JiraConcurrentEditError(
                     f"Issue {issue_key} changed since it was read: expected updated="
@@ -342,9 +357,46 @@ def test_patch_description_section_missing_token_refusal_is_one_machine_readable
 
     assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
     payload = json.loads(result.stdout)
-    assert payload["error_type"] == "concurrency_guard_unavailable"
+    assert payload["error_type"] == "concurrent_edit_guard_unavailable"
     assert payload["issue"] == ISSUE_KEY
     assert payload["dry_run"] is False
+    assert writes == []
+
+
+def test_patch_description_section_put_time_missing_token_is_guard_unavailable_not_api_error(
+    tmp_path, monkeypatch
+) -> None:
+    """H4 regression. `patch-description-section` splits its read/build and its write into two
+    separate try blocks; the write-containing one used to catch only `JiraConcurrentEditError`
+    and the generic `JiraApiError`, so when the pre-PUT re-check inside `_guarded_issue_put`
+    itself found no usable token (distinct from the FIRST read having none, which the other try
+    block already handled), it fell through to the generic API-error handler: exit 1,
+    error_type "jira_api_error", instead of the same guard-unavailable refusal (exit 4,
+    "concurrent_edit_guard_unavailable") every other guarded command gives for this condition.
+    """
+    FakeClient, writes = _make_patch_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED, put_time_missing_token=True
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "patch-description-section",
+            ISSUE_KEY,
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nNew body.",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "concurrent_edit_guard_unavailable"
     assert writes == []
 
 
@@ -483,7 +535,7 @@ def test_all_four_json_error_documents_share_the_same_envelope_keys(tmp_path, mo
 
     documents = {
         "concurrent_edit": json.loads(concurrent_result.stdout),
-        "concurrency_guard_unavailable": json.loads(missing_result.stdout),
+        "concurrent_edit_guard_unavailable": json.loads(missing_result.stdout),
         "jira_api_error": json.loads(api_result.stdout),
         "write_safety_error": json.loads(safety_result.stdout),
     }
@@ -1024,26 +1076,40 @@ _PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x03\x06\x00\x00\x00F\
 
 
 def _make_embed_diagram_fake_client(
-    *, after_upload_updated: str | None, at_put_time_updated: str | None = None
-) -> tuple[type, list]:
+    *,
+    after_upload_updated: str | None,
+    at_put_time_updated: str | None = None,
+    initial_description: dict[str, Any] | None = None,
+    concurrent_description: dict[str, Any] | None = None,
+    delete_attachment_raises: bool = False,
+) -> tuple[type, list, list]:
     """Fake client for embed-diagram.
 
     Models Jira's real behaviour: uploading an attachment moves the issue's own `updated` on
-    the server. G1's pre-fix code read its guard token from the SAME `get_issue` call that ran
-    before the upload; a fake whose `add_attachment` left that reading undisturbed could never
-    reproduce the bug it was meant to catch, because it verified the test rather than the thing.
+    the server, AND a genuine concurrent editor can change the live `description` in the same
+    window (`concurrent_description`, applied at the same point `add_attachment` bumps
+    `updated` -- this fake has no finer time resolution than "before the upload" vs. "after
+    it"). The fixed code's SECOND `get_issue` read (fields=["description", "updated"]), issued
+    after the upload, must observe this live state, not the state the FIRST read saw. A fake
+    whose `get_issue` always returned the same frozen document regardless of when it was called
+    could never reproduce the round-2 bug (content built from the first read, token from a
+    later one) because it would verify the test rather than the thing.
 
     `add_attachment` bumps this fake's live `updated` state to `after_upload_updated` (`None`
-    models Jira still returning no usable timestamp after the upload). `issue_version` -- the
-    guard's own dedicated, late read -- reports that live state, raising
-    `JiraMissingConcurrencyTokenError` when it is unusable, exactly like the real client.
-    `at_put_time_updated` is the ground truth `edit_issue_adf_description`'s own guard finds
-    immediately before its PUT: it defaults to `after_upload_updated` (nothing but this
-    process's own upload happened) and only needs overriding to model a genuine third party
-    editing the issue in the narrow window that remains after the late read.
+    models Jira still returning no usable timestamp after the upload) and, when given, switches
+    the live description to `concurrent_description`. `issue_version` mirrors the same live
+    `updated` state for any code path that still reads it directly. `at_put_time_updated` is the
+    ground truth `_guarded_issue_put`'s own re-check finds immediately before its PUT: it
+    defaults to `after_upload_updated` (nothing but this process's own upload happened) and only
+    needs overriding to model a genuine third party editing the issue in the narrow window that
+    remains after the post-upload read.
     """
     writes: list[dict[str, Any]] = []
-    state: dict[str, str | None] = {"updated": "T-before-upload"}
+    deleted: list[str] = []
+    state: dict[str, Any] = {
+        "updated": "T-before-upload",
+        "description": initial_description or {"type": "doc", "version": 1, "content": []},
+    }
     resolved_at_put_time = (
         at_put_time_updated if at_put_time_updated is not None else after_upload_updated
     )
@@ -1059,31 +1125,277 @@ def _make_embed_diagram_fake_client(
             return None
 
         def get_issue(self, issue_key: str, *, fields=None, expand=None):
-            # Deliberately lenient about the exact fields list (only "description" and
-            # "attachment" are required): the pre-fix code also asked for "updated" here, and
-            # asserting the fixed code's narrower list would mask the actual regression this
-            # fake exists to reproduce behind an unrelated AssertionError.
-            assert fields is not None and "description" in fields and "attachment" in fields, (
-                fields
-            )
-            return {
-                "key": issue_key,
-                "fields": {
-                    "description": {"type": "doc", "version": 1, "content": []},
-                    "attachment": [],
-                    # Present even though the fixed code no longer requests or reads it from
-                    # this early call; the pre-fix code did read its (stale-by-construction)
-                    # guard token from exactly this value.
-                    "updated": state["updated"],
-                },
-            }
+            assert fields is not None, fields
+            payload: dict[str, Any] = {"key": issue_key, "fields": {"updated": state["updated"]}}
+            if "description" in fields:
+                payload["fields"]["description"] = state["description"]
+            if "attachment" in fields:
+                payload["fields"]["attachment"] = []
+            return payload
 
         def add_attachment(self, issue_key: str, file_path):
             state["updated"] = after_upload_updated
+            if concurrent_description is not None:
+                state["description"] = concurrent_description
             return [{"id": "9001", "filename": Path(file_path).name}]
 
         def attachment_media_id(self, attachment_id: str, *, issue_key: str) -> str:
             return "media-diagram-1"
+
+        def issue_version(self, issue_key: str) -> str:
+            current = state["updated"]
+            if not isinstance(current, str) or not current:
+                raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
+            return current
+
+        def edit_issue_adf_description(self, issue_key: str, description, *, expect_updated=None):
+            if expect_updated is not None and expect_updated != resolved_at_put_time:
+                raise JiraConcurrentEditError(
+                    f"Issue {issue_key} changed since it was read: expected updated="
+                    f"{expect_updated!r}, found {resolved_at_put_time!r}. Re-read the issue and "
+                    "retry.",
+                    issue_key=issue_key,
+                    expected_updated=expect_updated,
+                    found_updated=resolved_at_put_time,
+                )
+            writes.append(
+                {"issue": issue_key, "description": description, "expect_updated": expect_updated}
+            )
+            return {"id": "1"}
+
+        def delete_attachment(self, attachment_id: str, *, issue_key: str) -> dict[str, Any]:
+            deleted.append(attachment_id)
+            if delete_attachment_raises:
+                raise JiraApiError("cleanup delete failed")
+            return {}
+
+    return FakeClient, writes, deleted
+
+
+def test_embed_diagram_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    """A genuine third-party edit landing after the late read must still refuse."""
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED, at_put_time_updated=CHANGED_UPDATED
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert writes == []
+    # H2: the refused write must not orphan the attachment this command already uploaded.
+    assert deleted == ["9001"]
+
+
+def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+
+
+def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
+    """F2's lesson carried to embed-diagram: a missing `updated` with the guard on must refuse,
+    not silently write unguarded."""
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(after_upload_updated=None)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert "Concurrency guard unavailable" in result.stderr
+    assert writes == []
+    # H2: a missing-token refusal must not orphan the attachment this command already uploaded.
+    assert deleted == ["9001"]
+
+
+def test_embed_diagram_cleanup_failure_does_not_mask_the_original_refusal(
+    tmp_path, monkeypatch
+) -> None:
+    """H2: the cleanup delete is itself best-effort and must not replace the ORIGINAL error
+    (the concurrent-edit refusal) with whatever the cleanup attempt raised.
+    """
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED,
+        at_put_time_updated=CHANGED_UPDATED,
+        delete_attachment_raises=True,
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert "Concurrent edit refused:" in result.stderr
+    assert writes == []
+    assert deleted == ["9001"], "cleanup must still be attempted even though it will fail"
+
+
+def test_embed_diagram_execute_succeeds_despite_upload_moving_updated_no_orphan(
+    tmp_path, monkeypatch
+) -> None:
+    """G1 regression. embed-diagram's own attachment upload moves the issue's `updated` on the
+    Jira side. Before the fix, the guard token was captured BEFORE that upload from the initial
+    `get_issue` read, so it was stale by construction: this exact scenario -- no external editor
+    at all -- refused every guarded execution, after the attachment had already been uploaded,
+    orphaning it with no description referencing it. This must succeed, and the written
+    description must actually embed the uploaded attachment's media.
+    """
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+    assert adf_contains_media_id(writes[0]["description"], "media-diagram-1")
+
+
+def _paragraph(text: str) -> dict[str, Any]:
+    return {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+
+
+def test_embed_diagram_execute_incorporates_concurrent_edit_landing_before_post_upload_read(
+    tmp_path, monkeypatch
+) -> None:
+    """H1 regression. A concurrent editor's change lands in the window between the FIRST read
+    (the one that only resolves --delete-filename and feeds the dry-run display) and the
+    post-upload SECOND read that now supplies both the content and the guard token.
+
+    Round 2's bug built the write from the FIRST read's description while reading the token from
+    a separate, later `issue_version` call: the token would match (nothing further changed after
+    the upload), so the write would go ahead and REPORT a guarded success, but the written
+    document would silently drop the concurrent editor's paragraph, because it was never in the
+    document round 2 built from. The fix must build from the post-upload read instead, so this
+    same concurrent edit is INCORPORATED into the write, not lost by it.
+    """
+    initial_description = {"type": "doc", "version": 1, "content": [_paragraph("Original content")]}
+    concurrent_description = {
+        "type": "doc",
+        "version": 1,
+        "content": [_paragraph("Original content"), _paragraph("Concurrent editor's note")],
+    }
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED,
+        initial_description=initial_description,
+        concurrent_description=concurrent_description,
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    written_description = writes[0]["description"]
+    assert adf_contains_media_id(written_description, "media-diagram-1")
+    written_texts = [
+        item.get("text")
+        for block in written_description["content"]
+        if block.get("type") == "paragraph"
+        for item in block.get("content", [])
+    ]
+    assert "Concurrent editor's note" in written_texts, (
+        "the concurrent editor's paragraph must survive the write, not be silently dropped: "
+        f"{written_description}"
+    )
+
+
+# --- render-mermaid: H1/H5's other read-mutate-write-whole-field shape ----------------------
+
+_MERMAID_CODE_BLOCK = {
+    "type": "codeBlock",
+    "attrs": {"language": "mermaid"},
+    "content": [{"type": "text", "text": "flowchart LR\nA --> B"}],
+}
+
+
+def _make_render_mermaid_fake_client(
+    *,
+    after_upload_updated: str | None,
+    at_put_time_updated: str | None = None,
+    initial_description: dict[str, Any] | None = None,
+    concurrent_description: dict[str, Any] | None = None,
+) -> tuple[type, list]:
+    """Fake client for render-mermaid. Same shape as `_make_embed_diagram_fake_client`: uploading
+    a rendered PNG moves the issue's own `updated`, and `concurrent_description` models a genuine
+    concurrent editor's change becoming visible by the time of the post-upload SECOND read.
+    """
+    writes: list[dict[str, Any]] = []
+    state: dict[str, Any] = {
+        "updated": "T-before-upload",
+        "description": initial_description
+        or {"type": "doc", "version": 1, "content": [_MERMAID_CODE_BLOCK]},
+    }
+    resolved_at_put_time = (
+        at_put_time_updated if at_put_time_updated is not None else after_upload_updated
+    )
+
+    class FakeClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get_issue(self, issue_key: str, *, fields=None, expand=None):
+            assert fields is not None, fields
+            payload: dict[str, Any] = {"key": issue_key, "fields": {"updated": state["updated"]}}
+            if "description" in fields:
+                payload["fields"]["description"] = state["description"]
+            if "attachment" in fields:
+                payload["fields"]["attachment"] = []
+            return payload
+
+        def add_attachment(self, issue_key: str, path):
+            state["updated"] = after_upload_updated
+            if concurrent_description is not None:
+                state["description"] = concurrent_description
+            return [{"id": "9101", "filename": Path(path).name}]
+
+        def attachment_media_id(self, attachment_id: str, *, issue_key: str) -> str:
+            return "media-mermaid-1"
 
         def issue_version(self, issue_key: str) -> str:
             current = state["updated"]
@@ -1112,53 +1424,71 @@ def _make_embed_diagram_fake_client(
     return FakeClient, writes
 
 
-def test_embed_diagram_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
-    """A genuine third-party edit landing after the late read must still refuse."""
-    FakeClient, writes = _make_embed_diagram_fake_client(
-        after_upload_updated=READ_UPDATED, at_put_time_updated=CHANGED_UPDATED
+def _patch_mermaid_rendering(monkeypatch, tmp_path: Path) -> None:
+    def fake_render(_source, output_path, *, runtime):
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x03\x06\x00\x00\x00F\x08\x02\x00\x00\x00"
+        )
+        return Path(output_path)
+
+    monkeypatch.setattr(mermaid_module, "render_mermaid_png", fake_render)
+    monkeypatch.setattr(
+        cli,
+        "discover_mermaid_runtime",
+        lambda *_a, **_k: MermaidRuntime(
+            node=tmp_path / "node", cli=tmp_path / "cli.js", browser=tmp_path / "chrome"
+        ),
     )
-    png = tmp_path / "diagram.png"
-    png.write_bytes(_PNG_BYTES)
+
+
+def test_render_mermaid_execute_succeeds_despite_upload_moving_updated(
+    tmp_path, monkeypatch
+) -> None:
+    """G1-style regression carried to render-mermaid: its own upload moves `updated`, so a token
+    read before it (or from the first, pre-upload read) would be stale by construction."""
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(after_upload_updated=READ_UPDATED)
 
     result = _run(
         monkeypatch,
         tmp_path,
         FakeClient,
-        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+        ["render-mermaid", ISSUE_KEY, "--output-dir", str(tmp_path / "out"), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+    assert adf_contains_media_id(writes[0]["description"], "media-mermaid-1")
+
+
+def test_render_mermaid_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(
+        after_upload_updated=READ_UPDATED, at_put_time_updated=CHANGED_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["render-mermaid", ISSUE_KEY, "--output-dir", str(tmp_path / "out"), "--execute"],
     )
 
     assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
     assert writes == []
 
 
-def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
-    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
-    png = tmp_path / "diagram.png"
-    png.write_bytes(_PNG_BYTES)
+def test_render_mermaid_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(after_upload_updated=None)
 
     result = _run(
         monkeypatch,
         tmp_path,
         FakeClient,
-        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
-    )
-
-    assert result.exit_code == 0, result.stdout + result.stderr
-    assert len(writes) == 1
-
-
-def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
-    """F2's lesson carried to embed-diagram: a missing `updated` with the guard on must refuse,
-    not silently write unguarded."""
-    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=None)
-    png = tmp_path / "diagram.png"
-    png.write_bytes(_PNG_BYTES)
-
-    result = _run(
-        monkeypatch,
-        tmp_path,
-        FakeClient,
-        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+        ["render-mermaid", ISSUE_KEY, "--output-dir", str(tmp_path / "out"), "--execute"],
     )
 
     assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
@@ -1166,31 +1496,82 @@ def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monke
     assert writes == []
 
 
-def test_embed_diagram_execute_succeeds_despite_upload_moving_updated_no_orphan(
+def test_render_mermaid_no_concurrency_guard_writes_despite_missing_token(
     tmp_path, monkeypatch
 ) -> None:
-    """G1 regression. embed-diagram's own attachment upload moves the issue's `updated` on the
-    Jira side. Before the fix, the guard token was captured BEFORE that upload from the initial
-    `get_issue` read, so it was stale by construction: this exact scenario -- no external editor
-    at all -- refused every guarded execution, after the attachment had already been uploaded,
-    orphaning it with no description referencing it. This must succeed, and the written
-    description must actually embed the uploaded attachment's media.
-    """
-    FakeClient, writes = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
-    png = tmp_path / "diagram.png"
-    png.write_bytes(_PNG_BYTES)
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(after_upload_updated=None)
 
     result = _run(
         monkeypatch,
         tmp_path,
         FakeClient,
-        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+        [
+            "render-mermaid",
+            ISSUE_KEY,
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--no-concurrency-guard",
+            "--execute",
+        ],
     )
 
     assert result.exit_code == 0, result.stdout + result.stderr
     assert len(writes) == 1
-    assert writes[0]["expect_updated"] == READ_UPDATED
-    assert adf_contains_media_id(writes[0]["description"], "media-diagram-1")
+    assert writes[0]["expect_updated"] is None
+
+
+def test_render_mermaid_execute_incorporates_concurrent_edit_landing_before_post_upload_read(
+    tmp_path, monkeypatch
+) -> None:
+    """H1 regression for render-mermaid, the second command sharing embed-diagram's shape: a
+    concurrent editor's change lands between the FIRST read (which only finds the Mermaid blocks
+    to render) and the post-upload SECOND read that now supplies both content and guard token.
+    The write must incorporate it, not silently drop it the way round 2's token-after/content-
+    from-before split would have.
+    """
+    initial_description = {
+        "type": "doc",
+        "version": 1,
+        "content": [_paragraph("Original content"), _MERMAID_CODE_BLOCK],
+    }
+    concurrent_description = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            _paragraph("Original content"),
+            _paragraph("Concurrent editor's note"),
+            _MERMAID_CODE_BLOCK,
+        ],
+    }
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(
+        after_upload_updated=READ_UPDATED,
+        initial_description=initial_description,
+        concurrent_description=concurrent_description,
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["render-mermaid", ISSUE_KEY, "--output-dir", str(tmp_path / "out"), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    written_description = writes[0]["description"]
+    assert adf_contains_media_id(written_description, "media-mermaid-1")
+    written_texts = [
+        item.get("text")
+        for block in written_description["content"]
+        if block.get("type") == "paragraph"
+        for item in block.get("content", [])
+    ]
+    assert "Concurrent editor's note" in written_texts, (
+        "the concurrent editor's paragraph must survive the write, not be silently dropped: "
+        f"{written_description}"
+    )
 
 
 def _make_embed_existing_png_fake_client(

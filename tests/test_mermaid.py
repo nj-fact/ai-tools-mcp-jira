@@ -100,7 +100,15 @@ def test_embed_mermaid_diagrams_renders_before_upload_and_replaces_blocks(
 
     monkeypatch.setattr("jira_agent.mermaid.render_mermaid_png", fake_render)
 
+    description = text_to_adf(
+        "```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: Next\n```"
+    )
+
     class FakeClient:
+        def get_issue(self, _issue_key, *, fields=None, expand=None):
+            events.append("get_issue")
+            return {"fields": {"description": description, "updated": "T-fresh"}}
+
         def add_attachment(self, _issue_key, path):
             events.append(f"upload:{Path(path).name}")
             return [{"id": str(len(events)), "filename": Path(path).name}]
@@ -108,18 +116,16 @@ def test_embed_mermaid_diagrams_renders_before_upload_and_replaces_blocks(
         def attachment_media_id(self, attachment_id, *, issue_key):
             return f"media-{issue_key}-{attachment_id}"
 
-        def edit_issue_adf_description(self, _issue_key, description):
+        def edit_issue_adf_description(self, _issue_key, description, *, expect_updated=None):
             events.append("edit")
             self.description = description
+            self.expect_updated = expect_updated
             return {"updated": True}
 
         def delete_attachment(self, attachment_id, *, issue_key):
             events.append(f"delete:{issue_key}:{attachment_id}")
 
     client = FakeClient()
-    description = text_to_adf(
-        "```mermaid\nflowchart LR\nA --> B\n```\n\n```mermaid\nsequenceDiagram\nA->>B: Next\n```"
-    )
     result = embed_mermaid_diagrams(
         client,
         issue_key="FC-123",
@@ -142,6 +148,9 @@ def test_embed_mermaid_diagrams_renders_before_upload_and_replaces_blocks(
         "mediaSingle",
         "mediaSingle",
     ]
+    # The guard token comes from the post-upload get_issue read, not from a token captured
+    # before the uploads (which would be stale by construction; see H1/G1).
+    assert client.expect_updated == "T-fresh"
 
 
 def test_embed_mermaid_diagrams_rolls_back_uploads_when_description_edit_fails(
@@ -157,13 +166,21 @@ def test_embed_mermaid_diagrams_rolls_back_uploads_when_description_edit_fails(
     monkeypatch.setattr("jira_agent.mermaid.render_mermaid_png", fake_render)
 
     class FakeClient:
+        def get_issue(self, _issue_key, *, fields=None, expand=None):
+            return {
+                "fields": {
+                    "description": text_to_adf("```mermaid\nflowchart LR\nA --> B\n```"),
+                    "updated": "T-fresh",
+                }
+            }
+
         def add_attachment(self, _issue_key, path):
             return [{"id": "new-1", "filename": Path(path).name}]
 
         def attachment_media_id(self, _attachment_id, *, issue_key):
             return f"media-{issue_key}"
 
-        def edit_issue_adf_description(self, _issue_key, _description):
+        def edit_issue_adf_description(self, _issue_key, _description, *, expect_updated=None):
             raise JiraApiError("edit failed")
 
         def delete_attachment(self, attachment_id, *, issue_key):
