@@ -496,6 +496,191 @@ def test_edit_issue_sends_fix_versions_in_the_jira_shape() -> None:
     assert seen["json"] == '{"fields":{"fixVersions":[{"name":"FCL-MVP"}]}}'
 
 
+# --- Atomic `update` operations for labels / fixVersions -------------------------------------
+#
+# Jira's editmeta for this site advertises `operations: ["add", "set", "remove"]` for `labels`
+# (string items) and `operations: ["set", "add", "remove"]` for `fixVersions` (version-object
+# items, `{"name": ...}`). `add`/`remove` are applied server-side against whatever the field
+# currently holds, unlike `fields`, which replaces the whole value outright -- see
+# `edit_issue_payload`'s docstring.
+
+
+def test_edit_issue_payload_builds_atomic_labels_add_remove_ops() -> None:
+    payload = edit_issue_payload(labels_add=["needs-review"], labels_remove=["stale"])
+
+    assert payload == {
+        "fields": {},
+        "update": {"labels": [{"add": "needs-review"}, {"remove": "stale"}]},
+    }
+
+
+def test_edit_issue_payload_builds_atomic_fix_versions_add_remove_ops() -> None:
+    payload = edit_issue_payload(fix_versions_add=["FCL-MVP"], fix_versions_remove=["FCL-1.0"])
+
+    assert payload == {
+        "fields": {},
+        "update": {
+            "fixVersions": [{"add": {"name": "FCL-MVP"}}, {"remove": {"name": "FCL-1.0"}}]
+        },
+    }
+
+
+def test_edit_issue_payload_combines_a_whole_field_set_with_an_unrelated_atomic_op() -> None:
+    """Different fields in one PUT: `fields` and `update` may both appear, as long as no field
+    is named in both."""
+    payload = edit_issue_payload(summary="New title", labels_add=["needs-review"])
+
+    assert payload == {
+        "fields": {"summary": "New title"},
+        "update": {"labels": [{"add": "needs-review"}]},
+    }
+
+
+def test_edit_issue_payload_refuses_labels_set_and_update_together() -> None:
+    try:
+        edit_issue_payload(labels=["a"], labels_add=["b"])
+    except ValueError as exc:
+        assert "labels" in str(exc)
+        assert "both sets a field via `fields` and updates it via `update`" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_fix_versions_set_and_update_together() -> None:
+    try:
+        edit_issue_payload(fix_versions=["FCL-MVP"], fix_versions_remove=["FCL-MVP"])
+    except ValueError as exc:
+        assert "fixVersions" in str(exc)
+        assert "both sets a field via `fields` and updates it via `update`" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_sends_update_section_in_the_jira_shape() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-107", labels_add=["needs-review"], labels_remove=["stale"])
+
+    # No "fields" key at all when the request is purely atomic -- not even an empty one.
+    assert seen["json"] == '{"update":{"labels":[{"add":"needs-review"},{"remove":"stale"}]}}'
+
+
+def test_edit_issue_atomic_label_ops_send_no_extra_read_though_method_is_guardable() -> None:
+    """Mirrors test_edit_issue_adf_description_without_guard_sends_no_extra_read: `edit_issue`
+    is a guardable method (it calls `_guarded_issue_put`), but a caller that never passes
+    `expect_updated` gets exactly the unguarded behaviour -- no extra GET -- whether the payload
+    is a whole-field rewrite or, as here, purely atomic add/remove operations that never needed
+    one in the first place.
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-1", labels_add=["needs-review"])
+
+    assert calls == ["PUT"]
+
+
+class _StatefulLabelsServer:
+    """Stands in for Jira's own issue resource for exactly one behaviour: `labels` is a single
+    array this fake stores server-side, and a PUT can either replace it outright (`fields`) or
+    apply `add`/`remove` operations against whatever it currently holds (`update`) -- the same
+    two shapes `editmeta` advertises for this field on the real site. A test can mutate
+    `self.labels` directly to model "a concurrent editor's write already landed", independently
+    of anything this process itself read or is about to send.
+    """
+
+    def __init__(self, labels: list[str]) -> None:
+        self.labels = list(labels)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"labels": list(self.labels)}})
+        assert request.method == "PUT"
+        body = json.loads(request.read().decode())
+        fields = body.get("fields") or {}
+        if "labels" in fields:
+            self.labels = list(fields["labels"])
+        update = body.get("update") or {}
+        for op in update.get("labels", []):
+            if "add" in op:
+                if op["add"] not in self.labels:
+                    self.labels.append(op["add"])
+            elif "remove" in op:
+                if op["remove"] in self.labels:
+                    self.labels.remove(op["remove"])
+        return httpx.Response(204)
+
+
+def _client_against(server: _StatefulLabelsServer) -> JiraClient:
+    return JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(server.handler),
+        ),
+    )
+
+
+def test_atomic_label_add_survives_a_label_a_concurrent_editor_already_added() -> None:
+    """The claim this task exists to prove: an atomic `add` operation, sent with no whole-array
+    read at all, cannot lose a label a concurrent editor already wrote server-side, because Jira
+    applies it against whatever the array holds AT WRITE TIME, not against a value this process
+    read."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    # A concurrent editor's own write already landed on the server before ours is sent.
+    server.labels.append("concurrent-label")
+
+    client.edit_issue("FC-1", labels_add=["mine"])
+
+    assert set(server.labels) == {"existing", "concurrent-label", "mine"}
+
+
+def test_whole_array_label_set_loses_a_label_a_concurrent_editor_already_added() -> None:
+    """Same scenario, but through the OLD whole-array shape (`labels=[...]`, computed from a
+    read taken before the concurrent write landed): the stale computed array overwrites the
+    concurrent editor's label outright. This is the exact failure `labels_add`/`labels_remove`
+    exists to make impossible, demonstrated here rather than only asserted."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    # This read happens BEFORE the concurrent write below -- exactly the race window a
+    # read-transform-whole-field-rewrite cannot close.
+    read_labels = client.get_issue("FC-1", fields=["labels"])["fields"]["labels"]
+    computed = sorted({*read_labels, "mine"})
+
+    server.labels.append("concurrent-label")
+
+    client.edit_issue("FC-1", labels=computed)
+
+    assert "concurrent-label" not in server.labels
+    assert set(server.labels) == {"existing", "mine"}
+
+
 def test_create_issue_payload_writes_story_points_to_the_configured_field() -> None:
     payload = create_issue_payload(
         project_key="FC",

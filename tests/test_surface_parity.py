@@ -304,6 +304,36 @@ def test_every_edit_issue_call_is_guarded_or_on_the_named_allowlist() -> None:
     assert not stale, f"allowlist entries no longer match any unguarded call: {sorted(stale)}"
 
 
+# --- Atomic array ops: no `_NO_GUARD_ALLOWLIST` entry is needed, deliberately -------------------
+#
+# labels_add/labels_remove/fix_versions_add/fix_versions_remove build Jira `update` operations
+# (see edit_issue_payload's docstring), applied server-side against whatever the field currently
+# holds -- there is no read-modify-write here for a stale `expect_updated` token to protect, and
+# none should ever be passed for a call built only from these four parameters.
+#
+# That call still goes through `edit_issue`, which the visitor above treats as guarded (it calls
+# `_guarded_issue_put`), so `_EditCallVisitor` requires every call site to either pass
+# `expect_updated=` as a keyword or sit on `_NO_GUARD_ALLOWLIST`. The atomic call sites below
+# choose the first option -- they spell `expect_updated=None` explicitly rather than omitting the
+# keyword -- so the visitor already sees them as "accounted for" with no allowlist entry required.
+# This is the deliberate choice, not an accident of the AST check: an allowlist entry would wrongly
+# say "this omits the guard as a documented exception to a rule that otherwise applies to it",
+# when the truth is closer to "this call was never in the guard's domain to begin with" (unlike
+# `clear_parent`, which IS in that domain -- it could carry a token -- and is allowlisted instead
+# because a post-write reread verifies its outcome directly).
+#
+# Pin the literal at drift-labels' two call sites (its only atomic-only ones today) so a
+# regression that starts computing or threading a real token through either surface again is
+# caught here, not by an adversarial reviewer re-deriving this reasoning from scratch.
+
+
+def test_drift_label_writes_pass_no_guard_token_explicitly() -> None:
+    cli_source = inspect.getsource(cli.drift_labels)
+    mcp_source = inspect.getsource(mcp_server.jira_update_drift_labels)
+    assert "expect_updated=None" in cli_source
+    assert "expect_updated=None" in mcp_source
+
+
 # --- Sprint hardening: the concurrency guard's scope is a deliberate decision, not a gap -------
 #
 # `_guarded_issue_put` (and the `expect_updated` contract it enforces) exists for a specific

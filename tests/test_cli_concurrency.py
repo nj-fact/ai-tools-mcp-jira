@@ -637,6 +637,109 @@ def test_edit_issue_json_refusal_is_one_machine_readable_document(tmp_path, monk
     assert writes == []
 
 
+def test_edit_issue_atomic_label_ops_alone_skip_the_guard_read_entirely(
+    tmp_path, monkeypatch
+) -> None:
+    """A call carrying only --add-label/--remove-label (no whole-field option at all) has
+    nothing for a concurrency token to protect, so it must not read `issue_version` at all, even
+    though --concurrency-guard defaults on."""
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+    read_calls: list[str] = []
+    original_issue_version = FakeClient.issue_version
+
+    def issue_version(self, issue_key: str) -> str:
+        read_calls.append(issue_key)
+        return original_issue_version(self, issue_key)
+
+    FakeClient.issue_version = issue_version
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--add-label", "reviewed", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert read_calls == [], "atomic-only edit-issue must not read issue_version at all"
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] is None
+    assert writes[0]["kwargs"]["labels_add"] == ["reviewed"]
+
+
+def test_edit_issue_mixed_whole_field_and_atomic_still_reads_the_guard(
+    tmp_path, monkeypatch
+) -> None:
+    """Combining an unrelated whole-field option with an atomic op still guards the whole-field
+    part: --summary together with --add-label is one PUT carrying both `fields` and `update`."""
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "edit-issue",
+            ISSUE_KEY,
+            "--summary",
+            "New title",
+            "--add-label",
+            "reviewed",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+    assert writes[0]["kwargs"]["summary"] == "New title"
+    assert writes[0]["kwargs"]["labels_add"] == ["reviewed"]
+
+
+def test_edit_issue_refuses_to_combine_whole_array_labels_with_atomic_label_ops(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--labels", "a,b", "--add-label", "c"],
+    )
+
+    assert result.exit_code == 2, result.stdout + result.stderr
+    assert "--labels" in result.stderr
+    assert "--add-label" in result.stderr
+    assert writes == []
+
+
+def test_edit_issue_refuses_to_combine_whole_array_fix_version_with_atomic_ops(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--fix-version", "FCL-MVP", "--remove-fix-version", "FCL-1.0"],
+    )
+
+    assert result.exit_code == 2, result.stdout + result.stderr
+    assert "--fix-version" in result.stderr
+    assert "--remove-fix-version" in result.stderr
+    assert writes == []
+
+
 # --- edit-comment / delete-comment ----------------------------------------------------------
 
 
@@ -952,13 +1055,19 @@ def test_human_brief_no_concurrency_guard_writes_despite_change(tmp_path, monkey
     assert writes[0]["expect_updated"] is None
 
 
-# --- drift-labels: G8 surfaced this whole-array read-transform-write had no guard at all -----
+# --- drift-labels: converted from a guarded whole-array read-transform-write (G8) to atomic ---
+# add/remove operations. Add/remove alone need no read and no guard at all; --clear is the one
+# path that still reads `labels` once, to name the drift-* labels currently present as explicit
+# remove operations, and that read still carries no guard either (see cli.drift_labels).
 
 
-def _make_drift_labels_fake_client(
-    *, read_updated: str, server_updated: str
-) -> tuple[type, list]:
-    writes: list[dict[str, Any]] = []
+def _make_stateful_drift_labels_client(initial_labels: list[str]) -> tuple[type, dict[str, Any]]:
+    """A fake that models Jira's own `add`/`remove` semantics against ONE stored array, the way
+    the real Jira API does server-side -- not a client-side whole-array replacement. This is what
+    lets a test prove a concurrently added label survives an atomic write: the fake applies each
+    operation against whatever `state["labels"]` holds at write time, exactly like Jira does.
+    """
+    state: dict[str, Any] = {"labels": list(initial_labels), "get_issue_calls": 0}
 
     class FakeClient:
         def __init__(self, config: JiraConfig) -> None:
@@ -971,103 +1080,162 @@ def _make_drift_labels_fake_client(
             return None
 
         def get_issue(self, issue_key: str, *, fields: list[str] | None = None, **_kwargs: Any):
-            assert fields == ["labels", "updated"], fields
-            return {
-                "key": issue_key,
-                "fields": {"labels": ["drift-open"], "updated": read_updated},
-            }
+            assert fields == ["labels"], fields
+            state["get_issue_calls"] += 1
+            return {"key": issue_key, "fields": {"labels": list(state["labels"])}}
 
         def edit_issue(
-            self, issue_key: str, *, labels=None, expect_updated: str | None = None, **_kw: Any
+            self,
+            issue_key: str,
+            *,
+            labels_add: list[str] | None = None,
+            labels_remove: list[str] | None = None,
+            expect_updated: str | None = None,
+            **_kw: Any,
         ) -> dict[str, Any]:
-            if expect_updated is not None and expect_updated != server_updated:
-                raise JiraConcurrentEditError(
-                    f"Issue {issue_key} changed since it was read: expected updated="
-                    f"{expect_updated!r}, found {server_updated!r}. Re-read the issue and retry.",
-                    issue_key=issue_key,
-                    expected_updated=expect_updated,
-                    found_updated=server_updated,
-                )
-            writes.append({"issue": issue_key, "labels": labels, "expect_updated": expect_updated})
+            assert expect_updated is None, "atomic label ops must never carry a guard token"
+            for label in labels_add or []:
+                if label not in state["labels"]:
+                    state["labels"].append(label)
+            for label in labels_remove or []:
+                if label in state["labels"]:
+                    state["labels"].remove(label)
             return {"key": issue_key, "fields": {}}
 
-    return FakeClient, writes
+    return FakeClient, state
 
 
-def test_drift_labels_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
-    FakeClient, writes = _make_drift_labels_fake_client(
-        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
-    )
-
-    result = _run(
-        monkeypatch,
-        tmp_path,
-        FakeClient,
-        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
-    )
-
-    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
-    assert writes == []
-
-
-def test_drift_labels_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
-    FakeClient, writes = _make_drift_labels_fake_client(
-        read_updated=READ_UPDATED, server_updated=READ_UPDATED
-    )
-
-    result = _run(
-        monkeypatch,
-        tmp_path,
-        FakeClient,
-        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
-    )
-
-    assert result.exit_code == 0, result.stdout + result.stderr
-    assert len(writes) == 1
-    assert set(writes[0]["labels"]) == {"drift-open", "drift-reviewed"}
-
-
-def test_drift_labels_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
-    FakeClient, writes = _make_drift_labels_fake_client(
-        read_updated=None, server_updated=READ_UPDATED
-    )
-
-    result = _run(
-        monkeypatch,
-        tmp_path,
-        FakeClient,
-        ["drift-labels", ISSUE_KEY, "--add", "drift-reviewed", "--execute"],
-    )
-
-    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
-    assert "Concurrency guard unavailable" in result.stderr
-    assert writes == []
-
-
-def test_drift_labels_no_concurrency_guard_writes_despite_missing_token(
+def test_drift_labels_add_writes_atomic_ops_with_no_read_and_no_guard(
     tmp_path, monkeypatch
 ) -> None:
-    FakeClient, writes = _make_drift_labels_fake_client(
-        read_updated=None, server_updated=READ_UPDATED
+    FakeClient, state = _make_stateful_drift_labels_client(["drift-open"])
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "reviewed", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert state["get_issue_calls"] == 0, "add/remove alone must not read the issue at all"
+    assert set(state["labels"]) == {"drift-open", "drift-reviewed"}
+
+
+def test_drift_labels_two_concurrent_adds_both_survive(tmp_path, monkeypatch) -> None:
+    """The point of this task: two agents adding different drift labels to the same issue, one
+    after the other with no coordination, must both land. A whole-array read-transform-write
+    computed by the first call would have raced the second; an atomic add cannot, because each
+    is applied against whatever the server currently holds, not against a value either call read.
+    """
+    FakeClient, state = _make_stateful_drift_labels_client(["drift-open"])
+
+    first = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "reviewed", "--execute"],
+    )
+    second = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "urgent", "--execute"],
+    )
+
+    assert first.exit_code == 0, first.stdout + first.stderr
+    assert second.exit_code == 0, second.stdout + second.stderr
+    assert set(state["labels"]) == {"drift-open", "drift-reviewed", "drift-urgent"}
+
+
+def test_drift_labels_clear_reads_once_and_removes_only_drift_prefixed_labels(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, state = _make_stateful_drift_labels_client(
+        ["jira-agent", "drift-old", "drift-keep"]
     )
 
     result = _run(
         monkeypatch,
         tmp_path,
         FakeClient,
-        [
-            "drift-labels",
-            ISSUE_KEY,
-            "--add",
-            "drift-reviewed",
-            "--no-concurrency-guard",
-            "--execute",
-        ],
+        ["drift-labels", ISSUE_KEY, "--add", "new", "--clear", "--execute"],
     )
 
     assert result.exit_code == 0, result.stdout + result.stderr
-    assert len(writes) == 1
-    assert writes[0]["expect_updated"] is None
+    assert state["get_issue_calls"] == 1, "--clear reads the issue exactly once"
+    assert set(state["labels"]) == {"jira-agent", "drift-new"}
+
+
+def test_drift_labels_clear_does_not_remove_a_drift_label_added_after_its_read(
+    tmp_path, monkeypatch
+) -> None:
+    """--clear's read is a snapshot: a drift label that lands after it is never named in an
+    explicit remove operation, so it survives, exactly like add/remove alone already do for
+    anything they were not told about."""
+    FakeClient, state = _make_stateful_drift_labels_client(["drift-old"])
+    original_get_issue = FakeClient.get_issue
+
+    def get_issue_then_concurrent_add(self, issue_key, **kwargs):
+        result = original_get_issue(self, issue_key, **kwargs)
+        state["labels"].append("drift-concurrent")
+        return result
+
+    FakeClient.get_issue = get_issue_then_concurrent_add
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--clear", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert state["labels"] == ["drift-concurrent"]
+
+
+def test_drift_labels_dry_run_shows_operations_not_a_guessed_resulting_array(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, state = _make_stateful_drift_labels_client(["drift-open"])
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "reviewed", "--remove", "open"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert state["get_issue_calls"] == 0
+    json_start = result.stdout.index("{\n")
+    payload, _ = json.JSONDecoder().raw_decode(result.stdout[json_start:])
+    assert payload == {
+        "payload": {
+            "fields": {},
+            "update": {"labels": [{"add": "drift-reviewed"}, {"remove": "drift-open"}]},
+        }
+    }
+    # Nothing was written: the dry run must not guess what the array would end up holding.
+    assert state["labels"] == ["drift-open"]
+
+
+def test_drift_labels_no_longer_offers_a_concurrency_guard_flag(tmp_path, monkeypatch) -> None:
+    """The old `--concurrency-guard/--no-concurrency-guard` option protected a whole-array
+    rewrite that no longer exists on any drift-labels path (add/remove need no read at all;
+    --clear's read only selects which remove operations to send). A flag that no longer does
+    anything is worse than one that was never documented, so it is removed, not just unused."""
+    FakeClient, _state = _make_stateful_drift_labels_client(["drift-open"])
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["drift-labels", ISSUE_KEY, "--add", "reviewed", "--no-concurrency-guard", "--execute"],
+    )
+
+    assert result.exit_code != 0
+    assert "no such option" in result.stdout.lower() + result.stderr.lower()
 
 
 # A minimal valid PNG header (signature + IHDR), reused from tests/test_client.py's own

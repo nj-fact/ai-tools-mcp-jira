@@ -617,6 +617,10 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
                 "parent_key": None,
                 "priority": None,
                 "story_points": None,
+                "labels_add": None,
+                "labels_remove": None,
+                "fix_versions_add": None,
+                "fix_versions_remove": None,
                 "expect_updated": "2026-09-14T10:00:00.000+0200",
             },
         }

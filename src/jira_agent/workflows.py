@@ -223,18 +223,38 @@ def normalize_drift_label(value: str) -> str:
     return label
 
 
-def update_drift_labels(
-    existing_labels: list[str],
+def drift_label_operations(
     *,
     add: list[str] | None = None,
     remove: list[str] | None = None,
+    existing_labels: list[str] | None = None,
     clear: bool = False,
-) -> list[str]:
-    labels = set(existing_labels)
+) -> tuple[list[str], list[str]]:
+    """Compute the (add, remove) label VALUES for an atomic Jira `labels` `update`, never a
+    whole replacement array.
+
+    `add` and `remove` alone need no read at all: each named label becomes its own `add` or
+    `remove` operation, applied by Jira against whatever the array currently holds server-side,
+    regardless of what else changed there since. That is `drift-labels`' ordinary path, and it
+    carries no concurrency guard because there is no read-modify-write left to protect.
+
+    `clear=True` is the one path that still needs a read: to remove "every label starting with
+    drift-", the caller first has to know which labels currently do. Pass that read's `labels` as
+    `existing_labels`; only the ones already present and drift-prefixed become explicit `remove`
+    operations, so a drift label some other, concurrent write adds after that read was taken is
+    never named here and survives, the same way `add`/`remove` alone already leaves everything
+    it was not told about untouched. This still needs no concurrency guard: the read only decides
+    WHICH remove operations to send, and each one, once sent, is itself safe against a concurrent
+    edit the same way any other `remove` operation is.
+
+    A label named in both `add` and `remove` ends up added, never removed, the same precedence
+    the previous whole-array implementation had (it applied `remove` before `add` against one
+    Python set) -- preserved here so the net *labels present* outcome for identical inputs against
+    an unchanged issue does not change, only how it is sent to Jira.
+    """
+    add_labels = sorted({normalize_drift_label(label) for label in add or []})
+    remove_labels = {normalize_drift_label(label) for label in remove or []}
     if clear:
-        labels = {label for label in labels if not label.startswith("drift-")}
-    for label in remove or []:
-        labels.discard(normalize_drift_label(label))
-    for label in add or []:
-        labels.add(normalize_drift_label(label))
-    return sorted(labels)
+        remove_labels |= {label for label in existing_labels or [] if label.startswith("drift-")}
+    remove_labels -= set(add_labels)
+    return add_labels, sorted(remove_labels)

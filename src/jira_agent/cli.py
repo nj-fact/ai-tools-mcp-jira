@@ -55,13 +55,13 @@ from jira_agent.safety import (
     ensure_project_write_allowed,
 )
 from jira_agent.workflows import (
+    drift_label_operations,
     drift_reconcile_comment_body,
     factory_contract_comment_body,
     issue_contains_link_id,
     read_text_source,
     resolve_directed_issue_link,
     resolve_png_attachment,
-    update_drift_labels,
 )
 
 app = typer.Typer(
@@ -1861,29 +1861,26 @@ def drift_labels(
         bool,
         typer.Option("--clear", help="Remove all existing drift-* labels."),
     ] = False,
-    concurrency_guard: Annotated[
-        bool,
-        typer.Option(
-            "--concurrency-guard/--no-concurrency-guard",
-            help=(
-                "Capture the issue's `updated` timestamp in the same read as its labels, then "
-                "refuse the write (exit code 4) if it no longer matches immediately before the "
-                "write. Default: guarded."
-            ),
-        ),
-    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually update labels in Jira."),
     ] = False,
 ) -> None:
-    """Set or remove drift-* labels. Defaults to dry-run.
+    """Add or remove drift-* labels atomically. Defaults to dry-run.
 
-    This reads the whole `labels` array, computes a new whole array, and writes it back --
-    exactly the read-transform-whole-field-rewrite shape the other guarded commands protect, so
-    a label a concurrent editor added after this read would otherwise be silently dropped when
-    the stale array overwrites it. By default the write is guarded the same way: the same read
-    that fetches `labels` also fetches `updated`, so the guard token belongs to that read.
+    `--add` and `--remove` need no read of the issue at all: each named label becomes its own
+    Jira `add`/`remove` operation on `labels` (see `editmeta`'s advertised operations for that
+    field), applied server-side against whatever the array currently holds, so two agents adding
+    different drift labels at the same time cannot lose each other's work. This command carries
+    NO concurrency guard on any path -- there is no whole-array read-modify-write left for a
+    stale `updated` token to protect.
+
+    `--clear` is the one path that still reads the issue first, once, to find out which labels
+    currently start with `drift-`; only those become explicit `remove` operations. A drift label
+    added by someone else after that read is never named and survives, the same way `--add`/
+    `--remove` alone already leave everything they were not told about untouched. That read
+    still needs no guard: it only decides which `remove` operations to send, and each one is
+    itself safe against a concurrent edit once sent.
     """
     config = _config()
     issue_key = key or config.test_issue_key
@@ -1895,42 +1892,44 @@ def drift_labels(
     with JiraClient(config) as client:
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["labels", "updated"])
-            issue_fields = issue.get("fields") or {}
-            expect_updated = require_concurrency_token(
-                issue_key, issue_fields.get("updated"), guard_enabled=concurrency_guard
-            )
-            existing = issue_fields.get("labels") or []
-            labels = update_drift_labels(
-                existing,
+            existing: list[str] | None = None
+            if clear:
+                issue = client.get_issue(issue_key, fields=["labels"])
+                existing = (issue.get("fields") or {}).get("labels") or []
+            add_labels, remove_labels = drift_label_operations(
                 add=_csv_list(add),
                 remove=_csv_list(remove),
+                existing_labels=existing,
                 clear=clear,
             )
-            payload = edit_issue_payload(labels=labels)
+            if not add_labels and not remove_labels:
+                console.print("[yellow]Nothing to do:[/yellow] no labels to add or remove.")
+                return
+            payload = edit_issue_payload(
+                labels_add=add_labels or None, labels_remove=remove_labels or None
+            )
             if not execute:
                 console.print("[yellow]Dry run:[/yellow] would update drift labels")
                 console.print(f"issue: {issue_key}")
                 console.print(f"safety: {safety}")
-                _print_json({"before": existing, "after": labels, "payload": payload})
+                _print_json({"payload": payload})
                 console.print("Pass --execute to write it to Jira.")
                 return
-            result = client.edit_issue(issue_key, labels=labels, expect_updated=expect_updated)
+            # Atomic add/remove: never pass expect_updated. There is no whole-array rewrite here
+            # for a stale token to protect (see the docstring above and drift_label_operations).
+            result = client.edit_issue(
+                issue_key,
+                labels_add=add_labels or None,
+                labels_remove=remove_labels or None,
+                expect_updated=None,
+            )
             audit_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
-                payload={
-                    "before": existing,
-                    "after": labels,
-                    "concurrency_guard": concurrency_guard,
-                },
+                payload=payload,
                 result=result,
             )
-        except JiraConcurrentEditError as exc:
-            _exit_concurrent_edit_error(exc, json_mode=False)
-        except JiraMissingConcurrencyTokenError as exc:
-            _exit_missing_concurrency_token_error(exc, json_mode=False)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -1973,13 +1972,71 @@ def edit_issue(
     ] = None,
     labels: Annotated[
         str | None,
-        typer.Option("--labels", help="Comma-separated labels to set."),
+        typer.Option(
+            "--labels",
+            help=(
+                "Comma-separated labels to set, replacing the whole array. Whole-array form: "
+                "this one CAN silently drop a label a concurrent editor added, so it carries the "
+                "concurrency guard (see --concurrency-guard). Cannot be combined with "
+                "--add-label/--remove-label."
+            ),
+        ),
+    ] = None,
+    add_label: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--add-label",
+            help=(
+                "Add one label without touching the rest (repeatable). Atomic form: applied "
+                "against whatever labels the issue currently has, so it cannot lose a "
+                "concurrent editor's own change and carries NO concurrency guard. Cannot be "
+                "combined with --labels."
+            ),
+        ),
+    ] = None,
+    remove_label: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--remove-label",
+            help=(
+                "Remove one label without touching the rest (repeatable). Same atomic form as "
+                "--add-label, so it carries NO concurrency guard. Cannot be combined with "
+                "--labels."
+            ),
+        ),
     ] = None,
     fix_version: Annotated[
         list[str] | None,
         typer.Option(
             "--fix-version",
-            help="Fix version name to set. Repeat to set several; pass none to leave unchanged.",
+            help=(
+                "Fix version name to set. Repeat to set several; pass none to leave unchanged. "
+                "Whole-array form: this one CAN silently drop a fix version a concurrent editor "
+                "added, so it carries the concurrency guard (see --concurrency-guard). Cannot be "
+                "combined with --add-fix-version/--remove-fix-version."
+            ),
+        ),
+    ] = None,
+    add_fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--add-fix-version",
+            help=(
+                "Add one fix version without touching the rest (repeatable). Atomic form: "
+                "applied against whatever fix versions the issue currently has, so it carries "
+                "NO concurrency guard. Cannot be combined with --fix-version."
+            ),
+        ),
+    ] = None,
+    remove_fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--remove-fix-version",
+            help=(
+                "Remove one fix version without touching the rest (repeatable). Same atomic "
+                "form as --add-fix-version, so it carries NO concurrency guard. Cannot be "
+                "combined with --fix-version."
+            ),
         ),
     ] = None,
     parent: Annotated[
@@ -2018,22 +2075,52 @@ def edit_issue(
 ) -> None:
     """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
 
-    `--description` and friends each replace the whole field, so a concurrent edit to that field
-    would otherwise be silently overwritten. By default the write is guarded: this command has
-    to add a dedicated read, since edit-issue previously read nothing before writing, so
-    immediately before attempting the write it captures the issue's `updated` timestamp with
-    `issue_version`, as late as possible to keep the window small. The client then re-checks that
-    same timestamp again right before the PUT and refuses the write (exit code 4) if it no longer
-    matches. This narrows the race window to a check-then-act gap; it is not an atomic
-    compare-and-swap, since Jira Cloud offers no conditional write here, so a change landing
-    inside that narrowed window is still lost. Pass --no-concurrency-guard for the old unguarded
-    behaviour.
+    `--description` and friends, plus the whole-array `--labels`/`--fix-version`, each replace
+    the whole field, so a concurrent edit to that same field would otherwise be silently
+    overwritten. By default a call that sets one of those is guarded: this command has to add a
+    dedicated read, since edit-issue previously read nothing before writing, so immediately
+    before attempting the write it captures the issue's `updated` timestamp with `issue_version`,
+    as late as possible to keep the window small. The client then re-checks that same timestamp
+    again right before the PUT and refuses the write (exit code 4) if it no longer matches. This
+    narrows the race window to a check-then-act gap; it is not an atomic compare-and-swap, since
+    Jira Cloud offers no conditional write here, so a change landing inside that narrowed window
+    is still lost. Pass --no-concurrency-guard for the old unguarded behaviour.
+
+    `--add-label`/`--remove-label` and `--add-fix-version`/`--remove-fix-version` are atomic
+    instead: Jira applies them against whatever the array currently holds server-side (see
+    `editmeta`'s advertised `add`/`remove` operations for `labels` and `fixVersions`), so they
+    cannot lose a concurrent editor's own change and never need `expect_updated`. A call that
+    mixes one of these with an unrelated whole-field option (for example `--summary` together
+    with `--add-label`) still reads and checks `updated` for the whole-field part; only a call
+    with no whole-field option at all skips that read entirely. `--labels` cannot be combined
+    with `--add-label`/`--remove-label`, and `--fix-version` cannot be combined with
+    `--add-fix-version`/`--remove-fix-version`: Jira rejects a PUT that both sets and updates the
+    same field.
     """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
         error_console.print(
             "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+
+    if labels is not None and (add_label or remove_label):
+        _print_error(
+            "Edit error:",
+            "Cannot combine --labels with --add-label/--remove-label: Jira rejects a PUT that "
+            "both sets and updates the same field. --labels replaces the whole array and "
+            "carries the concurrency guard; --add-label/--remove-label are atomic and carry "
+            "none. Use one form or the other.",
+        )
+        raise typer.Exit(2)
+    if fix_version and (add_fix_version or remove_fix_version):
+        _print_error(
+            "Edit error:",
+            "Cannot combine --fix-version with --add-fix-version/--remove-fix-version: Jira "
+            "rejects a PUT that both sets and updates the same field. --fix-version replaces "
+            "the whole array and carries the concurrency guard; --add-fix-version/"
+            "--remove-fix-version are atomic and carry none. Use one form or the other.",
         )
         raise typer.Exit(2)
 
@@ -2051,6 +2138,10 @@ def edit_issue(
             parent_key=parent,
             priority=priority,
             story_points=story_points,
+            labels_add=add_label,
+            labels_remove=remove_label,
+            fix_versions_add=add_fix_version,
+            fix_versions_remove=remove_fix_version,
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
@@ -2075,8 +2166,14 @@ def edit_issue(
             # minimal read added for the guard: it fetches only `updated`, taken as late as
             # possible (right before the write call below) so the window this narrows — between
             # this read and the client's own immediate re-check before its PUT — stays as small
-            # as this process can make it.
-            expect_updated = client.issue_version(issue_key) if concurrency_guard else None
+            # as this process can make it. Skipped entirely when the request carries no
+            # whole-field write at all (`payload["fields"]` empty): atomic-only add/remove
+            # operations need no token to guard with, so there is nothing here worth the read.
+            expect_updated = (
+                client.issue_version(issue_key)
+                if concurrency_guard and payload["fields"]
+                else None
+            )
 
             data = client.edit_issue(
                 issue_key,
@@ -2087,6 +2184,10 @@ def edit_issue(
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
+                labels_add=add_label,
+                labels_remove=remove_label,
+                fix_versions_add=add_fix_version,
+                fix_versions_remove=remove_fix_version,
                 expect_updated=expect_updated,
             )
             audit_write(

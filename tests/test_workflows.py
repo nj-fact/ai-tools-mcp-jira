@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from jira_agent.workflows import (
+    drift_label_operations,
     drift_reconcile_comment_body,
     factory_contract_comment_body,
     markdown_section,
@@ -8,7 +9,6 @@ from jira_agent.workflows import (
     read_text_source,
     resolve_directed_issue_link,
     resolve_png_attachment,
-    update_drift_labels,
 )
 
 
@@ -195,10 +195,36 @@ def test_normalize_drift_label_adds_prefix_and_normalizes_spacing() -> None:
     assert normalize_drift_label("drift-open") == "drift-open"
 
 
-def test_update_drift_labels_can_add_remove_and_clear() -> None:
-    assert update_drift_labels(
-        ["jira-agent", "drift-old", "drift-keep"],
+def test_drift_label_operations_add_and_remove_need_no_existing_labels() -> None:
+    """The ordinary path: add/remove alone never look at `existing_labels` (it is not even
+    passed here), because each named label becomes its own atomic operation regardless of what
+    else the array currently holds."""
+    assert drift_label_operations(add=["New"], remove=["Old"]) == (["drift-new"], ["drift-old"])
+
+
+def test_drift_label_operations_clear_removes_only_existing_drift_labels() -> None:
+    """NEW contract for the old test_update_drift_labels_can_add_remove_and_clear case: `clear`
+    turns every drift-* label found in `existing_labels` into an explicit remove operation
+    instead of folding survivors into a whole replacement array. `jira-agent` (not drift-*) never
+    appears in either list -- it was never a candidate for removal, and this function does not
+    report array survivors at all, only the operations to send."""
+    assert drift_label_operations(
         add=["new"],
         remove=["keep"],
+        existing_labels=["jira-agent", "drift-old", "drift-keep"],
         clear=True,
-    ) == ["drift-new", "jira-agent"]
+    ) == (["drift-new"], ["drift-keep", "drift-old"])
+
+
+def test_drift_label_operations_add_wins_over_remove_for_the_same_label() -> None:
+    """Preserves the previous whole-array implementation's precedence (remove processed before
+    add against one Python set): a label named in both lists is never sent as a remove
+    operation, only as an add."""
+    assert drift_label_operations(add=["open"], remove=["open"]) == (["drift-open"], [])
+
+
+def test_drift_label_operations_clear_alone_needs_no_add_or_remove() -> None:
+    assert drift_label_operations(existing_labels=["drift-a", "drift-b", "keep"], clear=True) == (
+        [],
+        ["drift-a", "drift-b"],
+    )

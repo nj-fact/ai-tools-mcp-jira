@@ -560,15 +560,24 @@ class JiraClient:
         issue_key: str,
         fields: dict[str, Any],
         *,
+        update: dict[str, Any] | None = None,
         expect_updated: str | None,
     ) -> dict[str, Any]:
-        """PUT one issue's fields, checking `updated` immediately beforehand when `expect_updated`
-        is given.
+        """PUT one issue's `fields` and/or `update` sections, checking `updated` immediately
+        beforehand when `expect_updated` is given.
 
         This is a check-then-act narrowing of the race window, NOT an atomic compare-and-swap:
         Jira Cloud's issue PUT offers no conditional-write mechanism (no ETag / If-Match), so a
         change landing between the read below and the PUT that follows it is still silently lost.
         Passing `expect_updated=None` keeps the previously unguarded behaviour exactly as it was.
+
+        `update` carries Jira's per-field `add`/`remove` array operations (see
+        `edit_issue_payload`). Those are exactly the case `expect_updated` does not need to cover:
+        Jira applies them against whatever the field holds server-side at write time, not against
+        a value this process read earlier, so there is no read-modify-write for a stale token to
+        protect. A caller that also supplies `fields` may still want the guard for THAT part of
+        the same PUT; the token, when given, gates the whole request, `update` included, since
+        Jira offers only one PUT per issue, not a way to guard one section and not the other.
         """
         if expect_updated is not None:
             found = self.issue_version(issue_key)
@@ -580,7 +589,12 @@ class JiraClient:
                     expected_updated=expect_updated,
                     found_updated=found,
                 )
-        return self._request("PUT", f"/issue/{issue_key}", json={"fields": fields}, key=issue_key)
+        body: dict[str, Any] = {}
+        if fields:
+            body["fields"] = fields
+        if update:
+            body["update"] = update
+        return self._request("PUT", f"/issue/{issue_key}", json=body, key=issue_key)
 
     def edit_issue(
         self,
@@ -594,8 +608,21 @@ class JiraClient:
         clear_parent: bool = False,
         priority: str | None = None,
         story_points: float | None = None,
+        labels_add: list[str] | None = None,
+        labels_remove: list[str] | None = None,
+        fix_versions_add: list[str] | None = None,
+        fix_versions_remove: list[str] | None = None,
         expect_updated: str | None = None,
     ) -> dict[str, Any]:
+        """Edit one issue. See `edit_issue_payload` for the `fields` vs. `update` split and the
+        set-and-update-the-same-field refusal.
+
+        Pass `expect_updated` only when this call includes a whole-field rewrite (`labels`,
+        `fix_versions`, or any other keyword here) worth guarding. A call carrying only
+        `labels_add`/`labels_remove`/`fix_versions_add`/`fix_versions_remove` needs no guard at
+        all -- Jira applies those against its own current state -- so such a call should leave
+        `expect_updated` at its default `None` rather than pay for a read that protects nothing.
+        """
         payload = edit_issue_payload(
             summary=summary,
             description=description,
@@ -605,9 +632,18 @@ class JiraClient:
             clear_parent=clear_parent,
             priority=priority,
             story_points=story_points,
+            labels_add=labels_add,
+            labels_remove=labels_remove,
+            fix_versions_add=fix_versions_add,
+            fix_versions_remove=fix_versions_remove,
             story_points_field=self.config.story_points_field,
         )
-        return self._guarded_issue_put(issue_key, payload["fields"], expect_updated=expect_updated)
+        return self._guarded_issue_put(
+            issue_key,
+            payload["fields"],
+            update=payload.get("update"),
+            expect_updated=expect_updated,
+        )
 
     def edit_issue_adf_description(
         self,
@@ -1958,8 +1994,36 @@ def edit_issue_payload(
     clear_parent: bool = False,
     priority: str | None = None,
     story_points: float | None = None,
+    labels_add: list[str] | None = None,
+    labels_remove: list[str] | None = None,
+    fix_versions_add: list[str] | None = None,
+    fix_versions_remove: list[str] | None = None,
     story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
+    """Build the PUT body `edit_issue` sends: a `fields` section (whole-field replacement) and,
+    when atomic array operations are requested, an `update` section alongside it.
+
+    `fields` entries replace a whole field's value outright. Jira applies them unconditionally,
+    so a concurrent editor's own change to that same field is silently lost the moment this
+    fields dict also names it -- exactly the race `expect_updated` (see `_guarded_issue_put`)
+    narrows for a caller that opts in.
+
+    `labels_add`/`labels_remove` and `fix_versions_add`/`fix_versions_remove` instead build
+    Jira's `update` array operations. Probed read-only against this Jira site's `editmeta`:
+    `labels` advertises `operations: ["add", "set", "remove"]` with string items, and
+    `fixVersions` advertises `operations: ["set", "add", "remove"]` with version-object items
+    (`{"name": ...}`). Jira applies `add`/`remove` against whatever the field holds server-side
+    at write time, not against a value read earlier, so there is no read-modify-write here for a
+    stale `expect_updated` token to protect -- and none should be passed for a call built only
+    from these four parameters (see `edit_issue`'s docstring).
+
+    Jira rejects a PUT that both sets and updates the SAME field, so passing `labels` together
+    with `labels_add`/`labels_remove` (or `fix_versions` together with
+    `fix_versions_add`/`fix_versions_remove`) raises ValueError here rather than sending that
+    doomed request. The CLI and the MCP server each pre-check the same conflict first, using
+    their own option/parameter spellings, so a caller sees a message naming what they actually
+    typed; this is the shared defence underneath both, and for any other caller of this function.
+    """
     if clear_parent and parent_key is not None:
         raise ValueError("Use either parent_key or clear_parent, not both")
     fields: dict[str, Any] = {}
@@ -1979,9 +2043,37 @@ def edit_issue_payload(
         fields["priority"] = {"name": priority}
     if story_points is not None:
         fields[story_points_field] = _story_points_value(story_points)
-    if not fields:
+
+    update: dict[str, Any] = {}
+    if labels_add or labels_remove:
+        if labels is not None:
+            raise ValueError(
+                "Cannot set and update `labels` in the same request: Jira rejects a PUT that "
+                "both sets a field via `fields` and updates it via `update`. Pass either "
+                "labels (the whole array) or labels_add/labels_remove (atomic operations), not "
+                "both."
+            )
+        update["labels"] = [{"add": value} for value in labels_add or []] + [
+            {"remove": value} for value in labels_remove or []
+        ]
+    if fix_versions_add or fix_versions_remove:
+        if fix_versions is not None:
+            raise ValueError(
+                "Cannot set and update `fixVersions` in the same request: Jira rejects a PUT "
+                "that both sets a field via `fields` and updates it via `update`. Pass either "
+                "fix_versions (the whole array) or fix_versions_add/fix_versions_remove (atomic "
+                "operations), not both."
+            )
+        update["fixVersions"] = [{"add": {"name": value}} for value in fix_versions_add or []] + [
+            {"remove": {"name": value}} for value in fix_versions_remove or []
+        ]
+
+    if not fields and not update:
         raise ValueError("At least one editable field must be provided")
-    return {"fields": fields}
+    payload: dict[str, Any] = {"fields": fields}
+    if update:
+        payload["update"] = update
+    return payload
 
 
 def issue_link_payload(

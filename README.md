@@ -338,8 +338,14 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   edit by default the same way `edit-issue` is: an `--no-concurrency-guard` opt-out is available.
 - Store Factory Contracts as comments or attachments with `factory-contract`
 - Post Drift Reconcile comments with `drift-reconcile-comment`
-- Set or remove `drift-*` labels with `drift-labels`
-- Edit summary, description, labels, parent, priority, and story points with `edit-issue`
+- Add or remove `drift-*` labels atomically with `drift-labels` (`--clear` removes every
+  existing `drift-*` label); see
+  [Atomic label and fix-version operations](#atomic-label-and-fix-version-operations)
+- Edit summary, description, labels, parent, priority, and story points with `edit-issue`; add or
+  remove individual labels and fix versions atomically on the same command with `--add-label`/
+  `--remove-label` and `--add-fix-version`/`--remove-fix-version`, alongside the whole-array
+  `--labels`/`--fix-version` (see
+  [Atomic label and fix-version operations](#atomic-label-and-fix-version-operations))
 - Clear an issue parent explicitly with `clear-parent`, with a post-write reread
 - Rewrite one section of an existing description with `patch-description-section`, which
   replaces, appends to, prepends to, or deletes the matched section and carries every top-level
@@ -474,21 +480,91 @@ The smoke test starts `jira-agent-mcp` over stdio, verifies the expected tool li
 
 ## Concurrency guard on whole-field rewrites
 
-`edit-issue`, `patch-description-section`, `human-brief`, `drift-labels`, `embed-diagram`,
-`embed-existing-png`, `upsert-image-gallery`, and `render-mermaid` each read an issue, then write
-a whole field back. By default all eight are guarded: the command captures the issue's `updated`
-timestamp — as part of its read where nothing changes the issue in between, or with a dedicated
-read immediately before the write when something does (`embed-diagram` and `render-mermaid`'s
-own uploads) — then refuses the write with exit code 4 (distinct from the generic API error's 1
-and the write-safety error's 3) if `updated` no longer matches immediately before the write.
-`issue-type` carries the same guard unconditionally, with no opt-out flag. The refusal names the
-issue and both timestamps in prose, and, under `--json`, in a JSON document carrying
-`error_type: "concurrent_edit"`, `expected_updated`, `found_updated`, and `dry_run`.
+`edit-issue`, `patch-description-section`, `human-brief`, `embed-diagram`, `embed-existing-png`,
+`upsert-image-gallery`, and `render-mermaid` each read an issue, then write a whole field back.
+By default all seven are guarded: the command captures the issue's `updated` timestamp — as part
+of its read where nothing changes the issue in between, or with a dedicated read immediately
+before the write when something does (`embed-diagram` and `render-mermaid`'s own uploads) — then
+refuses the write with exit code 4 (distinct from the generic API error's 1 and the write-safety
+error's 3) if `updated` no longer matches immediately before the write. `issue-type` carries the
+same guard unconditionally, with no opt-out flag. The refusal names the issue and both timestamps
+in prose, and, under `--json`, in a JSON document carrying `error_type: "concurrent_edit"`,
+`expected_updated`, `found_updated`, and `dry_run`.
 
 This is a check-then-act narrowing of the race window, not an atomic compare-and-swap: Jira
 Cloud exposes no conditional write (no ETag / If-Match) on the issue resource, so a change that
 lands inside that narrowed window is still silently lost. Pass `--no-concurrency-guard` on any of
-the eight opt-out-capable commands for the previous unguarded behaviour.
+the seven opt-out-capable commands for the previous unguarded behaviour.
+
+On `edit-issue` specifically, the guard only fires for a call that includes at least one
+whole-field rewrite (`--summary`, `--description`, the whole-array `--labels`/`--fix-version`,
+`--parent`, `--priority`, or `--story-points`): a call built entirely from the atomic
+`--add-label`/`--remove-label`/`--add-fix-version`/`--remove-fix-version` options below reads
+nothing and carries no guard, because there is no whole-array read for a stale token to protect.
+
+`drift-labels` no longer appears in the list above or carries a `--concurrency-guard` option at
+all. It used to read the whole `labels` array, compute a new array in Python, and write it back —
+exactly the shape the guard exists to protect — but every one of its paths (`--add`, `--remove`,
+and `--clear`) now sends atomic `add`/`remove` operations instead of a whole-array replacement.
+See [Atomic label and fix-version operations](#atomic-label-and-fix-version-operations) for what
+changed and why none of its three paths need the guard any more.
+
+## Atomic label and fix-version operations
+
+Jira's `editmeta` advertises which update operations a field accepts. Probed read-only against
+this site: `labels` reports `operations: ["add", "set", "remove"]` with plain string items, and
+`fixVersions` reports `operations: ["set", "add", "remove"]` with version-object items
+(`{"name": ...}`). This tool assumes `add`/`remove` are available for both fields on that basis,
+sent through Jira's issue PUT `update` section (`{"update": {"labels": [{"add": "x"}, ...]}}`)
+rather than the `fields` section every other write here uses. Jira applies `add`/`remove`
+against whatever the field holds server-side at write time, not against a value this tool read
+earlier, so there is no read-modify-write left for a concurrent editor's own change to lose, and
+no `expect_updated` guard is needed or accepted for a call built only from these operations.
+
+`edit-issue` exposes this as `--add-label`/`--remove-label` and `--add-fix-version`/
+`--remove-fix-version`, each repeatable, alongside the pre-existing whole-array `--labels` and
+`--fix-version`:
+
+```bash
+uv run jira-agent edit-issue FC-107 --add-label needs-review --remove-label stale --execute
+uv run jira-agent edit-issue FC-107 --add-fix-version FCL-MVP --execute
+```
+
+`--labels` and `--fix-version` still replace the whole array outright — genuinely useful when a
+caller wants to set the exact contents — and still carry the concurrency guard described above,
+because that whole-array replacement CAN silently drop a label or fix version a concurrent editor
+added since this process last read the issue. `--add-label`/`--remove-label` and
+`--add-fix-version`/`--remove-fix-version` cannot. Combining the whole-array form with the atomic
+form for the SAME field is refused locally, naming both options, rather than sent to Jira: it
+rejects a PUT that both sets and updates one field in the same request.
+
+```bash
+uv run jira-agent edit-issue FC-107 --labels a,b --add-label c
+# Edit error: Cannot combine --labels with --add-label/--remove-label: Jira rejects a PUT that
+# both sets and updates the same field. --labels replaces the whole array and carries the
+# concurrency guard; --add-label/--remove-label are atomic and carry none. Use one form or the
+# other.
+```
+
+The MCP `jira_edit_issue` tool takes the same four operations as `labels_add`/`labels_remove` and
+`fix_versions_add`/`fix_versions_remove`, with the identical refusal (naming `labels`/
+`labels_add`/`labels_remove` or `fix_versions`/`fix_versions_add`/`fix_versions_remove`) when a
+caller mixes the two forms for one field.
+
+`drift-labels` (and the MCP `jira_update_drift_labels`) is the atomic form's main customer: `--add`
+and `--remove` need no read of the issue at all — each named label becomes its own `add`/`remove`
+operation, so two agents adding different drift labels to the same issue at the same time cannot
+lose each other's work. `--clear` is the one path that still reads the issue, once, to find out
+which labels currently start with `drift-`; only those become explicit `remove` operations, so a
+drift label another writer adds after that read is never named and survives — the same guarantee
+`--add`/`--remove` already give everything they were not told about. None of the three paths
+carries a concurrency guard: `--add`/`--remove` have no read to guard, and `--clear`'s read only
+selects which `remove` operations to send, each of which is itself safe against a concurrent edit
+once sent.
+
+Every dry run under this section prints the exact operations it would send, never a guessed
+resulting array: the real result depends on server-side state this tool has not read, so showing
+anything else would be a guess dressed up as a preview.
 
 Two comment commands fill a gap where only `add-comment` existed:
 

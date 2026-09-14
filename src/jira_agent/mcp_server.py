@@ -54,13 +54,13 @@ from jira_agent.safety import (
     write_scope_summary,
 )
 from jira_agent.workflows import (
+    drift_label_operations,
     drift_reconcile_comment_body,
     factory_contract_comment_body,
     issue_contains_link_id,
     read_text_source,
     resolve_directed_issue_link,
     resolve_png_attachment,
-    update_drift_labels,
 )
 
 mcp = FastMCP("jira-agent")
@@ -678,6 +678,10 @@ def jira_edit_issue(
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
+    labels_add: list[str] | None = None,
+    labels_remove: list[str] | None = None,
+    fix_versions_add: list[str] | None = None,
+    fix_versions_remove: list[str] | None = None,
     guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
@@ -688,16 +692,29 @@ def jira_edit_issue(
     you supply, and that extract then becomes the entire description, dropping every other section
     the issue had. To change one section and keep the rest, use jira_patch_description_section.
 
-    Omitting fix_versions leaves the issue's fix versions untouched. Pass an empty list to
-    clear them, matching the labels convention; pass one or more version names to set them.
+    labels and fix_versions each replace the whole array outright: omitting one leaves that field
+    untouched, an empty list clears it, and a concurrent editor's own change to the same field is
+    silently lost when this call also names it -- guard_concurrent_edit exists for exactly this.
 
-    guard_concurrent_edit defaults to true: the issue's `updated` timestamp is read right before
-    the write and passed back as a concurrency guard, so a change that lands between that read
-    and this write is refused with error_type "concurrent_edit" naming both timestamps, instead
-    of being silently overwritten. When that dedicated read itself carries no usable `updated`,
-    this refuses with error_type "concurrent_edit_guard_unavailable" instead of a generic error,
-    the same outcome every other guarded tool produces for the same condition. Pass false to
-    skip the guard.
+    labels_add/labels_remove and fix_versions_add/fix_versions_remove are atomic instead: Jira
+    applies each one against whatever the field currently holds server-side (`editmeta`
+    advertises `add`/`remove` operations for both `labels` and `fixVersions` on this site), so
+    they cannot lose a concurrent editor's own change and never need a guard token. labels cannot
+    be combined with labels_add/labels_remove, and fix_versions cannot be combined with
+    fix_versions_add/fix_versions_remove: Jira rejects a PUT that both sets and updates the same
+    field, and this refuses the same way before sending it.
+
+    guard_concurrent_edit defaults to true: when this call includes at least one whole-field
+    write (summary, description, labels, fix_versions, parent_key, priority, or story_points),
+    the issue's `updated` timestamp is read right before the write and passed back as a
+    concurrency guard, so a change that lands between that read and this write is refused with
+    error_type "concurrent_edit" naming both timestamps, instead of being silently overwritten.
+    When that dedicated read itself carries no usable `updated`, this refuses with error_type
+    "concurrent_edit_guard_unavailable" instead of a generic error, the same outcome every other
+    guarded tool produces for the same condition. Pass false to skip the guard. A call with no
+    whole-field write at all -- only labels_add/labels_remove/fix_versions_add/
+    fix_versions_remove -- skips this read entirely regardless of guard_concurrent_edit: there is
+    nothing there for a token to protect.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -705,6 +722,28 @@ def jira_edit_issue(
         return {
             "ok": False,
             "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
+        }
+
+    if labels is not None and (labels_add or labels_remove):
+        return {
+            "ok": False,
+            "message": (
+                "Cannot combine labels with labels_add/labels_remove: Jira rejects a PUT that "
+                "both sets and updates the same field. labels replaces the whole array and "
+                "carries the concurrency guard; labels_add/labels_remove are atomic and carry "
+                "none. Use one form or the other."
+            ),
+        }
+    if fix_versions is not None and (fix_versions_add or fix_versions_remove):
+        return {
+            "ok": False,
+            "message": (
+                "Cannot combine fix_versions with fix_versions_add/fix_versions_remove: Jira "
+                "rejects a PUT that both sets and updates the same field. fix_versions replaces "
+                "the whole array and carries the concurrency guard; "
+                "fix_versions_add/fix_versions_remove are atomic and carry none. Use one form "
+                "or the other."
+            ),
         }
 
     try:
@@ -721,6 +760,10 @@ def jira_edit_issue(
             parent_key=parent_key,
             priority=priority,
             story_points=story_points,
+            labels_add=labels_add,
+            labels_remove=labels_remove,
+            fix_versions_add=fix_versions_add,
+            fix_versions_remove=fix_versions_remove,
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
@@ -729,7 +772,11 @@ def jira_edit_issue(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            expect_updated = client.issue_version(issue_key) if guard_concurrent_edit else None
+            expect_updated = (
+                client.issue_version(issue_key)
+                if guard_concurrent_edit and payload["fields"]
+                else None
+            )
             if not execute:
                 return {
                     "ok": True,
@@ -751,6 +798,10 @@ def jira_edit_issue(
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
+                labels_add=labels_add,
+                labels_remove=labels_remove,
+                fix_versions_add=fix_versions_add,
+                fix_versions_remove=fix_versions_remove,
                 expect_updated=expect_updated,
             )
             audit_write(
@@ -1268,19 +1319,23 @@ def jira_update_drift_labels(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     clear: bool = False,
-    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Set or remove drift-* labels. Defaults to dry-run.
+    """Add or remove drift-* labels atomically. Defaults to dry-run.
 
-    G2 decision: unlike jira_clear_issue_parent, this DOES need the guard. It reads the whole
-    `labels` array, computes a new whole array from add/remove/clear, and PUTs that array back
-    -- the same read-transform-whole-field-rewrite shape as the description rewrites this round
-    exists to protect, just for a list field instead of a document. A label a concurrent editor
-    added after this read is silently dropped when the stale array overwrites it, which a
-    single-target-value operation like clearing a parent cannot do to unrelated data.
-    guard_concurrent_edit defaults to true: the same read that fetches `labels` also fetches
-    `updated`, so the guard token belongs to that read; pass false to skip it.
+    add and remove need no read of the issue at all: each named label becomes its own Jira
+    `add`/`remove` operation on `labels` (`editmeta` advertises both for this field), applied
+    server-side against whatever the array currently holds, so two agents adding different drift
+    labels at the same time cannot lose each other's work. This tool carries NO concurrency
+    guard on any path -- there is no whole-array read-modify-write left for a stale `updated`
+    token to protect.
+
+    clear=True is the one path that still reads the issue first, once, to find out which labels
+    currently start with `drift-`; only those become explicit `remove` operations. A drift label
+    added by someone else after that read is never named and survives, the same way add/remove
+    alone already leave everything they were not told about untouched. That read still needs no
+    guard: it only decides which `remove` operations to send, and each one is itself safe
+    against a concurrent edit once sent.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -1292,41 +1347,54 @@ def jira_update_drift_labels(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["labels", "updated"])
-            issue_fields = issue.get("fields") or {}
-            expect_updated = require_concurrency_token(
-                issue_key, issue_fields.get("updated"), guard_enabled=guard_concurrent_edit
+            existing: list[str] | None = None
+            if clear:
+                issue = client.get_issue(issue_key, fields=["labels"])
+                existing = (issue.get("fields") or {}).get("labels") or []
+            add_labels, remove_labels = drift_label_operations(
+                add=add, remove=remove, existing_labels=existing, clear=clear
             )
-            existing = issue_fields.get("labels") or []
-            labels = update_drift_labels(existing, add=add, remove=remove, clear=clear)
-            payload = edit_issue_payload(labels=labels)
+            if not add_labels and not remove_labels:
+                return {
+                    "ok": True,
+                    "issue": issue_key,
+                    "labels_added": [],
+                    "labels_removed": [],
+                    "message": "Nothing to do: no labels to add or remove.",
+                }
+            payload = edit_issue_payload(
+                labels_add=add_labels or None, labels_remove=remove_labels or None
+            )
             if not execute:
                 return {
                     "ok": True,
                     "dry_run": True,
                     "issue": issue_key,
-                    "before": existing,
-                    "after": labels,
                     "payload": payload,
                     "safety": safety,
+                    "write_scope": write_scope_summary(config),
                 }
-            result = client.edit_issue(issue_key, labels=labels, expect_updated=expect_updated)
+            # Atomic add/remove: never pass expect_updated. There is no whole-array rewrite here
+            # for a stale token to protect (see this tool's docstring and drift_label_operations).
+            result = client.edit_issue(
+                issue_key,
+                labels_add=add_labels or None,
+                labels_remove=remove_labels or None,
+                expect_updated=None,
+            )
             audit_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
-                payload={
-                    "before": existing,
-                    "after": labels,
-                    "guard_concurrent_edit": guard_concurrent_edit,
-                },
+                payload=payload,
                 result=result,
             )
-            return {"ok": True, "issue": issue_key, "labels": labels}
-    except JiraConcurrentEditError as exc:
-        return _concurrent_edit_error(exc)
-    except JiraMissingConcurrencyTokenError as exc:
-        return _guard_unavailable_error(exc)
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "labels_added": add_labels,
+                "labels_removed": remove_labels,
+            }
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

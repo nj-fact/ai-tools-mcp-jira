@@ -1045,6 +1045,83 @@ def test_jira_edit_issue_guard_concurrent_edit_false_skips_the_guard(tmp_path, m
     assert client.edits[0]["expect_updated"] is None
 
 
+def test_jira_edit_issue_atomic_label_ops_alone_skip_the_guard_read(tmp_path, monkeypatch) -> None:
+    """A call carrying only labels_add/labels_remove (no whole-field write at all) has nothing
+    for a concurrency token to protect, so it must not read `issue_version` even though
+    guard_concurrent_edit defaults to true."""
+    client = _install_edit_issue_client(
+        monkeypatch,
+        tmp_path,
+        updated="2026-09-01T00:00:00.000+0000",
+        server_updated="2026-09-01T00:05:00.000+0000",
+    )
+    read_calls: list[str] = []
+    original_issue_version = EditIssueFakeClient.issue_version
+
+    def issue_version(self, issue_key):
+        read_calls.append(issue_key)
+        return original_issue_version(self, issue_key)
+
+    client.issue_version = issue_version.__get__(client, EditIssueFakeClient)
+
+    result = mcp_server.jira_edit_issue(key="FC-400", labels_add=["reviewed"], execute=True)
+
+    assert result == {"ok": True, "issue": "FC-400"}
+    assert read_calls == [], "atomic-only jira_edit_issue must not read issue_version at all"
+    assert client.edits[0]["expect_updated"] is None
+    assert client.edits[0]["labels_add"] == ["reviewed"]
+
+
+def test_jira_edit_issue_mixed_whole_field_and_atomic_still_reads_the_guard(
+    tmp_path, monkeypatch
+) -> None:
+    """Combining an unrelated whole-field write with an atomic op still guards the whole-field
+    part: summary together with labels_add is one PUT carrying both `fields` and `update`."""
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-400", summary="New title", labels_add=["reviewed"], execute=True
+    )
+
+    assert result == {"ok": True, "issue": "FC-400"}
+    assert client.edits[0]["expect_updated"] == client.updated
+    assert client.edits[0]["summary"] == "New title"
+    assert client.edits[0]["labels_add"] == ["reviewed"]
+
+
+def test_jira_edit_issue_refuses_to_combine_whole_array_labels_with_atomic_label_ops(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-400", labels=["a", "b"], labels_add=["c"], execute=True
+    )
+
+    assert result["ok"] is False
+    assert "labels" in result["message"]
+    assert "labels_add" in result["message"]
+    assert client.edits == []
+
+
+def test_jira_edit_issue_refuses_to_combine_whole_array_fix_versions_with_atomic_ops(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_edit_issue_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-400",
+        fix_versions=["FCL-MVP"],
+        fix_versions_remove=["FCL-1.0"],
+        execute=True,
+    )
+
+    assert result["ok"] is False
+    assert "fix_versions" in result["message"]
+    assert "fix_versions_remove" in result["message"]
+    assert client.edits == []
+
+
 def test_jira_agent_report_accepts_all_as_comment_limit_and_returns_true_counts(
     tmp_path, monkeypatch
 ) -> None:
@@ -2328,12 +2405,16 @@ def test_jira_write_human_brief_guard_false_ignores_missing_updated(tmp_path, mo
 
 
 class DriftLabelsFakeClient:
-    def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
-        self.updated = updated
-        self.server_updated = server_updated if server_updated is not None else updated
-        self.existing_labels = ["drift-open"]
+    """Models Jira's own `add`/`remove` semantics against ONE stored array (like the real API
+    applies them server-side), not a client-side whole-array replacement -- see
+    test_cli_concurrency.py's `_make_stateful_drift_labels_client` for the same shape on the CLI
+    surface. This is what lets a test prove a concurrently added label survives an atomic write.
+    """
+
+    def __init__(self, _config, *, initial_labels=("drift-open",)):
+        self.labels = list(initial_labels)
+        self.get_issue_calls = 0
         self.writes: list[dict[str, object]] = []
-        self.expect_updated_calls: list[str | None] = []
 
     def __enter__(self):
         return self
@@ -2344,25 +2425,24 @@ class DriftLabelsFakeClient:
     def get_issue(self, issue_key, *, fields=None, expand=None):
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
-        assert fields == ["labels", "updated"], fields
-        return {
-            "key": issue_key,
-            "fields": {"labels": self.existing_labels, "updated": self.updated},
-        }
+        assert fields == ["labels"], fields
+        self.get_issue_calls += 1
+        return {"key": issue_key, "fields": {"labels": list(self.labels)}}
 
-    def edit_issue(self, issue_key, *, labels=None, expect_updated=None, **_kwargs):
-        self.expect_updated_calls.append(expect_updated)
-        if expect_updated is not None and expect_updated != self.server_updated:
-            raise JiraConcurrentEditError(
-                f"Issue {issue_key} changed since it was read: expected updated="
-                f"{expect_updated!r}, found {self.server_updated!r}. Re-read the issue and "
-                "retry.",
-                issue_key=issue_key,
-                expected_updated=expect_updated,
-                found_updated=self.server_updated,
-            )
-        self.writes.append({"issue": issue_key, "labels": labels})
-        return {"key": issue_key, "fields": {"labels": labels}}
+    def edit_issue(
+        self, issue_key, *, labels_add=None, labels_remove=None, expect_updated=None, **_kwargs
+    ):
+        assert expect_updated is None, "atomic label ops must never carry a guard token"
+        self.writes.append(
+            {"issue": issue_key, "labels_add": labels_add, "labels_remove": labels_remove}
+        )
+        for label in labels_add or []:
+            if label not in self.labels:
+                self.labels.append(label)
+        for label in labels_remove or []:
+            if label in self.labels:
+                self.labels.remove(label)
+        return {"key": issue_key, "fields": {}}
 
 
 def _install_drift_labels_client(monkeypatch, tmp_path, **kwargs) -> DriftLabelsFakeClient:
@@ -2374,54 +2454,78 @@ def _install_drift_labels_client(monkeypatch, tmp_path, **kwargs) -> DriftLabels
     return client
 
 
-def test_jira_update_drift_labels_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
-    """G2 regression: a whole-array read-transform-write, exactly like the description
-    rewrites, had no guard at all before this fix."""
-    client = _install_drift_labels_client(
-        monkeypatch,
-        tmp_path,
-        updated="2026-01-01T00:00:00.000+0000",
-        server_updated="2026-01-01T00:05:00.000+0000",
-    )
-
-    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
-
-    assert result["ok"] is False
-    assert result["error_type"] == "concurrent_edit"
-    assert client.writes == []
-
-
-def test_jira_update_drift_labels_executes_when_updated_matches(tmp_path, monkeypatch) -> None:
+def test_jira_update_drift_labels_add_writes_atomic_ops_with_no_read(tmp_path, monkeypatch) -> None:
     client = _install_drift_labels_client(monkeypatch, tmp_path)
 
-    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["reviewed"], execute=True)
 
     assert result["ok"] is True
-    assert set(result["labels"]) == {"drift-open", "drift-reviewed"}
-    assert len(client.writes) == 1
+    assert result["labels_added"] == ["drift-reviewed"]
+    assert result["labels_removed"] == []
+    assert client.get_issue_calls == 0, "add/remove alone must not read the issue at all"
+    assert set(client.labels) == {"drift-open", "drift-reviewed"}
 
 
-def test_jira_update_drift_labels_refuses_when_updated_missing(tmp_path, monkeypatch) -> None:
-    client = _install_drift_labels_client(monkeypatch, tmp_path, updated=None)
+def test_jira_update_drift_labels_two_concurrent_adds_both_survive(tmp_path, monkeypatch) -> None:
+    """The point of this task: two callers adding different drift labels to the same issue must
+    both land, because each add is applied against whatever the server currently holds, not
+    against a value either call read."""
+    client = _install_drift_labels_client(monkeypatch, tmp_path)
 
-    result = mcp_server.jira_update_drift_labels("FC-1", add=["drift-reviewed"], execute=True)
+    first = mcp_server.jira_update_drift_labels("FC-1", add=["reviewed"], execute=True)
+    second = mcp_server.jira_update_drift_labels("FC-1", add=["urgent"], execute=True)
 
-    assert result["ok"] is False
-    assert result["error_type"] == "concurrent_edit_guard_unavailable"
-    assert client.writes == []
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert set(client.labels) == {"drift-open", "drift-reviewed", "drift-urgent"}
 
 
-def test_jira_update_drift_labels_guard_false_ignores_missing_updated(
+def test_jira_update_drift_labels_clear_reads_once_and_removes_only_drift_prefixed(
     tmp_path, monkeypatch
 ) -> None:
-    client = _install_drift_labels_client(monkeypatch, tmp_path, updated=None)
+    client = _install_drift_labels_client(
+        monkeypatch, tmp_path, initial_labels=["jira-agent", "drift-old", "drift-keep"]
+    )
 
     result = mcp_server.jira_update_drift_labels(
-        "FC-1", add=["drift-reviewed"], guard_concurrent_edit=False, execute=True
+        "FC-1", add=["new"], clear=True, execute=True
     )
 
     assert result["ok"] is True
-    assert client.expect_updated_calls == [None]
+    assert client.get_issue_calls == 1, "--clear reads the issue exactly once"
+    assert set(client.labels) == {"jira-agent", "drift-new"}
+
+
+def test_jira_update_drift_labels_dry_run_shows_operations_not_a_guessed_array(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_drift_labels_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["reviewed"], remove=["open"])
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["payload"] == {
+        "fields": {},
+        "update": {"labels": [{"add": "drift-reviewed"}, {"remove": "drift-open"}]},
+    }
+    assert client.writes == []
+    assert client.labels == ["drift-open"]
+
+
+def test_jira_update_drift_labels_no_longer_accepts_guard_concurrent_edit(
+    tmp_path, monkeypatch
+) -> None:
+    _install_drift_labels_client(monkeypatch, tmp_path)
+
+    try:
+        mcp_server.jira_update_drift_labels(
+            "FC-1", add=["reviewed"], guard_concurrent_edit=False, execute=True
+        )
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("Expected TypeError: guard_concurrent_edit no longer exists")
 
 
 def _gallery_manifest(tmp_path: Path) -> Path:
