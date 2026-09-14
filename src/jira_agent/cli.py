@@ -94,6 +94,27 @@ def _print_json(data: Any) -> None:
     data_console.print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+def _emit_json(data: Any) -> None:
+    """Write exactly one JSON document to stdout and nothing else.
+
+    This is the call every ``--json`` code path uses for its result. By the time it runs, every
+    prose line for that invocation has already gone to stderr through ``_say``, so stdout ends
+    up carrying only this document, with no `find('{')` slicing required on the caller's side.
+    """
+    _print_json(data)
+
+
+def _say(message: str, *, json_mode: bool) -> None:
+    """Print one line of human prose: stdout normally, stderr when the caller passed --json.
+
+    A --json caller needs stdout to hold nothing but the JSON document, so every prose line a
+    command would otherwise print goes through this one named place instead of a conditional at
+    each call site. With ``json_mode=False`` this is exactly ``console.print``, so it changes
+    nothing about normal-mode output.
+    """
+    (error_console if json_mode else console).print(message)
+
+
 def _print_error(label: str, detail: object) -> None:
     """Print a labelled error without letting the detail be read as markup.
 
@@ -289,7 +310,7 @@ def myself(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     console.print(f"{data.get('displayName')} <{data.get('emailAddress', 'email hidden')}>")
@@ -333,7 +354,7 @@ def user_search(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(users)
+        _emit_json(users)
         return
     _print_users_table(users)
 
@@ -358,7 +379,7 @@ def issue(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     _print_issues_table([data])
@@ -388,7 +409,7 @@ def comments(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     comments_data = data.get("comments") or []
@@ -427,10 +448,12 @@ def add_comment(
 ) -> None:
     """Add a comment to one Jira issue. Defaults to dry-run."""
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would add this comment")
-        console.print(f"issue: {key}")
-        console.print(body)
-        console.print("Pass --execute to write it to Jira.")
+        _say("[yellow]Dry run:[/yellow] would add this comment", json_mode=json_output)
+        _say(f"issue: {key}", json_mode=json_output)
+        _say(body, json_mode=json_output)
+        if json_output:
+            _emit_json({"issue": key, "body": body, "dry_run": True})
+        _say("Pass --execute to write it to Jira.", json_mode=json_output)
         return
 
     with _client() as client:
@@ -450,7 +473,7 @@ def add_comment(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Added comment {data.get('id')} to {key}.")
@@ -630,7 +653,7 @@ def test_scope(
 ) -> None:
     """Run a read-only smoke query against the configured Jira test scope."""
     config = _config()
-    console.print(f"test JQL: {config.test_jql}")
+    _say(f"test JQL: {config.test_jql}", json_mode=json_output)
     with JiraClient(config) as client:
         try:
             data = client.search_issues(
@@ -642,7 +665,7 @@ def test_scope(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     issues = data.get("issues") or []
@@ -678,7 +701,7 @@ def create_meta(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     _print_create_metadata(data)
@@ -710,11 +733,14 @@ def create_test_issue(
     )
 
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would create this Jira test issue")
-        console.print(f"project: {config.test_project_key}")
-        console.print(f"issue type: {config.test_issue_type}")
-        _print_json(payload)
-        console.print("Pass --execute to create it in Jira.")
+        _say("[yellow]Dry run:[/yellow] would create this Jira test issue", json_mode=json_output)
+        _say(f"project: {config.test_project_key}", json_mode=json_output)
+        _say(f"issue type: {config.test_issue_type}", json_mode=json_output)
+        if json_output:
+            _emit_json({**payload, "dry_run": True})
+        else:
+            _print_json(payload)
+        _say("Pass --execute to create it in Jira.", json_mode=json_output)
         return
 
     with JiraClient(config) as client:
@@ -739,7 +765,7 @@ def create_test_issue(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Created Jira test issue {data.get('key')} ({data.get('id')}).")
@@ -839,11 +865,17 @@ def create_issue(
         else 0
     )
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
-        _print_json(payload)
+        _say("[yellow]Dry run:[/yellow] would create this Jira issue", json_mode=json_output)
+        if json_output:
+            _emit_json({**payload, "dry_run": True})
+        else:
+            _print_json(payload)
         if diagram_count:
-            console.print(f"Mermaid diagrams to render after creation: {diagram_count}")
-        console.print("Pass --execute to create it in Jira.")
+            _say(
+                f"Mermaid diagrams to render after creation: {diagram_count}",
+                json_mode=json_output,
+            )
+        _say("Pass --execute to create it in Jira.", json_mode=json_output)
         return
 
     with JiraClient(config) as client:
@@ -897,9 +929,9 @@ def create_issue(
 
     if json_output:
         if mermaid_result is None:
-            _print_json(data)
+            _emit_json({**data, "dry_run": False})
         else:
-            _print_json({"issue": data, "mermaid": mermaid_result})
+            _emit_json({"issue": data, "mermaid": mermaid_result, "dry_run": False})
         return
     console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
     if mermaid_result is not None:
@@ -963,7 +995,7 @@ def render_mermaid(
                     "safety": safety,
                 }
                 if json_output:
-                    _print_json(result)
+                    _emit_json(result)
                 else:
                     console.print("[yellow]Dry run:[/yellow] would render Mermaid diagrams")
                     console.print(f"issue: {key}")
@@ -1000,7 +1032,7 @@ def render_mermaid(
         raise typer.Exit(1) from exc
 
     if json_output:
-        _print_json(result)
+        _emit_json({**result, "dry_run": False})
         return
     console.print(f"Embedded {result['diagram_count']} Mermaid diagram(s) in {key}.")
 
@@ -1025,7 +1057,7 @@ def test_issue(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     _print_issues_table([data])
@@ -1073,7 +1105,7 @@ def agent_report(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(report)
+        _emit_json(report)
         return
 
     _print_agent_report(report)
@@ -1528,11 +1560,14 @@ def edit_issue(
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would edit issue")
-                console.print(f"issue: {issue_key}")
-                console.print(f"safety: {safety}")
-                _print_json(payload)
-                console.print("Pass --execute to write it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would edit issue", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({**payload, "dry_run": True})
+                else:
+                    _print_json(payload)
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             data = client.edit_issue(
@@ -1558,7 +1593,7 @@ def edit_issue(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Edited {issue_key}.")
@@ -1595,11 +1630,14 @@ def clear_parent(
             current = client.get_issue(issue_key, fields=["parent"])
             before = (current.get("fields") or {}).get("parent")
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would clear issue parent")
-                console.print(f"issue: {issue_key}")
-                console.print(f"safety: {safety}")
-                _print_json({"before": before, "payload": payload})
-                console.print("Pass --execute to clear the parent in Jira.")
+                _say("[yellow]Dry run:[/yellow] would clear issue parent", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({"before": before, "payload": payload, "dry_run": True})
+                else:
+                    _print_json({"before": before, "payload": payload})
+                _say("Pass --execute to clear the parent in Jira.", json_mode=json_output)
                 return
 
             result = client.edit_issue(issue_key, clear_parent=True)
@@ -1623,7 +1661,7 @@ def clear_parent(
             raise typer.Exit(1) from exc
 
     if json_output:
-        _print_json(verified)
+        _emit_json({**verified, "dry_run": False})
         return
     console.print(f"Cleared parent of {issue_key}.")
 
@@ -1723,7 +1761,7 @@ def patch_description_section(
             )
         except AdfSectionPatchRefused as exc:
             _print_error("Patch refused:", exc)
-            _print_json(
+            _emit_json(
                 {
                     "error_type": "section_patch_refused",
                     "swallowed_headings": exc.swallowed_headings,
@@ -1761,11 +1799,17 @@ def patch_description_section(
         }
 
         if not execute:
-            console.print("[yellow]Dry run:[/yellow] would patch one description section")
-            console.print(f"safety: {safety}")
-            _print_json(summary)
-            _print_json(patch["new_nodes"])
-            console.print("Pass --execute to write it to Jira.")
+            _say(
+                "[yellow]Dry run:[/yellow] would patch one description section",
+                json_mode=json_output,
+            )
+            _say(f"safety: {safety}", json_mode=json_output)
+            if json_output:
+                _emit_json({**summary, "new_nodes": patch["new_nodes"], "dry_run": True})
+            else:
+                _print_json(summary)
+                _print_json(patch["new_nodes"])
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
             return
 
         try:
@@ -1787,7 +1831,7 @@ def patch_description_section(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Patched section {patch['heading']!r} of {key}.")
@@ -1796,7 +1840,7 @@ def patch_description_section(
 @app.command("mcp-config")
 def mcp_config() -> None:
     """Print the local MCP client configuration block."""
-    _print_json(_mcp_config_payload())
+    _emit_json(_mcp_config_payload())
 
 
 @app.command("smoke-write")
@@ -1915,12 +1959,23 @@ def assign(
             me = client.myself()
             target_account_id = None if unassigned else account_id or str(me["accountId"])
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would assign issue")
-                console.print(f"issue: {issue_key}")
-                console.print(f"target accountId: {target_account_id or 'Unassigned'}")
+                _say("[yellow]Dry run:[/yellow] would assign issue", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(
+                    f"target accountId: {target_account_id or 'Unassigned'}",
+                    json_mode=json_output,
+                )
                 if not unassigned and not account_id:
-                    console.print(f"target user: {me.get('displayName')}")
-                console.print("Pass --execute to write it to Jira.")
+                    _say(f"target user: {me.get('displayName')}", json_mode=json_output)
+                if json_output:
+                    _emit_json(
+                        {
+                            "issue": issue_key,
+                            "accountId": target_account_id,
+                            "dry_run": True,
+                        }
+                    )
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             ensure_issue_write_allowed(config, client, issue_key)
@@ -1938,7 +1993,7 @@ def assign(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Assigned {issue_key} to {target_account_id or 'Unassigned'}.")
@@ -2139,9 +2194,7 @@ def delete_issue_link(
             error_console.print(f"[red]Issue-link deletion error:[/red] {exc}")
             raise typer.Exit(1) from exc
 
-    console.print(
-        f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}."
-    )
+    console.print(f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}.")
 
 
 @app.command("attach")
@@ -2179,11 +2232,13 @@ def attach(
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would attach file")
-                console.print(f"issue: {issue_key}")
-                console.print(f"file: {file_path}")
-                console.print(f"safety: {safety}")
-                console.print("Pass --execute to upload it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would attach file", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"file: {file_path}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({"issue": issue_key, "file": str(file_path), "dry_run": True})
+                _say("Pass --execute to upload it to Jira.", json_mode=json_output)
                 return
 
             data = client.add_attachment(issue_key, file_path)
@@ -2200,7 +2255,7 @@ def attach(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({"attachments": data, "dry_run": False})
         return
     for attachment in data:
         console.print(f"Attached {attachment.get('filename')} ({attachment.get('id')}).")
@@ -2665,7 +2720,7 @@ def changelog(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
     for entry in data.get("values") or []:
         author = entry.get("author") or {}
@@ -2691,7 +2746,7 @@ def audit_log(
     config = _config()
     records = _read_audit_records(config.audit_log_path, limit)
     if json_output:
-        _print_json(records)
+        _emit_json(records)
         return
     if not records:
         console.print("No audit records.")
@@ -2725,7 +2780,7 @@ def transitions(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     transitions_data = data.get("transitions") or []
@@ -2774,11 +2829,16 @@ def transition(
 
             if not execute:
                 target = selected.get("to") or {}
-                console.print("[yellow]Dry run:[/yellow] would transition issue")
-                console.print(f"issue: {key}")
-                console.print(f"transition: {selected.get('name')} ({selected.get('id')})")
-                console.print(f"target status: {target.get('name')}")
-                console.print("Pass --execute to write it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would transition issue", json_mode=json_output)
+                _say(f"issue: {key}", json_mode=json_output)
+                _say(
+                    f"transition: {selected.get('name')} ({selected.get('id')})",
+                    json_mode=json_output,
+                )
+                _say(f"target status: {target.get('name')}", json_mode=json_output)
+                if json_output:
+                    _emit_json({"issue": key, "transition": selected, "dry_run": True})
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             ensure_issue_write_allowed(client.config, client, key)
@@ -2796,7 +2856,7 @@ def transition(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Transitioned {key} with {selected.get('name')} ({selected.get('id')}).")
@@ -2822,7 +2882,7 @@ def _run_search(
             _exit_api_error(exc)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     issues = data.get("issues") or []

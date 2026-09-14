@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 from rich.console import Console
 from typer.testing import CliRunner
@@ -780,3 +783,324 @@ def test_a_table_cell_keeps_jira_text_that_looks_like_markup() -> None:
         cli._print_issues_table(issues)
 
     assert "Costs [in EUR/m2]" in captured.get()
+
+
+# --- JSON purity: --json must print exactly one JSON document on stdout, nothing else -----------
+#
+# Click 8.4.1's CliRunner keeps stdout and stderr separate (checked directly below and confirmed
+# by hand against this repo's pinned version): result.stdout and result.stderr are independent
+# streams, so these tests assert on them separately instead of slicing result.output for a "{".
+
+
+def _json_purity_config(tmp_path) -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+
+def test_click_runner_keeps_stdout_and_stderr_separate_in_this_click_version() -> None:
+    """Pin the CliRunner behaviour this whole test group relies on.
+
+    If a future click upgrade merges the streams again, this fails first and loudly, instead of
+    every test below silently starting to check a merged stream.
+    """
+    import click
+    import click.testing
+
+    @click.command()
+    def probe() -> None:
+        click.echo("to stdout")
+        click.echo("to stderr", err=True)
+
+    # typer.testing.CliRunner.invoke expects a Typer app; this probes plain click, so use
+    # click's own runner directly.
+    result = click.testing.CliRunner().invoke(probe, [])
+
+    assert result.stdout == "to stdout\n"
+    assert result.stderr == "to stderr\n"
+
+
+class _EditIssueFakeClient:
+    def __init__(self, _config) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, **_kwargs):
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def edit_issue(self, issue_key, **_kwargs):
+        return {"key": issue_key, "fields": {"summary": "Updated summary"}}
+
+
+def test_edit_issue_cli_json_dry_run_parses_directly_and_carries_dry_run_true(
+    tmp_path, monkeypatch
+) -> None:
+    """The exact scenario from the defect report: edit-issue --json without --execute."""
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _EditIssueFakeClient)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-380", "--summary", "Updated summary", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # No find('{') slicing: the whole of stdout is the JSON document, nothing else.
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["fields"]["summary"] == "Updated summary"
+    # Every prose line moved to stderr; none of it leaked onto stdout.
+    assert "Dry run" not in result.stdout
+    assert "Pass --execute" not in result.stdout
+    assert "Dry run" in result.stderr
+
+
+def test_edit_issue_cli_json_execute_parses_as_one_document_with_dry_run_false(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _EditIssueFakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-380", "--summary", "Updated summary", "--execute", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is False
+    assert payload["fields"]["summary"] == "Updated summary"
+    assert result.stdout.strip() == json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def test_issue_cli_json_round_trips_long_and_bracket_bearing_values_byte_identically(
+    tmp_path, monkeypatch
+) -> None:
+    """A summary long enough to have triggered rich's word-wrap before the data_console fix,
+    and a value containing a literal '[' that markup would have swallowed.
+    """
+    long_summary = "S" * 210 + " [scope note]"
+    fake_issue = {
+        "key": "FC-389",
+        "fields": {
+            "summary": long_summary,
+            "parent": {"key": "FC-100", "fields": {"summary": "Parent [with brackets]"}},
+        },
+    }
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_issue(self, issue_key, **_kwargs):
+            return fake_issue
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["issue", "FC-389", "--fields", "parent", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload == fake_issue
+
+
+def test_search_cli_json_hides_next_page_token_from_stdout(tmp_path, monkeypatch) -> None:
+    fake_response = {
+        "issues": [
+            {
+                "key": "FC-1",
+                "fields": {
+                    "summary": "s",
+                    "status": {"name": "Open"},
+                    "assignee": {"displayName": "Ada"},
+                    "issuetype": {"name": "Task"},
+                    "project": {"key": "FC"},
+                    "updated": "2026-09-01T00:00:00.000+0000",
+                },
+            }
+        ],
+        "nextPageToken": "token-abc-123",
+    }
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def search_issues(self, jql, **_kwargs):
+            return fake_response
+
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["search", "project = FC", "--json"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload == fake_response
+    # The token legitimately appears as a JSON field in the document above; what must not
+    # appear is the separate human-readable "nextPageToken: ..." prose line the non-json path
+    # prints after its table.
+    assert "nextPageToken: token-abc-123" not in result.stdout
+
+
+# --- Every --json/--execute command must fold dry_run into its JSON (item d) --------------------
+
+
+def _commands_with_json_and_execute() -> list[str]:
+    """The typer app's own registered commands, not a hand-maintained guess.
+
+    A future command wired with both --json and --execute has to appear here automatically, so
+    it cannot silently skip the dry_run rule the way edit-issue and friends used to. A bare
+    ``@app.command()`` leaves ``command.name`` as ``None``; typer derives the actual dashed CLI
+    name from the function name at run time, via the same helper used here.
+    """
+    from typer.main import get_command_name
+
+    names = []
+    for command in cli.app.registered_commands:
+        params = inspect.signature(command.callback).parameters
+        if "json_output" in params and "execute" in params:
+            names.append(command.name or get_command_name(command.callback.__name__))
+    return sorted(names)
+
+
+# Commands excluded from the sweep below, and why. Keep this empty unless a command genuinely
+# cannot be driven by a fake client; every command discovered above is either exercised or named
+# here, so a silently skipped command fails the coverage assertion in the test instead.
+_JSON_EXECUTE_SWEEP_EXCLUSIONS: dict[str, str] = {}
+
+
+class _JsonExecuteSweepFakeClient:
+    """One generic fake client for the dry-run sweep below.
+
+    Every command in the sweep only reads Jira state before its dry-run return, so this fake only
+    has to answer the handful of read shapes those commands ask for, keyed on the exact `fields`
+    list each call site uses.
+    """
+
+    def __init__(self, _config) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def myself(self):
+        return {"accountId": "acc-1", "displayName": "Fake User", "emailAddress": "fake@x.test"}
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        if fields == ["project"]:
+            return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+        if fields == ["parent"]:
+            return {"key": issue_key, "fields": {"parent": None}}
+        if fields == ["description"]:
+            return {"key": issue_key, "fields": {"description": _patch_description()}}
+        if fields == ["description", "attachment"]:
+            return {
+                "key": issue_key,
+                "fields": {
+                    "description": {
+                        "type": "doc",
+                        "version": 1,
+                        "content": [
+                            {
+                                "type": "codeBlock",
+                                "attrs": {"language": "mermaid"},
+                                "content": [{"type": "text", "text": "flowchart LR\nA --> B"}],
+                            }
+                        ],
+                    },
+                    "attachment": [],
+                },
+            }
+        return {"key": issue_key, "fields": {}}
+
+    def get_transitions(self, issue_key):
+        return {"transitions": [{"id": "31", "name": "Done", "to": {"name": "Done"}}]}
+
+
+def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
+    attach_file = tmp_path / "sweep-attachment.txt"
+    attach_file.write_text("attachment body", encoding="utf-8")
+    return {
+        "add-comment": ["add-comment", "FC-1", "Test body", "--json"],
+        "create-test-issue": ["create-test-issue", "Test summary", "--json"],
+        "create-issue": [
+            "create-issue",
+            "Test summary",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--json",
+        ],
+        "render-mermaid": ["render-mermaid", "FC-1", "--json"],
+        "edit-issue": ["edit-issue", "FC-1", "--summary", "New summary", "--json"],
+        "clear-parent": ["clear-parent", "FC-1", "--json"],
+        "patch-description-section": [
+            "patch-description-section",
+            "FC-1",
+            "--section",
+            "Observed",
+            "--content",
+            "## Observed\n\nUpdated for the sweep.",
+            "--json",
+        ],
+        "assign": ["assign", "FC-1", "--json"],
+        "attach": ["attach", "FC-1", "--file", str(attach_file), "--json"],
+        "transition": ["transition", "FC-1", "Done", "--json"],
+    }
+
+
+def test_every_json_and_execute_command_carries_dry_run_true_in_its_json(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", _JsonExecuteSweepFakeClient)
+    monkeypatch.setattr(
+        cli,
+        "discover_mermaid_runtime",
+        lambda *_a, **_k: SimpleNamespace(
+            node=Path("node"), cli=Path("mmdc"), browser=Path("chromium")
+        ),
+    )
+
+    discovered = _commands_with_json_and_execute()
+    args_by_command = _json_execute_sweep_args(tmp_path)
+    uncovered = set(discovered) - set(args_by_command) - set(_JSON_EXECUTE_SWEEP_EXCLUSIONS)
+    assert not uncovered, f"no dry-run args registered for: {sorted(uncovered)}"
+
+    for name in discovered:
+        if name in _JSON_EXECUTE_SWEEP_EXCLUSIONS:
+            continue
+        result = CliRunner().invoke(cli.app, args_by_command[name])
+        assert result.exit_code == 0, f"{name}: {result.stdout}{result.stderr}"
+        payload = json.loads(result.stdout)
+        assert payload["dry_run"] is True, f"{name}: {payload}"

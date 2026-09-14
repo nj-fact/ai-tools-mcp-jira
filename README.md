@@ -346,6 +346,13 @@ Write actions are blocked unless the issue belongs to `JIRA_WRITE_PROJECT_KEYS`
 or the issue key is listed in `JIRA_WRITE_ISSUE_KEYS`.
 Executed write actions are appended to `JIRA_AUDIT_LOG_PATH`.
 
+With `--json`, a command's stdout is exactly one JSON document and nothing else — safe to pipe
+into `jq` or `json.load` with no slicing. Every other line (dry-run notices, safety scope, the
+`Pass --execute ...` reminder) prints to stderr instead. For a command that supports `--execute`,
+that JSON document also carries a top-level `dry_run` boolean, `true` when the write was not
+performed and `false` when it was, so a `--json` caller can tell a dry-run preview apart from a
+completed write without having read the (now stderr-only) prose.
+
 ## MCP Server
 
 The same core is exposed as an MCP server over stdio:
