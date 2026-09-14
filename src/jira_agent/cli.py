@@ -1623,6 +1623,19 @@ def edit_issue(
         float | None,
         typer.Option("--story-points", help="New story-point estimate."),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Read the issue's `updated` timestamp immediately before the write and refuse "
+                "the write (exit code 4) if it no longer matches. This is a check-then-act "
+                "narrowing of the race window, not an atomic compare-and-swap: Jira Cloud has "
+                "no conditional write here, so a change landing in that window is still lost. "
+                "Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually edit the issue in Jira."),
@@ -1632,7 +1645,19 @@ def edit_issue(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
+    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
+
+    `--description` and friends each replace the whole field, so a concurrent edit to that field
+    would otherwise be silently overwritten. By default the write is guarded: this command has
+    to add a dedicated read, since edit-issue previously read nothing before writing, so
+    immediately before attempting the write it captures the issue's `updated` timestamp with
+    `issue_version`, as late as possible to keep the window small. The client then re-checks that
+    same timestamp again right before the PUT and refuses the write (exit code 4) if it no longer
+    matches. This narrows the race window to a check-then-act gap; it is not an atomic
+    compare-and-swap, since Jira Cloud offers no conditional write here, so a change landing
+    inside that narrowed window is still lost. Pass --no-concurrency-guard for the old unguarded
+    behaviour.
+    """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1675,6 +1700,13 @@ def edit_issue(
                 _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
+            # edit-issue previously read nothing before writing. issue_version is the dedicated,
+            # minimal read added for the guard: it fetches only `updated`, taken as late as
+            # possible (right before the write call below) so the window this narrows — between
+            # this read and the client's own immediate re-check before its PUT — stays as small
+            # as this process can make it.
+            expect_updated = client.issue_version(issue_key) if concurrency_guard else None
+
             data = client.edit_issue(
                 issue_key,
                 summary=summary,
@@ -1684,14 +1716,17 @@ def edit_issue(
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
+                expect_updated=expect_updated,
             )
             audit_write(
                 config,
                 action="edit_issue",
                 issue_key=issue_key,
-                payload=payload,
+                payload={**payload, "concurrency_guard": concurrency_guard},
                 result=data,
             )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:

@@ -250,3 +250,130 @@ def test_patch_description_section_docstring_no_longer_claims_no_optimistic_conc
     assert "there is no optimistic concurrency" not in doc
     assert "concurrency" in doc
     assert "no-concurrency-guard" in doc
+
+
+# --- edit-issue ------------------------------------------------------------------------------
+
+
+def _make_edit_issue_fake_client(
+    *, read_updated: str, server_updated: str
+) -> tuple[type, list[dict]]:
+    """Fake client for edit-issue. ``writes`` records only completed writes."""
+    writes: list[dict[str, Any]] = []
+
+    class FakeClient:
+        def __init__(self, config: JiraConfig) -> None:
+            self.config = config
+
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def issue_version(self, issue_key: str) -> str:
+            return read_updated
+
+        def edit_issue(
+            self, issue_key: str, *, expect_updated: str | None = None, **kwargs: Any
+        ) -> dict[str, Any]:
+            if expect_updated is not None and expect_updated != server_updated:
+                raise JiraConcurrentEditError(
+                    f"Issue {issue_key} changed since it was read: expected updated="
+                    f"{expect_updated!r}, found {server_updated!r}. Re-read the issue and retry.",
+                    issue_key=issue_key,
+                    expected_updated=expect_updated,
+                    found_updated=server_updated,
+                )
+            writes.append({"issue": issue_key, "expect_updated": expect_updated, "kwargs": kwargs})
+            return {"key": issue_key, "fields": {}}
+
+    return FakeClient, writes
+
+
+def test_edit_issue_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--description", "New description text.", "--execute"],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    assert ISSUE_KEY in result.stderr
+    assert READ_UPDATED in result.stderr
+    assert CHANGED_UPDATED in result.stderr
+    assert writes == []
+
+
+def test_edit_issue_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["edit-issue", ISSUE_KEY, "--description", "New description text.", "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] == READ_UPDATED
+
+
+def test_edit_issue_no_concurrency_guard_writes_despite_change(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "edit-issue",
+            ISSUE_KEY,
+            "--description",
+            "New description text.",
+            "--no-concurrency-guard",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert writes[0]["expect_updated"] is None
+
+
+def test_edit_issue_json_refusal_is_one_machine_readable_document(tmp_path, monkeypatch) -> None:
+    FakeClient, writes = _make_edit_issue_fake_client(
+        read_updated=READ_UPDATED, server_updated=CHANGED_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "edit-issue",
+            ISSUE_KEY,
+            "--description",
+            "New description text.",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == cli.CONCURRENT_EDIT_EXIT_CODE, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "concurrent_edit"
+    assert payload["expected_updated"] == READ_UPDATED
+    assert payload["found_updated"] == CHANGED_UPDATED
+    assert payload["dry_run"] is False
+    assert writes == []
