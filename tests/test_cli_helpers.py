@@ -1359,7 +1359,13 @@ def test_agent_report_cli_rejects_a_comments_value_that_is_neither_int_nor_all(
     assert "all" in combined.lower()
 
 
-def test_agent_report_cli_human_output_states_both_comment_numbers(tmp_path, monkeypatch) -> None:
+def test_agent_report_cli_human_output_states_both_comment_numbers_and_order(
+    tmp_path, monkeypatch
+) -> None:
+    """G4 regression: human mode used to print the count and then a bare comment list, with no
+    signal that `--comments all` changed from oldest-first to newest-first. Anyone who learned
+    "the last line is the newest" would misread the oldest comment as the newest. The order must
+    now sit right next to the count, not only reach `--json`'s `comments_order` key."""
     FakeClient, _calls = _agent_report_fake_client(total_comments=18)
     monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
     monkeypatch.setattr(cli, "JiraClient", FakeClient)
@@ -1370,7 +1376,20 @@ def test_agent_report_cli_human_output_states_both_comment_numbers(tmp_path, mon
     # The exact phrase, not bare "5"/"18": one of the fake's comment timestamps legitimately
     # contains "18" (2026-01-18), so a loose substring check would pass against the old code by
     # coincidence instead of because the new summary line exists.
-    assert "comments: 5 of 18 returned (truncated)" in result.stdout
+    assert "comments: 5 of 18 returned (truncated, newest-first)" in result.stdout
+
+
+def test_agent_report_cli_human_output_states_order_when_complete_too(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, _calls = _agent_report_fake_client(total_comments=18)
+    monkeypatch.setattr(cli, "load_config", lambda: _json_purity_config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    result = CliRunner().invoke(cli.app, ["agent-report", "FC-1", "--comments", "all"])
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert "comments: 18 of 18 returned (complete, newest-first)" in result.stdout
 
 
 def test_issue_cli_json_shows_parent_field_with_no_fields_argument(tmp_path, monkeypatch) -> None:
@@ -1799,3 +1818,35 @@ def test_every_json_and_execute_command_carries_dry_run_true_in_its_json(
         assert result.exit_code == 0, f"{name}: {result.stdout}{result.stderr}"
         payload = json.loads(result.stdout)
         assert payload["dry_run"] is True, f"{name}: {payload}"
+
+
+def test_json_help_no_longer_claims_raw_response_for_curated_commands() -> None:
+    """G5 regression: `recent`, `mine`, `assigned-to-me`, `fc-open`, `by-status`, `search`,
+    `test-scope`, `issue-sprint`, and `issue-type-options` each synthesize a curated result
+    document under `--json` (see `_run_search`, and each command's own body for the other two),
+    but their `--json` help text used to say "Print the raw Jira JSON response" -- copied from
+    the many commands where that literally is what happens. Checks the click-level help string
+    directly, not rendered `--help` output, since Rich wraps that across lines and would make a
+    substring check pass or fail on line-wrap width rather than content.
+    """
+    import typer as typer_module
+
+    click_app = typer_module.main.get_command(cli.app)
+    stale_claim = "print the raw jira json response"
+    curated_commands = {
+        "recent",
+        "mine",
+        "assigned-to-me",
+        "fc-open",
+        "by-status",
+        "search",
+        "test-scope",
+        "issue-sprint",
+        "issue-type-options",
+    }
+    for name in curated_commands:
+        command = click_app.commands[name]
+        json_param = next(p for p in command.params if p.name == "json_output")
+        help_text = (json_param.help or "").lower()
+        assert stale_claim not in help_text, f"{name}: {json_param.help!r}"
+        assert "curated" in help_text, f"{name}: {json_param.help!r}"

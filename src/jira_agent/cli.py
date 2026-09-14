@@ -224,9 +224,19 @@ def _print_agent_report(report: dict[str, Any]) -> None:
     comment_count = report.get("comment_count")
     comments_returned = report.get("comments_returned")
     comments_truncated = report.get("comments_truncated")
+    comments_order = report.get("comments_order")
     if comments_returned is not None and comment_count is not None:
         status_word = "truncated" if comments_truncated else "complete"
-        console.print(f"comments: {comments_returned} of {comment_count} returned ({status_word})")
+        # G4: `--comments all` used to return oldest-first in human mode and now returns
+        # newest-first, with `comments_order` reaching only `--json`. Stating the order next to
+        # the count here means a reader who "learned the last line is the newest" is corrected
+        # in the same place they read the count, not left to discover the flip by misreading a
+        # comment's date.
+        order_suffix = f", {comments_order}" if comments_order else ""
+        console.print(
+            f"comments: {comments_returned} of {comment_count} returned "
+            f"({status_word}{order_suffix})"
+        )
     comments = report.get("comments") or []
     if comments:
         for comment in comments:
@@ -700,7 +710,10 @@ def recent(
     ] = ",".join(DEFAULT_FIELDS),
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show recently updated Jira issues."""
@@ -726,7 +739,10 @@ def mine(
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show unresolved issues assigned to the authenticated user."""
@@ -755,7 +771,10 @@ def assigned_to_me(
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Alias for mine."""
@@ -770,7 +789,10 @@ def fc_open(
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show open FC issues."""
@@ -797,7 +819,10 @@ def by_status(
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Search issues by status."""
@@ -858,7 +883,10 @@ def search(
     ] = None,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Search Jira issues with JQL.
@@ -887,7 +915,10 @@ def test_scope(
     ] = 5,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Run a read-only smoke query against the configured Jira test scope.
@@ -3515,7 +3546,13 @@ def issue_sprint(
     ] = DEFAULT_SPRINT_FIELD,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help=(
+                "Print the curated result document (issue, sprint_field, "
+                "sprint_field_present, sprints), not Jira's raw response."
+            ),
+        ),
     ] = False,
 ) -> None:
     """Show which sprint(s) one issue is in. Read-only, no --execute.
@@ -3716,7 +3753,13 @@ def issue_type_options(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help=(
+                "Print the curated result document (issue, allowed_values), not Jira's raw "
+                "editmeta response."
+            ),
+        ),
     ] = False,
 ) -> None:
     """List the issue types one issue may become. Read-only, no --execute."""
