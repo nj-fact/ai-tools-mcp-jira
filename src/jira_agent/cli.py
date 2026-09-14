@@ -12,6 +12,7 @@ from rich.table import Table
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    DEFAULT_SPRINT_FIELD,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
@@ -3184,6 +3185,417 @@ def transition(
         return
 
     console.print(f"Transitioned {key} with {selected.get('name')} ({selected.get('id')}).")
+
+
+# --- Sprint and board commands (Agile API) ------------------------------------------------
+
+
+@app.command()
+def boards(
+    board_type: Annotated[
+        str | None,
+        typer.Option("--type", help="Filter by board type, for example scrum or kanban."),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Filter by board name."),
+    ] = None,
+    max_results: Annotated[
+        int,
+        typer.Option("--max-results", min=1, max=100, help="Maximum boards to return."),
+    ] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """List Jira Agile boards, so a caller can find a board id without the UI."""
+    with _client() as client:
+        try:
+            data = client.list_boards(board_type=board_type, name=name, max_results=max_results)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json(data)
+        return
+
+    values = data.get("values") or []
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Type", no_wrap=True)
+    for board in values:
+        table.add_row(
+            str(board.get("id") or ""),
+            str(board.get("name") or ""),
+            str(board.get("type") or ""),
+        )
+    table_console.print(table)
+
+
+@app.command()
+def sprints(
+    board_id: Annotated[
+        int,
+        typer.Option("--board", help="Board id. Use `boards` to find it."),
+    ],
+    state: Annotated[
+        str | None,
+        typer.Option("--state", help="Filter by sprint state: active, future, or closed."),
+    ] = None,
+    max_results: Annotated[
+        int,
+        typer.Option("--max-results", min=1, max=100, help="Maximum sprints to return."),
+    ] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """List one board's sprints."""
+    with _client() as client:
+        try:
+            data = client.list_board_sprints(board_id, state=state, max_results=max_results)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json(data)
+        return
+
+    values = data.get("values") or []
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("State", no_wrap=True)
+    table.add_column("Start", no_wrap=True)
+    table.add_column("End", no_wrap=True)
+    for sprint in values:
+        # The table is a glance view, so dates are trimmed to their day; --json still carries
+        # the full Jira timestamp. A full-width Name column matters more here: an operator moving
+        # 13 issues at once reads sprint names, not sprint timestamps, to pick the right one.
+        table.add_row(
+            str(sprint.get("id") or ""),
+            str(sprint.get("name") or ""),
+            str(sprint.get("state") or ""),
+            str(sprint.get("startDate") or "")[:10],
+            str(sprint.get("endDate") or "")[:10],
+        )
+    table_console.print(table)
+
+
+# Sentinel so a sprint-field key genuinely absent from `fields` is distinguishable from one
+# present with a `None` or empty-list value. `dict.get(key, _SPRINT_FIELD_MISSING)` returns this
+# object only when the key was never in the response at all.
+_SPRINT_FIELD_MISSING = object()
+
+
+@app.command("issue-sprint")
+def issue_sprint(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    sprint_field: Annotated[
+        str,
+        typer.Option("--sprint-field", help="Sprint custom field id."),
+    ] = DEFAULT_SPRINT_FIELD,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Show which sprint(s) one issue is in. Read-only, no --execute.
+
+    Renders three distinct states instead of collapsing any two of them: the sprint field
+    absent from the Jira response entirely, the field present but an empty list (the issue is
+    in no sprint), and the field present with one or more sprints.
+    """
+    with _client() as client:
+        try:
+            issue = client.get_issue(key, fields=[sprint_field])
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    fields = issue.get("fields") or {}
+    raw = fields.get(sprint_field, _SPRINT_FIELD_MISSING)
+    field_present = raw is not _SPRINT_FIELD_MISSING
+    sprint_list = raw if isinstance(raw, list) else []
+
+    if not field_present:
+        _say(
+            f"{key}: the Jira response did not include the sprint field ({sprint_field}).",
+            json_mode=json_output,
+        )
+    elif not sprint_list:
+        _say(f"{key} is in no sprint.", json_mode=json_output)
+    else:
+        _say(f"{key} is in {len(sprint_list)} sprint(s):", json_mode=json_output)
+        for sprint in sprint_list:
+            _say(
+                f"- {sprint.get('id')} {sprint.get('name')} ({sprint.get('state')})",
+                json_mode=json_output,
+            )
+
+    if json_output:
+        _emit_json(
+            {
+                "issue": key,
+                "sprint_field": sprint_field,
+                "sprint_field_present": field_present,
+                "sprints": sprint_list,
+            }
+        )
+
+
+@app.command("sprint-add")
+def sprint_add(
+    sprint_id: Annotated[int, typer.Argument(help="Target Jira sprint id.")],
+    keys: Annotated[
+        list[str],
+        typer.Argument(help="One or more Jira issue keys to add to the sprint."),
+    ],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually add the issues to the sprint."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Add one or more issues to a sprint. Defaults to dry-run.
+
+    This is a single batched POST (`add_issues_to_sprint` sends every key in one request), not a
+    per-issue loop, so there is no "key 7 of 13 failed" partial state to report on the Jira side.
+    The safety gate is still checked for every key before that one call is made, so a rejection
+    on any key leaves every issue, including earlier ones in the list, untouched.
+    """
+    if not keys:
+        _print_error("No issue keys given:", "pass at least one issue key.")
+        raise typer.Exit(2)
+
+    if not execute:
+        _say(
+            f"[yellow]Dry run:[/yellow] would add {len(keys)} issue(s) to sprint {sprint_id}",
+            json_mode=json_output,
+        )
+        for issue_key in keys:
+            _say(f"- {issue_key} -> sprint {sprint_id}", json_mode=json_output)
+        if json_output:
+            _emit_json({"sprint_id": sprint_id, "issue_keys": list(keys), "dry_run": True})
+        _say("Pass --execute to write it to Jira.", json_mode=json_output)
+        return
+
+    with _client() as client:
+        try:
+            # Check every key's write permission before writing any of them. The write itself is
+            # one batched call, so this loop is what keeps a rejection on key N from following a
+            # write that already happened for keys 1..N-1: nothing is written until every key in
+            # the batch has cleared the gate.
+            for issue_key in keys:
+                ensure_issue_write_allowed(client.config, client, issue_key)
+            data = client.add_issues_to_sprint(sprint_id, list(keys))
+            audit_write(
+                client.config,
+                action="sprint_add",
+                issue_key=None,
+                payload={"sprint_id": sprint_id, "issue_keys": list(keys)},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json(
+            {"sprint_id": sprint_id, "issue_keys": list(keys), "result": data, "dry_run": False}
+        )
+        return
+
+    console.print(f"Added {len(keys)} issue(s) to sprint {sprint_id}.")
+
+
+@app.command("sprint-remove")
+def sprint_remove(
+    keys: Annotated[
+        list[str],
+        typer.Argument(help="One or more Jira issue keys to move to the backlog."),
+    ],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually move the issues to the backlog."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Move one or more issues to the backlog: how this API removes an issue from a sprint.
+
+    Defaults to dry-run. Like sprint-add, this is one batched POST, and every key clears the
+    safety gate before that call is made, so a rejected key leaves the whole batch unwritten.
+    """
+    if not keys:
+        _print_error("No issue keys given:", "pass at least one issue key.")
+        raise typer.Exit(2)
+
+    if not execute:
+        _say(
+            f"[yellow]Dry run:[/yellow] would move {len(keys)} issue(s) to the backlog",
+            json_mode=json_output,
+        )
+        for issue_key in keys:
+            _say(f"- {issue_key} -> backlog", json_mode=json_output)
+        if json_output:
+            _emit_json({"issue_keys": list(keys), "dry_run": True})
+        _say("Pass --execute to write it to Jira.", json_mode=json_output)
+        return
+
+    with _client() as client:
+        try:
+            for issue_key in keys:
+                ensure_issue_write_allowed(client.config, client, issue_key)
+            data = client.move_issues_to_backlog(list(keys))
+            audit_write(
+                client.config,
+                action="sprint_remove",
+                issue_key=None,
+                payload={"issue_keys": list(keys)},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json({"issue_keys": list(keys), "result": data, "dry_run": False})
+        return
+
+    console.print(f"Moved {len(keys)} issue(s) to the backlog.")
+
+
+# --- Issue type change ---------------------------------------------------------------------
+
+
+def _issue_type_allowed_values(metadata: dict[str, Any]) -> list[str]:
+    issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
+    return [
+        str(value.get("name"))
+        for value in issuetype_field.get("allowedValues") or []
+        if isinstance(value, dict) and value.get("name")
+    ]
+
+
+@app.command("issue-type-options")
+def issue_type_options(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """List the issue types one issue may become. Read-only, no --execute."""
+    with _client() as client:
+        try:
+            metadata = client.get_edit_metadata(key)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    allowed_values = _issue_type_allowed_values(metadata)
+
+    if json_output:
+        _emit_json({"issue": key, "allowed_values": allowed_values})
+        return
+
+    if allowed_values:
+        console.print(f"{key} may become: {', '.join(allowed_values)}")
+    else:
+        console.print(f"{key}: editmeta returned no allowed issue types.")
+
+
+@app.command("issue-type")
+def issue_type(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    new_type: Annotated[str, typer.Argument(help="Target issue type name, for example Bug.")],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually change the issue type in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Change one issue's issue type. Defaults to dry-run.
+
+    Refuses locally, before any write, when `new_type` is not among editmeta's allowed values for
+    this issue: a doomed PUT with a Jira error is worse than a local refusal that shows the
+    options. When executing, this captures `issue_version` immediately before the write and
+    passes it as `expect_updated`, so a change landing between that read and the PUT surfaces as
+    `JiraConcurrentEditError` here rather than silently overwriting it; that failure exits with
+    code 4. A sibling worker is adding a shared `_exit_concurrent_edit_error` helper using the
+    same exit code elsewhere in this file for the same condition on other commands; the two
+    should be unified into one helper at integration rather than duplicated further.
+    """
+    with _client() as client:
+        try:
+            if not client.is_issue_type_allowed(key, new_type):
+                metadata = client.get_edit_metadata(key)
+                allowed_values = _issue_type_allowed_values(metadata)
+                _print_error(
+                    "Refused:",
+                    f"{new_type!r} is not an allowed issue type for {key}. Allowed values: "
+                    f"{', '.join(allowed_values) or 'none returned by editmeta'}.",
+                )
+                raise typer.Exit(2)
+
+            safety = ensure_issue_write_allowed(client.config, client, key)
+
+            if not execute:
+                _say("[yellow]Dry run:[/yellow] would change issue type", json_mode=json_output)
+                _say(f"issue: {key}", json_mode=json_output)
+                _say(f"new type: {new_type}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json(
+                        {
+                            "issue": key,
+                            "requested_type": new_type,
+                            "dry_run": True,
+                        }
+                    )
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
+                return
+
+            expected_updated = client.issue_version(key)
+            try:
+                data = client.set_issue_type(key, new_type, expect_updated=expected_updated)
+            except JiraConcurrentEditError as exc:
+                _print_error(
+                    "Concurrent edit:",
+                    f"{key} changed since it was read: expected updated="
+                    f"{exc.expected_updated!r}, found {exc.found_updated!r}. Re-read and retry.",
+                )
+                raise typer.Exit(4) from exc
+
+            audit_write(
+                client.config,
+                action="issue_type",
+                issue_key=key,
+                payload={"new_type": new_type, "expect_updated": expected_updated},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc)
+        except JiraApiError as exc:
+            _exit_api_error(exc)
+
+    if json_output:
+        _emit_json({**data, "dry_run": False})
+        return
+
+    console.print(f"Changed {key} to issue type {new_type}.")
 
 
 def _run_search(

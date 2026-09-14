@@ -458,3 +458,43 @@ Two comment commands fill a gap where only `add-comment` existed:
 
 Both default to dry-run behind `--execute`, go through the same write-scope check as every other
 write command, and append to the audit log on execution.
+
+## Sprints, boards, and issue-type changes
+
+These commands automate two things a human previously did by hand in the Jira board UI: moving
+several issues between sprints, and turning a Task into a Bug (previously impossible in place, so
+the workaround was creating a duplicate issue and retiring the original).
+
+- `boards [--type scrum|kanban] [--name TEXT] [--max-results N]` — list Jira Agile boards, so a
+  caller can find a board id without opening the UI.
+- `sprints --board ID [--state active|future|closed] [--max-results N]` — list one board's
+  sprints.
+- `issue-sprint <KEY>` — read-only, no `--execute`. Reports which sprint(s) an issue is in, and
+  renders three distinct states rather than collapsing any two of them: the sprint field absent
+  from the Jira response entirely (`sprint_field_present: false`), the field present but an empty
+  list (`sprint_field_present: true`, `sprints: []`, the issue is in no sprint), and the field
+  present with one or more sprints.
+- `sprint-add <SPRINT_ID> <KEY>...` — add one or more issues to a sprint. This is a single
+  batched `POST /sprint/{id}/issue` call carrying every key at once, not a per-issue loop, so
+  there is no "key 7 of 13 failed, the rest already moved" state to report on the Jira side. The
+  write-safety gate is still checked for every key before that one call is made: a key that fails
+  the gate stops the command before any issue, including earlier ones in the same invocation, is
+  written.
+- `sprint-remove <KEY>...` — move one or more issues to the backlog, which is how the Jira Agile
+  API removes an issue from its sprint. Same single-batched-call and check-every-key-first
+  behaviour as `sprint-add`.
+- `issue-type <KEY> <NEW_TYPE>` — change one issue's issue type. Defaults to dry-run; pass
+  `--execute` to write. Before writing, it calls `is_issue_type_allowed` and refuses locally, with
+  no Jira round trip, listing the allowed values from `editmeta` when `NEW_TYPE` is not among
+  them. When executing, it captures `issue_version` immediately before the write and passes it as
+  the concurrency guard `expect_updated`; if the issue changed since it was read, the write is
+  refused and the command exits with code 4, naming both the expected and the found `updated`
+  timestamp. A Jira-side rejection not predicted by `editmeta` (for example a required field on
+  the target type) surfaces Jira's own error text rather than being swallowed.
+- `issue-type-options <KEY>` — read-only. Lists the issue types `<KEY>` may become, from the same
+  `editmeta` allowed-values list `issue-type` checks against.
+
+Sprint and issue-type writes follow the same dry-run-by-default, `--execute`-to-write,
+`JIRA_WRITE_PROJECT_KEYS`/`JIRA_WRITE_ISSUE_KEYS`-gated, and audit-logged rules as every other
+write command above, including the `--json` contract: stdout carries exactly one JSON document
+with a top-level `dry_run` boolean, and prose moves to stderr.
