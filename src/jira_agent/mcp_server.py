@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
+    DEFAULT_SPRINT_FIELD,
     DEFAULT_STORY_POINTS_FIELD,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    JiraConcurrentEditError,
     adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
@@ -64,6 +66,17 @@ def _fields_or_default(fields: list[str] | None) -> list[str]:
     return fields or DEFAULT_FIELDS
 
 
+def _issue_fields_or_default(fields: list[str] | None) -> list[str]:
+    """jira_get_issue's own default field set: DEFAULT_FIELDS plus `parent`.
+
+    `parent` is missing from Jira's own default field list, matching the CLI's DEFAULT_FIELDS,
+    so a caller that fetches one issue and never names `parent` explicitly never sees it. A
+    single-issue fetch is exactly where that absence bites, so it is added only here rather than
+    to the shared DEFAULT_FIELDS the list-shaped search tools use.
+    """
+    return fields or [*DEFAULT_FIELDS, "parent"]
+
+
 def _story_points_field() -> str:
     """Dry runs must show the same field id the write would use, but must not fail
     when the environment is incomplete."""
@@ -90,17 +103,80 @@ def _safety_error(exc: JiraWriteSafetyError) -> dict[str, Any]:
     }
 
 
+def _concurrent_edit_error(exc: JiraConcurrentEditError) -> dict[str, Any]:
+    """Shape a JiraConcurrentEditError as a structured, actionable refusal.
+
+    Names both timestamps at the top level, rather than leaving the caller to dig them out of
+    a generic error's `details`, and keeps the underlying message, which already tells the
+    caller to re-read the issue and retry.
+    """
+    return {
+        "ok": False,
+        "error_type": "concurrent_edit",
+        "message": str(exc),
+        "issue": exc.issue_key,
+        "expected_updated": exc.expected_updated,
+        "found_updated": exc.found_updated,
+    }
+
+
+# /search/jql itself reports no match count at all (only `issues`, `isLast`, and an opaque
+# `nextPageToken`); see JiraClient.search_all_issues. This bound is the tool surface's own
+# per-page size, used only to decide when a requested `limit` needs more than one request.
+_SEARCH_PAGE_SIZE = 100
+
+
+def _search_result(
+    client: JiraClient,
+    jql: str,
+    *,
+    limit: int,
+    fields: list[str] | None,
+    project: str | None = None,
+    next_page_token: str | None = None,
+) -> dict[str, Any]:
+    """Run one JQL search and shape the result without ever inventing a match count.
+
+    Always returns `returned` (the issue count actually in this response) and `isLast`, and
+    never a `total` — `/search/jql` does not provide one. A `limit` above one page pages
+    automatically via `search_all_issues` unless the caller is already resuming a manual walk
+    with `next_page_token`, in which case exactly one page is fetched.
+    """
+    if next_page_token is None and limit > _SEARCH_PAGE_SIZE:
+        return client.search_all_issues(
+            jql,
+            limit=limit,
+            fields=fields,
+            project_key=project,
+            page_size=_SEARCH_PAGE_SIZE,
+        )
+    page = client.search_issues(
+        jql,
+        limit=limit,
+        fields=fields,
+        next_page_token=next_page_token,
+        project_key=project,
+    )
+    issues = page.get("issues") or []
+    result: dict[str, Any] = {
+        "issues": issues,
+        "returned": len(issues),
+        "isLast": bool(page.get("isLast", True)),
+    }
+    next_token = page.get("nextPageToken")
+    if next_token:
+        result["nextPageToken"] = next_token
+    return result
+
+
 def _run_jql(jql: str, limit: int = 20, project: str | None = None) -> dict[str, Any]:
     try:
         with _client() as client:
             return {
                 "ok": True,
                 "jql": jql,
-                "result": client.search_issues(
-                    jql,
-                    limit=limit,
-                    fields=DEFAULT_FIELDS,
-                    project_key=project,
+                "result": _search_result(
+                    client, jql, limit=limit, fields=DEFAULT_FIELDS, project=project
                 ),
             }
     except JiraApiError as exc:
@@ -119,10 +195,15 @@ def jira_myself(project: str | None = None) -> dict[str, Any]:
 
 @mcp.tool
 def jira_get_issue(key: str, fields: list[str] | None = None) -> dict[str, Any]:
-    """Fetch one Jira issue by key."""
+    """Fetch one Jira issue by key.
+
+    Defaults to DEFAULT_FIELDS plus `parent`, matching the CLI. `parent` is not part of Jira's
+    own default field list, so passing an explicit `fields` list must name it to see it.
+    """
     try:
         with _client() as client:
-            return {"ok": True, "issue": client.get_issue(key, fields=_fields_or_default(fields))}
+            issue = client.get_issue(key, fields=_issue_fields_or_default(fields))
+            return {"ok": True, "issue": issue}
     except JiraApiError as exc:
         return _error(exc)
 
@@ -135,17 +216,25 @@ def jira_search_issues(
     next_page_token: str | None = None,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """Search Jira issues with JQL. Pass a project key to search with its credential set."""
+    """Search Jira issues with JQL. Pass a project key to search with its credential set.
+
+    `/search/jql` reports no match count at all, only `issues`, `isLast`, and an opaque
+    `nextPageToken`; this never invents one. The result carries `returned` (the issue count in
+    this response) and `isLast`, plus `nextPageToken` when more remain and you are not already
+    paging past it automatically. A `limit` above 100 pages through every matching issue up to
+    that limit on its own; pass `next_page_token` yourself only to resume a manual page walk.
+    """
     try:
         with _client() as client:
             return {
                 "ok": True,
-                "result": client.search_issues(
+                "result": _search_result(
+                    client,
                     jql,
                     limit=limit,
                     fields=_fields_or_default(fields),
                     next_page_token=next_page_token,
-                    project_key=project,
+                    project=project,
                 ),
             }
     except JiraApiError as exc:
@@ -193,10 +282,8 @@ def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
             return {
                 "ok": True,
                 "test_jql": config.test_jql,
-                "result": client.search_issues(
-                    config.test_jql,
-                    limit=limit,
-                    fields=DEFAULT_FIELDS,
+                "result": _search_result(
+                    client, config.test_jql, limit=limit, fields=DEFAULT_FIELDS
                 ),
             }
     except JiraApiError as exc:
@@ -434,10 +521,19 @@ def jira_assign_issue(
 @mcp.tool
 def jira_agent_report(
     key: str | None = None,
-    comments_limit: int = 5,
+    comments_limit: int | Literal["all"] = 5,
     changelog_limit: int = 0,
 ) -> dict[str, Any]:
-    """Return compact issue context for agents."""
+    """Return compact issue context for agents.
+
+    comments_limit controls how many comments the report carries, never how many the issue
+    actually has: the report always carries `comment_count` (the API's true total),
+    `comments_returned` (how many are actually attached), and `comments_truncated` (true
+    whenever comments_returned is less than comment_count), so a reader never has to infer one
+    from the other. An integer fetches the newest that many comments, newest first. The literal
+    "all" pages through every comment and returns them oldest first, the API's natural
+    chronological order.
+    """
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -475,6 +571,7 @@ def jira_edit_issue(
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
@@ -486,6 +583,11 @@ def jira_edit_issue(
 
     Omitting fix_versions leaves the issue's fix versions untouched. Pass an empty list to
     clear them, matching the labels convention; pass one or more version names to set them.
+
+    guard_concurrent_edit defaults to true: the issue's `updated` timestamp is read right before
+    the write and passed back as a concurrency guard, so a change that lands between that read
+    and this write is refused with error_type "concurrent_edit" naming both timestamps, instead
+    of being silently overwritten. Pass false to skip the guard.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -517,6 +619,7 @@ def jira_edit_issue(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
+            expect_updated = client.issue_version(issue_key) if guard_concurrent_edit else None
             if not execute:
                 return {
                     "ok": True,
@@ -525,6 +628,7 @@ def jira_edit_issue(
                     "payload": payload,
                     "safety": safety,
                     "write_scope": write_scope_summary(config),
+                    "expect_updated": expect_updated,
                     "message": "Pass execute=true to edit this issue in Jira.",
                 }
 
@@ -537,6 +641,7 @@ def jira_edit_issue(
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
+                expect_updated=expect_updated,
             )
             audit_write(
                 config,
@@ -546,6 +651,8 @@ def jira_edit_issue(
                 result={},
             )
             return {"ok": True, "issue": issue_key}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -642,6 +749,7 @@ def jira_patch_description_section(
     include_heading: bool = True,
     expect_swallowed_headings: list[str] | None = None,
     allow_wide_rewrite: bool = False,
+    guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
     """Rewrite one section of an issue's existing description. Defaults to dry-run.
@@ -679,9 +787,12 @@ def jira_patch_description_section(
     A refusal returns error_type "section_patch_refused" together with swallowed_headings and
     expect_swallowed_headings as lists, so the correction is data and never a parsed sentence.
 
-    There is no optimistic concurrency. The description is read and then written back whole, so
-    an edit that lands in between is silently reverted. Keep the gap short, and re-read before a
-    second write.
+    guard_concurrent_edit defaults to true. The issue's `updated` timestamp is read in the same
+    request that already reads the description, so the token belongs to that exact read, and is
+    passed back as a concurrency guard on the write: an edit that lands in between is refused
+    with error_type "concurrent_edit" naming both timestamps, instead of being silently
+    reverted. Pass false to skip the guard and go back to the previous unconditional
+    read-then-overwrite behaviour.
 
     section names a top-level heading and is matched with leading # characters optional, case
     insensitively, and whitespace-trimmed. An unknown heading and an ambiguous heading are
@@ -716,7 +827,10 @@ def jira_patch_description_section(
     try:
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, key)
-            issue = client.get_issue(key, fields=["description"])
+            issue = client.get_issue(key, fields=["description", "updated"])
+            expect_updated = (
+                (issue.get("fields") or {}).get("updated") if guard_concurrent_edit else None
+            )
             patch = patch_adf_description_section(
                 (issue.get("fields") or {}).get("description"),
                 section=section,
@@ -736,10 +850,13 @@ def jira_patch_description_section(
                     "new_nodes": patch["new_nodes"],
                     "safety": safety,
                     "write_scope": write_scope_summary(config),
+                    "expect_updated": expect_updated,
                     "message": "Pass execute=true to patch this section in Jira.",
                 }
 
-            result = client.edit_issue_adf_description(key, patch["document"])
+            result = client.edit_issue_adf_description(
+                key, patch["document"], expect_updated=expect_updated
+            )
             audit_write(
                 config,
                 action="patch_description_section",
@@ -749,6 +866,7 @@ def jira_patch_description_section(
                     "include_heading": include_heading,
                     "expect_swallowed_headings": expect_swallowed_headings,
                     "allow_wide_rewrite": allow_wide_rewrite,
+                    "guard_concurrent_edit": guard_concurrent_edit,
                     **summary,
                 },
                 result=result,
@@ -767,6 +885,8 @@ def jira_patch_description_section(
         return {"ok": False, "message": str(exc)}
     except AdfPatchInvariantError as exc:
         return {"ok": False, "message": str(exc), "error_type": "patch_invariant"}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1036,13 +1156,40 @@ def jira_update_drift_labels(
 
 
 @mcp.tool
-def jira_list_comments(key: str, limit: int = 20, start_at: int = 0) -> dict[str, Any]:
-    """List comments for one Jira issue."""
+def jira_list_comments(
+    key: str,
+    limit: int | Literal["all"] = 20,
+    start_at: int = 0,
+    order_by: str | None = "-created",
+) -> dict[str, Any]:
+    """List comments for one Jira issue, NEWEST first by default.
+
+    Jira's own default order for this endpoint is oldest-first, which is easy to mistake for
+    "most recent" when only a handful come back: on a long issue the first page of the default
+    order holds only the oldest comments, so a freshly written one stays invisible. The dominant
+    use of this tool is checking whether your own comment landed, so order_by defaults here to
+    "-created" (newest first) instead of Jira's native order; pass order_by=None to get that
+    native oldest-first order back.
+
+    limit="all" pages through every comment on the issue and ignores start_at. An integer limit
+    returns one page of that size starting at start_at.
+
+    The response carries `returned` (the number of comments actually in this response) and
+    `total` (the API's real total comment count) as separate fields; never infer one from the
+    other.
+    """
     try:
         with _client() as client:
+            if limit == "all":
+                page = client.list_all_comments(key, order_by=order_by)
+            else:
+                page = client.list_comments(key, start_at=start_at, limit=limit, order_by=order_by)
+            comments = page.get("comments") or []
             return {
                 "ok": True,
-                "comments": client.list_comments(key, start_at=start_at, limit=limit),
+                "comments": comments,
+                "returned": len(comments),
+                "total": page.get("total"),
             }
     except JiraApiError as exc:
         return _error(exc)
@@ -1930,6 +2077,262 @@ def jira_transition_issue(
                 result={},
             )
             return {"ok": True, "issue": key, "transition": selected}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dict[str, Any]:
+    """Delete one comment from a Jira issue. Defaults to dry-run.
+
+    Reads the comment first, matching the jira_update_comment convention, so both the dry run
+    and a refusal on a missing comment show what would be deleted.
+    """
+    try:
+        with _client() as client:
+            safety = ensure_issue_write_allowed(client.config, client, key)
+            try:
+                current = client.get_comment(key, comment_id)
+            except JiraApiError as exc:
+                if exc.status_code == 404:
+                    return {
+                        "ok": False,
+                        "message": f"Comment {comment_id} is not present on {key}.",
+                    }
+                raise
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    "comment_id": comment_id,
+                    "current_author": (current.get("author") or {}).get("displayName"),
+                    "current_body": current.get("body"),
+                    "safety": safety,
+                    "message": "Pass execute=true to delete this comment in Jira.",
+                }
+
+            client.delete_comment(key, comment_id)
+            audit_write(
+                client.config,
+                action="delete_comment",
+                issue_key=key,
+                payload={"comment_id": comment_id},
+                result={},
+            )
+            return {"ok": True, "issue": key, "deleted_comment_id": comment_id}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_issue_type_options(key: str) -> dict[str, Any]:
+    """List one issue's allowed issue-type values for a type change.
+
+    Reads editmeta, the same source jira_set_issue_type checks before writing, so an agent can
+    see what an issue may change to without guessing and hitting the refusal.
+    """
+    try:
+        with _client() as client:
+            metadata = client.get_edit_metadata(key)
+            issuetype_field = (metadata.get("fields") or {}).get("issuetype") or {}
+            allowed = issuetype_field.get("allowedValues") or []
+            names = [
+                str(value.get("name"))
+                for value in allowed
+                if isinstance(value, dict) and value.get("name")
+            ]
+            return {"ok": True, "issue": key, "allowed_issue_types": names}
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_set_issue_type(
+    key: str,
+    issue_type_name: str,
+    guard_concurrent_edit: bool = True,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Change one issue's issue type. Defaults to dry-run.
+
+    Checks the target issue's editmeta first and refuses immediately when issue_type_name is not
+    among its allowed issuetype values, instead of sending a PUT Jira would reject. Guarded by
+    the same concurrency check as jira_edit_issue and jira_patch_description_section: pass
+    guard_concurrent_edit=false to skip it.
+    """
+    try:
+        with _client() as client:
+            safety = ensure_issue_write_allowed(client.config, client, key)
+            if not client.is_issue_type_allowed(key, issue_type_name):
+                return {
+                    "ok": False,
+                    "message": f"{issue_type_name!r} is not an allowed issue type for {key}.",
+                }
+            expect_updated = client.issue_version(key) if guard_concurrent_edit else None
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue": key,
+                    "issue_type_name": issue_type_name,
+                    "expect_updated": expect_updated,
+                    "safety": safety,
+                    "message": "Pass execute=true to change this issue's type in Jira.",
+                }
+
+            client.set_issue_type(key, issue_type_name, expect_updated=expect_updated)
+            audit_write(
+                client.config,
+                action="set_issue_type",
+                issue_key=key,
+                payload={
+                    "issue_type_name": issue_type_name,
+                    "guard_concurrent_edit": guard_concurrent_edit,
+                },
+                result={},
+            )
+            return {"ok": True, "issue": key, "issue_type_name": issue_type_name}
+    except JiraConcurrentEditError as exc:
+        return _concurrent_edit_error(exc)
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_list_boards(
+    board_type: str | None = None,
+    name: str | None = None,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List Jira Agile boards, optionally filtered by type (for example "scrum") or name."""
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "boards": client.list_boards(
+                    board_type=board_type, name=name, max_results=max_results
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_list_board_sprints(
+    board_id: int | str,
+    state: str | None = None,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List sprints on one Jira Agile board. state optionally filters to active/future/closed."""
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "sprints": client.list_board_sprints(
+                    board_id, state=state, max_results=max_results
+                ),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_get_issue_sprints(key: str, sprint_field: str = DEFAULT_SPRINT_FIELD) -> dict[str, Any]:
+    """Return the sprint objects on one issue's sprint field.
+
+    sprint_field defaults to customfield_10020, the id probed on this Jira site; pass a
+    different id if this site's Agile sprint field uses another custom field id.
+    """
+    try:
+        with _client() as client:
+            return {
+                "ok": True,
+                "issue": key,
+                "sprints": client.get_issue_sprints(key, sprint_field=sprint_field),
+            }
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_add_issues_to_sprint(
+    sprint_id: int | str,
+    issue_keys: list[str],
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Add one or more issues to a sprint. Defaults to dry-run."""
+    if not issue_keys:
+        return {"ok": False, "message": "issue_keys must not be empty."}
+    try:
+        with _client() as client:
+            safety = {
+                issue_key: ensure_issue_write_allowed(client.config, client, issue_key)
+                for issue_key in issue_keys
+            }
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "safety": safety,
+                    "message": "Pass execute=true to add these issues to the sprint in Jira.",
+                }
+
+            client.add_issues_to_sprint(sprint_id, issue_keys)
+            audit_write(
+                client.config,
+                action="add_issues_to_sprint",
+                issue_key=issue_keys[0],
+                payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
+                result={},
+            )
+            return {"ok": True, "sprint_id": sprint_id, "issue_keys": issue_keys}
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_move_issues_to_backlog(
+    issue_keys: list[str],
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Move one or more issues to the backlog, out of any sprint. Defaults to dry-run."""
+    if not issue_keys:
+        return {"ok": False, "message": "issue_keys must not be empty."}
+    try:
+        with _client() as client:
+            safety = {
+                issue_key: ensure_issue_write_allowed(client.config, client, issue_key)
+                for issue_key in issue_keys
+            }
+            if not execute:
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "issue_keys": issue_keys,
+                    "safety": safety,
+                    "message": "Pass execute=true to move these issues to the backlog in Jira.",
+                }
+
+            client.move_issues_to_backlog(issue_keys)
+            audit_write(
+                client.config,
+                action="move_issues_to_backlog",
+                issue_key=issue_keys[0],
+                payload={"issue_keys": issue_keys},
+                result={},
+            )
+            return {"ok": True, "issue_keys": issue_keys}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
