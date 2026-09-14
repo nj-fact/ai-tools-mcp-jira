@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from jira_agent import mcp_server
 from jira_agent.client import JiraApiError, JiraConcurrentEditError, text_to_adf
 from jira_agent.config import JiraConfig
@@ -979,19 +977,6 @@ def test_jira_agent_report_docstring_claims_newest_first_for_both_paths() -> Non
     assert "comments_order" in doc
 
 
-@pytest.mark.xfail(
-    reason=(
-        "F1: reporting.fetch_agent_report's 'all' branch does not yet pass "
-        "order_by='-created' to list_all_comments, and build_agent_report does not yet carry "
-        "comments_order. That fix belongs to reporting.py, owned by another worker on the CLI "
-        "surface of this same remediation; this pins the contract jira_agent_report's docstring "
-        "now promises, against the real (unmocked) reporting.fetch_agent_report/"
-        "build_agent_report, using only a fake JiraClient. strict=True so this turns into a "
-        "hard failure the day reporting.py's fix lands, forcing the marker's removal rather "
-        "than silently passing unnoticed."
-    ),
-    strict=True,
-)
 def test_jira_agent_report_all_path_returns_comments_newest_first(tmp_path, monkeypatch) -> None:
     config = make_config(tmp_path)
 
