@@ -67,6 +67,46 @@ class JiraConcurrentEditError(JiraApiError):
         self.found_updated = found_updated
 
 
+class JiraMissingConcurrencyTokenError(JiraApiError):
+    """A whole-field rewrite asked for the default concurrency guard, but the read that was
+    supposed to carry the guard token (`fields.updated`) did not return a usable one.
+
+    Distinct from JiraConcurrentEditError: that one fires when the guard successfully read a
+    token and then found it stale immediately before the write. This one fires when there was no
+    token to guard with in the first place. Treating a missing token as "no guard requested" —
+    which is what passing `expect_updated=None` through to `_guarded_issue_put` does — would
+    perform the exact unguarded overwrite the caller did not ask for, and report it as a guarded
+    success. Raising here instead makes that refusal visible.
+    """
+
+    def __init__(self, *, issue_key: str) -> None:
+        super().__init__(
+            f"Issue {issue_key}: the concurrency guard is on but Jira's response did not include "
+            "a usable 'updated' timestamp to guard the write with. Re-read the issue and retry, "
+            "or pass the command's guard opt-out flag to proceed without the guard.",
+            details={"issue_key": issue_key},
+        )
+        self.issue_key = issue_key
+
+
+def require_concurrency_token(
+    issue_key: str, read_updated: Any, *, guard_enabled: bool
+) -> str | None:
+    """Return `read_updated` as the `expect_updated` guard token, honouring `guard_enabled`.
+
+    Every whole-field-rewrite command reads `updated` in the same request as the content it is
+    about to rewrite, then wants exactly this decision: pass `None` through unchanged when the
+    guard is off, otherwise use the token that was read — unless that token is missing or not a
+    string, in which case raise `JiraMissingConcurrencyTokenError` rather than silently falling
+    back to an unguarded write. Centralized here so every guarded command applies the same rule.
+    """
+    if not guard_enabled:
+        return None
+    if not isinstance(read_updated, str) or not read_updated:
+        raise JiraMissingConcurrencyTokenError(issue_key=issue_key)
+    return read_updated
+
+
 class JiraClient:
     def __init__(
         self,
@@ -181,6 +221,13 @@ class JiraClient:
 
         Bounded to `_MAX_SEARCH_PAGES` requests, and stops early on a page that comes back with no
         issues even if `isLast` has not yet turned true, since there is nothing left to collect.
+
+        The returned dict spells this fact `is_last`, snake_case like every other key this tool's
+        own result documents use (`dry_run`, `error_type`, `expected_updated`,
+        `comments_returned`). Only the *read* of the raw Jira page a few lines below keeps Jira's
+        own `isLast` spelling, because that dict is Jira's response, not this method's result;
+        `nextPageToken` is left as-is for the same reason, and because a caller passes it back
+        verbatim as a request parameter.
         """
         issues: list[dict[str, Any]] = []
         is_last = True
@@ -211,14 +258,14 @@ class JiraClient:
         result: dict[str, Any] = {
             "issues": issues,
             "returned": len(issues),
-            "isLast": is_last,
+            "is_last": is_last,
         }
         if not is_last and next_token:
             result["nextPageToken"] = next_token
         return result
 
-    def approximate_issue_count(self, jql: str, *, project_key: str | None = None) -> int:
-        """Return Jira's approximate match count for a JQL query.
+    def approximate_issue_count(self, jql: str, *, project_key: str | None = None) -> int | None:
+        """Return Jira's approximate match count for a JQL query, or None if Jira left it out.
 
         This is a read in intent — it looks up a count, nothing more — but the endpoint Jira
         provides for it is a POST (`/search/approximate-count`), unlike every other lookup in this
@@ -226,6 +273,12 @@ class JiraClient:
         idempotency or cache-ability from the verb alone. This is also the only number this API
         gives for a `/search/jql` query, so the caller is responsible for labelling it approximate
         rather than presenting it as an exact total.
+
+        Returns `None`, rather than fabricating a number, when Jira's response does not carry a
+        `count` field. A caller that asked for this must report that absence explicitly (a
+        `search --count` invocation that silently drops the field it was asked for is exactly the
+        failure this return type exists to prevent) rather than treating a missing count the same
+        as one that was never requested.
         """
         data = self._request(
             "POST",
@@ -275,6 +328,18 @@ class JiraClient:
         ``total`` or a page comes back empty. Bounded to ``_MAX_COMMENT_PAGES`` requests: if a
         miscounted total or comments deleted mid-page ever kept this from converging, this
         returns the partial result instead of looping forever.
+
+        The reported ``total`` is the FIRST page's ``total``, not the last's: a comment deleted
+        between this method's first and last request would otherwise let a later, smaller
+        ``total`` overwrite the first, and the two are then free to disagree with each other in
+        either direction depending only on which page happened to run last. Keeping the first
+        page's value is not enough by itself either — the exact same deletion can make even that
+        first value smaller than the number of comments this method goes on to actually collect
+        (reproducible synthetically with a page reporting ``total: 0`` alongside one comment).
+        So the returned ``total`` is additionally floored at ``len(comments)``: it can disagree
+        with Jira's own count, but it can never claim fewer comments exist than this method is
+        handing back right now, which would read as ``comments_truncated: false`` alongside a
+        ``comment_count`` smaller than ``comments_returned`` — a contradiction in the same report.
         """
         comments: list[dict[str, Any]] = []
         total: int | None = None
@@ -284,16 +349,16 @@ class JiraClient:
                 issue_key, start_at=start_at, limit=page_size, order_by=order_by
             )
             page_comments = page.get("comments") or []
-            page_total = page.get("total")
-            if isinstance(page_total, int):
-                total = page_total
+            if total is None and isinstance(page.get("total"), int):
+                total = page["total"]
             if not page_comments:
                 break
             comments.extend(page_comments)
             start_at += len(page_comments)
             if total is not None and len(comments) >= total:
                 break
-        return {"comments": comments, "total": total if total is not None else len(comments)}
+        reported_total = len(comments) if total is None else max(total, len(comments))
+        return {"comments": comments, "total": reported_total}
 
     def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
         return self._request(

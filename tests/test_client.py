@@ -3180,6 +3180,62 @@ def test_list_all_comments_stops_on_an_empty_page() -> None:
     assert calls["count"] == 2
 
 
+def test_list_all_comments_keeps_the_first_pages_total_not_the_last() -> None:
+    """F6 regression: the old code kept overwriting `total` with each page's own `total`, so the
+    LAST page's value won, not the first's. A deletion between pages can make that last value
+    smaller than the first: `comment_count: 90` alongside `comments_returned: 100` reads as
+    `comments_truncated: false` while claiming fewer comments exist than were just returned.
+    """
+    pages = [
+        {"comments": [{"id": str(i)} for i in range(1, 51)], "total": 100},
+        {"comments": [{"id": str(i)} for i in range(51, 101)], "total": 90},
+    ]
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(200, json=pages[calls["count"]])
+        calls["count"] += 1
+        return response
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=50)
+
+    assert len(result["comments"]) == 100
+    assert result["total"] == 100
+    assert result["total"] >= len(result["comments"])
+
+
+def test_list_all_comments_total_is_never_less_than_comments_returned() -> None:
+    """F6 regression, the exact synthetic case from the finding: a page reporting `total: 0`
+    alongside one actual comment used to report `total: 0` with `comments_returned: 1` — fewer
+    comments claimed to exist than were just handed back in the same response.
+    """
+    pages = [{"comments": [{"id": "1"}], "total": 0}]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages[0])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=50)
+
+    assert len(result["comments"]) == 1
+    assert result["total"] == 1
+
+
 # --- Search paging with no fabricated total, and the approximate-count endpoint -------------
 
 
@@ -3208,7 +3264,10 @@ def test_search_all_issues_follows_next_page_token_until_is_last() -> None:
 
     assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3", "FC-4", "FC-5"]
     assert result["returned"] == 5
-    assert result["isLast"] is True
+    # This method's own result spells it `is_last`, snake_case like the rest of this tool's
+    # result documents; only the raw Jira pages above keep Jira's own `isLast` casing.
+    assert result["is_last"] is True
+    assert "isLast" not in result
     assert "nextPageToken" not in result
     assert "total" not in result
     assert seen_tokens == [None, "tok-1", "tok-2"]
@@ -3239,7 +3298,8 @@ def test_search_all_issues_limit_truncates_and_keeps_next_page_token() -> None:
     assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3"]
     assert result["returned"] == 3
     assert result["nextPageToken"] == "tok-2"
-    assert result["isLast"] is False
+    assert result["is_last"] is False
+    assert "isLast" not in result
     assert seen_max_results == [2, 1]
     assert "total" not in result
 
