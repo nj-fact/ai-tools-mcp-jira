@@ -16,6 +16,7 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    JiraConcurrentEditError,
     adf_contains_media_id,
     create_issue_payload,
     edit_issue_payload,
@@ -1813,6 +1814,19 @@ def patch_description_section(
             help="Permit a slice that is the whole description. It grants nothing else.",
         ),
     ] = False,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Capture the issue's `updated` timestamp in the same read as the description, "
+                "then refuse the write (exit code 4) if it no longer matches immediately before "
+                "the write. This is a check-then-act narrowing of the race window, not an "
+                "atomic compare-and-swap: Jira Cloud has no conditional write here, so a change "
+                "landing in that window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually patch the section in Jira."),
@@ -1831,9 +1845,15 @@ def patch_description_section(
     whole content list needs `--allow-wide-rewrite`. Every heading inside the slice below the
     one you named has to be named too, with a repeated `--expect-swallowed-heading` in document
     order; the refusal prints the exact list. `--allow-wide-rewrite` does not satisfy the naming
-    duty. There is no optimistic concurrency: the description is
-    read and written back whole, so an edit that lands in between is silently reverted. Use this
-    instead of `edit-issue --description-section`, which always replaces the whole field.
+    duty. The description is read and written back whole, so a naive read-then-write still risks
+    silently reverting a concurrent edit. By default this command guards against exactly that:
+    the read that fetches the description also fetches `updated` in the same request, so the
+    guard token belongs to the same read as the content rather than to a second read that could
+    itself straddle a change; the write then fails with exit code 4 if `updated` no longer
+    matches immediately beforehand. This narrows the race window but does not close it — Jira
+    Cloud offers no conditional write on this resource, so an edit landing inside that narrowed
+    window is still lost. Pass --no-concurrency-guard for the old unguarded behaviour. Use this
+    command instead of `edit-issue --description-section`, which always replaces the whole field.
     """
     config = _config()
     try:
@@ -1853,9 +1873,15 @@ def patch_description_section(
     with JiraClient(config) as client:
         try:
             safety = ensure_issue_write_allowed(config, client, key)
-            issue = client.get_issue(key, fields=["description"])
+            # Fetch "updated" in the SAME request as "description" so the guard token belongs
+            # to the read that produced the content being patched, rather than to a second,
+            # independent read that could itself straddle a concurrent change.
+            issue = client.get_issue(key, fields=["description", "updated"])
+            issue_fields = issue.get("fields") or {}
+            read_updated = issue_fields.get("updated")
+            expect_updated = read_updated if concurrency_guard else None
             patch = patch_adf_description_section(
-                (issue.get("fields") or {}).get("description"),
+                issue_fields.get("description"),
                 section=section,
                 mode=mode,
                 content=body,
@@ -1917,7 +1943,9 @@ def patch_description_section(
             return
 
         try:
-            data = client.edit_issue_adf_description(key, patch["document"])
+            data = client.edit_issue_adf_description(
+                key, patch["document"], expect_updated=expect_updated
+            )
             audit_write(
                 config,
                 action="patch_description_section",
@@ -1927,10 +1955,13 @@ def patch_description_section(
                     "include_heading": include_heading,
                     "expect_swallowed_headings": expect_swallowed_heading,
                     "allow_wide_rewrite": allow_wide_rewrite,
+                    "concurrency_guard": concurrency_guard,
                     **summary,
                 },
                 result=data,
             )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
         except JiraApiError as exc:
             _exit_api_error(exc)
 
@@ -3064,6 +3095,36 @@ def _exit_api_error(exc: JiraApiError) -> None:
 def _exit_safety_error(exc: JiraWriteSafetyError) -> None:
     _print_error("Write safety error:", exc)
     raise typer.Exit(3) from exc
+
+
+# Distinct from _exit_api_error's 1 and _exit_safety_error's 3, so a script can tell a lost-update
+# refusal apart from a transport failure or a write-scope refusal.
+CONCURRENT_EDIT_EXIT_CODE = 4
+
+
+def _exit_concurrent_edit_error(exc: JiraConcurrentEditError, *, json_mode: bool) -> None:
+    """Refuse a whole-field rewrite that lost the check-then-act race, on both output channels.
+
+    This is reached only when the guard itself found a mismatch immediately before the write, so
+    the write never happened. The caller must re-read the issue and retry with the fresh
+    `updated` value; retrying blindly with the same expectation will refuse again.
+    """
+    _print_error(
+        "Concurrent edit refused:",
+        f"{exc.issue_key} changed since it was read (expected updated={exc.expected_updated!r}, "
+        f"found updated={exc.found_updated!r}). Re-read the issue and retry.",
+    )
+    if json_mode:
+        _emit_json(
+            {
+                "error_type": "concurrent_edit",
+                "issue": exc.issue_key,
+                "expected_updated": exc.expected_updated,
+                "found_updated": exc.found_updated,
+                "dry_run": False,
+            }
+        )
+    raise typer.Exit(CONCURRENT_EDIT_EXIT_CODE) from exc
 
 
 if __name__ == "__main__":
