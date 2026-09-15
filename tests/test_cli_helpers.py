@@ -1330,6 +1330,118 @@ class EmptyUploadCliFakeClient:
         return []
 
 
+class CommittedMutationCliFakeClient:
+    creates = 0
+
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def add_comment(self, issue_key, body):
+        type(self).creates += 1
+        return {"id": "7001", "body": body}
+
+    def add_attachment(self, issue_key, file_path):
+        type(self).creates += 1
+        return [{"id": "8001", "filename": Path(file_path).name}]
+
+
+def _install_committed_mutation_cli(monkeypatch, tmp_path) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_PROJECT_KEY": "FC",
+            "JIRA_TEST_ISSUE_KEY": "FC-1",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    CommittedMutationCliFakeClient.creates = 0
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", CommittedMutationCliFakeClient)
+
+    def fail_audit(_config, **_kwargs):
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(cli, "audit_write", fail_audit)
+
+
+def test_add_comment_cli_audit_oserror_preserves_id_and_success(tmp_path, monkeypatch) -> None:
+    _install_committed_mutation_cli(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app, ["add-comment", "FC-1", "Committed comment", "--execute", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["id"] == "7001"
+    assert payload["partial_success"] is True
+    assert payload["audit_warning"]["committed"] is True
+    assert CommittedMutationCliFakeClient.creates == 1
+
+
+def test_attach_cli_audit_oserror_preserves_ids_and_success(tmp_path, monkeypatch) -> None:
+    _install_committed_mutation_cli(monkeypatch, tmp_path)
+    upload = tmp_path / "contract.txt"
+    upload.write_text("body", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["attach", "FC-1", "--file", str(upload), "--execute", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["attachments"][0]["id"] == "8001"
+    assert payload["partial_success"] is True
+    assert payload["audit_warning"]["committed"] is True
+    assert CommittedMutationCliFakeClient.creates == 1
+
+
+def test_factory_contract_cli_audit_oserror_preserves_remote_ids_and_success(
+    tmp_path, monkeypatch
+) -> None:
+    _install_committed_mutation_cli(monkeypatch, tmp_path)
+    upload = tmp_path / "contract.txt"
+    upload.write_text("body", encoding="utf-8")
+
+    comment_result = CliRunner().invoke(
+        cli.app,
+        ["factory-contract", "FC-1", "--text", "Contract", "--execute"],
+    )
+    attachment_result = CliRunner().invoke(
+        cli.app,
+        [
+            "factory-contract",
+            "FC-1",
+            "--mode",
+            "attachment",
+            "--file",
+            str(upload),
+            "--execute",
+        ],
+    )
+
+    assert comment_result.exit_code == 0, comment_result.stdout + comment_result.stderr
+    assert "comment 7001" in comment_result.stdout
+    assert "Jira accepted the mutation" in comment_result.stderr
+    assert attachment_result.exit_code == 0, attachment_result.stdout + attachment_result.stderr
+    assert "contract.txt (8001)" in attachment_result.stdout
+    assert "Jira accepted the mutation" in attachment_result.stderr
+    assert CommittedMutationCliFakeClient.creates == 2
+
+
 def test_attach_cli_rejects_empty_success_payload_without_audit(tmp_path, monkeypatch) -> None:
     config = JiraConfig.model_validate(
         {

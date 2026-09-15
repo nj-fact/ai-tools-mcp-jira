@@ -57,7 +57,13 @@ def audit_committed_write(
             result=result,
         )
     except Exception as exc:
-        return committed_audit_warning(action=action, exc=exc)
+        warning = committed_audit_warning(action=action, exc=exc)
+        if result is not None:
+            # Preserve the remote payload/IDs while making the partial-success state available
+            # to callers that return this result object directly.
+            result["audit_warning"] = warning
+            result["partial_success"] = True
+        return warning
     return None
 
 

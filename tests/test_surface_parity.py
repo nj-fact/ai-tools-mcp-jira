@@ -71,6 +71,26 @@ def test_no_stale_key_spelling_survives_in_either_surface_source() -> None:
         assert banned not in mcp_source, f"{banned} reappeared in mcp_server.py"
 
 
+def test_mutation_surfaces_never_call_raw_audit_write_directly() -> None:
+    """A local audit failure after an accepted Jira mutation must never invite a retry.
+
+    Every surface mutation is therefore routed through its `_audit_committed_write` wrapper.
+    `audit_write` may remain imported only as the injected writer, which keeps tests and the
+    low-level audit module independently usable; calling it directly from either surface is a
+    regression.
+    """
+    for module in (cli, mcp_server):
+        tree = ast.parse(inspect.getsource(module))
+        direct_calls = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "audit_write"
+        ]
+        assert direct_calls == [], f"raw audit_write calls in {module.__name__}: {direct_calls}"
+
+
 # H3: one condition ("the guard is on but the read carried no usable `updated` token"), pinned to
 # exactly one spelling. cli.py used to emit "concurrency_guard_unavailable" while mcp_server.py
 # (and client.py's own docstring, and every test written against the MCP surface) used

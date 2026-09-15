@@ -386,6 +386,12 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - `create-issue` and `create-test-issue` use the same committed partial-success contract: a local
   audit failure after Jira returns the new issue never converts that successful creation into a
   retryable failure or hides the created issue key.
+- The CLI and MCP mutation surfaces contain no direct `audit_write` calls. The complete audit
+  census classifies every surface audit as post-commit: comments, attachments, issue edits,
+  assignments, links, transitions, sprint/backlog moves, diagrams, galleries, and issue-type
+  changes all run only after Jira has accepted a remote mutation. They therefore all pass through
+  `audit_committed_write`; there are currently no pre-commit or otherwise retry-safe surface
+  audits that may propagate a local audit-sink failure.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,

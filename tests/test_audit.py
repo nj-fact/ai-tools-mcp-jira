@@ -72,11 +72,12 @@ def test_audit_committed_write_returns_explicit_warning_instead_of_retryable_fai
     def failing_writer(*_args, **_kwargs) -> None:
         raise OSError("audit disk unavailable")
 
+    remote_result = {"id": "7001"}
     warning = audit_committed_write(
         config,
         action="embed_diagram",
         issue_key="FC-107",
-        result={"updated": True},
+        result=remote_result,
         writer=failing_writer,
     )
 
@@ -89,3 +90,6 @@ def test_audit_committed_write_returns_explicit_warning_instead_of_retryable_fai
             "OSError: audit disk unavailable"
         ),
     }
+    assert remote_result["id"] == "7001"
+    assert remote_result["partial_success"] is True
+    assert remote_result["audit_warning"] == warning

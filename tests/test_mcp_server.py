@@ -804,6 +804,94 @@ def test_jira_factory_contract_rejects_empty_success_payload_without_audit(
     assert audited == []
 
 
+class CommittedMutationMcpFakeClient:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.mutations = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def add_comment(self, issue_key, body):
+        self.mutations += 1
+        return {"id": "7001", "body": body}
+
+    def add_attachment(self, issue_key, file_path):
+        self.mutations += 1
+        return [{"id": "8001", "filename": Path(file_path).name}]
+
+
+def _install_committed_mutation_mcp_client(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    client = CommittedMutationMcpFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "_client", lambda: client)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    def fail_audit(_config, **_kwargs):
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(mcp_server, "audit_write", fail_audit)
+    return client
+
+
+def test_jira_add_comment_audit_oserror_preserves_id_and_success(tmp_path, monkeypatch) -> None:
+    client = _install_committed_mutation_mcp_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_add_comment("FC-1", "Committed comment", execute=True)
+
+    assert result["ok"] is True
+    assert result["comment"]["id"] == "7001"
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert client.mutations == 1
+
+
+def test_jira_attach_file_audit_oserror_preserves_ids_and_success(tmp_path, monkeypatch) -> None:
+    client = _install_committed_mutation_mcp_client(monkeypatch, tmp_path)
+    upload = tmp_path / "contract.txt"
+    upload.write_text("body", encoding="utf-8")
+
+    result = mcp_server.jira_attach_file(str(upload), key="FC-1", execute=True)
+
+    assert result["ok"] is True
+    assert result["attachments"][0]["id"] == "8001"
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert client.mutations == 1
+
+
+def test_jira_factory_contract_audit_oserror_preserves_ids_and_success(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_committed_mutation_mcp_client(monkeypatch, tmp_path)
+    upload = tmp_path / "contract.txt"
+    upload.write_text("body", encoding="utf-8")
+
+    comment_result = mcp_server.jira_store_factory_contract(
+        body="Contract", key="FC-1", execute=True
+    )
+    attachment_result = mcp_server.jira_store_factory_contract(
+        key="FC-1", file_path=str(upload), mode="attachment", execute=True
+    )
+
+    assert comment_result["ok"] is True
+    assert comment_result["comment"]["id"] == "7001"
+    assert comment_result["partial_success"] is True
+    assert comment_result["audit_warning"]["committed"] is True
+    assert attachment_result["ok"] is True
+    assert attachment_result["attachments"][0]["id"] == "8001"
+    assert attachment_result["partial_success"] is True
+    assert attachment_result["audit_warning"]["committed"] is True
+    assert client.mutations == 2
+
+
 class LinkCreateFakeClient:
     def __init__(self, _config) -> None:
         self.created: list[dict[str, object]] = []

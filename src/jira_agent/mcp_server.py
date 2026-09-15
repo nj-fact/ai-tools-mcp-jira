@@ -81,6 +81,19 @@ from jira_agent.workflows import (
 mcp = FastMCP("jira-agent")
 
 
+def _audit_committed_write(config: Any, **kwargs: Any) -> dict[str, Any] | None:
+    """Audit an accepted Jira mutation without ever turning it into retryable failure."""
+    return audit_committed_write(config, **kwargs, writer=audit_write)
+
+
+def _with_audit_warning(
+    response: dict[str, Any], warning: dict[str, Any] | None
+) -> dict[str, Any]:
+    if warning:
+        response.update(audit_warning=warning, partial_success=True)
+    return response
+
+
 def _client() -> JiraClient:
     return JiraClient(load_config())
 
@@ -718,18 +731,21 @@ def jira_assign_issue(
 
             ensure_issue_write_allowed(config, client, issue_key)
             result = client.assign_issue(issue_key, target_account_id)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="assign_issue",
                 issue_key=issue_key,
                 payload={"accountId": target_account_id},
                 result=result,
             )
-            return {
-                "ok": True,
-                "issue": issue_key,
-                "target_account_id": target_account_id,
-            }
+            return _with_audit_warning(
+                {
+                    "ok": True,
+                    "issue": issue_key,
+                    "target_account_id": target_account_id,
+                },
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -933,14 +949,14 @@ def jira_edit_issue(
                 fix_versions_remove=fix_versions_remove,
                 expect_updated=expect_updated,
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="edit_issue",
                 issue_key=issue_key,
                 payload=payload,
                 result={},
             )
-            return {"ok": True, "issue": issue_key}
+            return _with_audit_warning({"ok": True, "issue": issue_key}, audit_warning)
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
     except JiraMissingConcurrencyTokenError as exc:
@@ -997,7 +1013,7 @@ def jira_clear_issue_parent(
             result = client.edit_issue(issue_key, clear_parent=True)
             verified = client.get_issue(issue_key, fields=["parent"])
             after = (verified.get("fields") or {}).get("parent")
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="clear_parent",
                 issue_key=issue_key,
@@ -1005,13 +1021,18 @@ def jira_clear_issue_parent(
                 result={"edit": result, "verified_parent": after},
             )
             if after is not None:
-                return {
-                    "ok": False,
-                    "message": f"Parent clear was not verified for {issue_key}: {after!r}",
-                    "issue": issue_key,
-                    "verified_parent": after,
-                }
-            return {"ok": True, "issue": issue_key, "verified_parent": None}
+                return _with_audit_warning(
+                    {
+                        "ok": False,
+                        "message": f"Parent clear was not verified for {issue_key}: {after!r}",
+                        "issue": issue_key,
+                        "verified_parent": after,
+                    },
+                    audit_warning,
+                )
+            return _with_audit_warning(
+                {"ok": True, "issue": issue_key, "verified_parent": None}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1171,7 +1192,7 @@ def jira_patch_description_section(
             result = client.edit_issue_adf_description(
                 key, patch["document"], expect_updated=expect_updated
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="patch_description_section",
                 issue_key=key,
@@ -1185,7 +1206,7 @@ def jira_patch_description_section(
                 },
                 result=result,
             )
-            return {"ok": True, "issue": key, **summary}
+            return _with_audit_warning({"ok": True, "issue": key, **summary}, audit_warning)
     except AdfSectionPatchRefused as exc:
         return {
             "ok": False,
@@ -1254,14 +1275,16 @@ def jira_agent_plan_comment(
 
             ensure_issue_write_allowed(config, client, issue_key)
             comment_result = client.add_comment(issue_key, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="agent_plan_comment",
                 issue_key=issue_key,
                 payload={"body": body},
                 result={"id": comment_result.get("id")},
             )
-            return {"ok": True, "comment": comment_result}
+            return _with_audit_warning(
+                {"ok": True, "comment": comment_result}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1313,14 +1336,14 @@ def jira_write_human_brief(
                     guard_enabled=True,
                 )
             result = client.edit_issue(issue_key, description=body, expect_updated=expect_updated)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="human_brief",
                 issue_key=issue_key,
                 payload={**payload, "guard_concurrent_edit": guard_concurrent_edit},
                 result=result,
             )
-            return {"ok": True, "issue": issue_key}
+            return _with_audit_warning({"ok": True, "issue": issue_key}, audit_warning)
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
     except JiraMissingConcurrencyTokenError as exc:
@@ -1366,14 +1389,16 @@ def jira_store_factory_contract(
                 result = validate_attachment_upload_response(
                     client.add_attachment(issue_key, file_path)
                 )
-                audit_write(
+                audit_warning = _audit_committed_write(
                     config,
                     action="factory_contract_attachment",
                     issue_key=issue_key,
                     payload={"file": file_path},
                     result={"attachments": result},
                 )
-                return {"ok": True, "attachments": result}
+                return _with_audit_warning(
+                    {"ok": True, "attachments": result}, audit_warning
+                )
 
             if not body:
                 return {"ok": False, "message": "body is required for comment mode"}
@@ -1387,14 +1412,14 @@ def jira_store_factory_contract(
                     "safety": safety,
                 }
             result = client.add_comment(issue_key, comment)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="factory_contract_comment",
                 issue_key=issue_key,
                 payload={"body": comment},
                 result={"id": result.get("id")},
             )
-            return {"ok": True, "comment": result}
+            return _with_audit_warning({"ok": True, "comment": result}, audit_warning)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1430,14 +1455,14 @@ def jira_post_drift_reconcile_comment(
                     "safety": safety,
                 }
             result = client.add_comment(issue_key, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="drift_reconcile_comment",
                 issue_key=issue_key,
                 payload={"body": body},
                 result={"id": result.get("id")},
             )
-            return {"ok": True, "comment": result}
+            return _with_audit_warning({"ok": True, "comment": result}, audit_warning)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1517,19 +1542,22 @@ def jira_update_drift_labels(
                 labels_remove=remove_labels or None,
                 expect_updated=None,
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
                 payload=payload,
                 result=result,
             )
-            return {
-                "ok": True,
-                "issue": issue_key,
-                "labels_added": add_labels,
-                "labels_removed": remove_labels,
-            }
+            return _with_audit_warning(
+                {
+                    "ok": True,
+                    "issue": issue_key,
+                    "labels_added": add_labels,
+                    "labels_removed": remove_labels,
+                },
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1650,14 +1678,16 @@ def jira_assign_user(
 
             ensure_issue_write_allowed(config, client, issue_key)
             result = client.assign_issue(issue_key, str(user["accountId"]))
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="assign_user",
                 issue_key=issue_key,
                 payload={"query": query, "accountId": user.get("accountId")},
                 result=result,
             )
-            return {"ok": True, "issue": issue_key, "user": user}
+            return _with_audit_warning(
+                {"ok": True, "issue": issue_key, "user": user}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1680,14 +1710,16 @@ def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, An
         with _client() as client:
             ensure_issue_write_allowed(client.config, client, key)
             comment_result = client.add_comment(key, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="add_comment",
                 issue_key=key,
                 payload={"body": body},
                 result={"id": comment_result.get("id")},
             )
-            return {"ok": True, "comment": comment_result}
+            return _with_audit_warning(
+                {"ok": True, "comment": comment_result}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1744,14 +1776,14 @@ def jira_update_comment(
                 }
 
             result = client.update_comment(key, comment_id, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="update_comment",
                 issue_key=key,
                 payload={"comment_id": comment_id, "body": body},
                 result={"id": result.get("id"), "updated": result.get("updated")},
             )
-            return {"ok": True, "comment": result}
+            return _with_audit_warning({"ok": True, "comment": result}, audit_warning)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1827,7 +1859,7 @@ def jira_link_issue(
                 link_type=link_type,
                 comment=comment,
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="link_issue",
                 issue_key=comment_issue_key or outward_key,
@@ -1841,7 +1873,7 @@ def jira_link_issue(
             }
             if comment_issue_key is not None:
                 response["comment_issue_key"] = comment_issue_key
-            return response
+            return _with_audit_warning(response, audit_warning)
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1903,7 +1935,7 @@ def jira_delete_issue_link(
                 outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
                 inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
             }
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="delete_issue_link",
                 issue_key=outward_key,
@@ -1911,13 +1943,19 @@ def jira_delete_issue_link(
                 result={"delete": result, "still_present": still_present},
             )
             if any(still_present.values()):
-                return {
-                    "ok": False,
-                    "message": f"Issue-link deletion was not verified for {resolved['id']}.",
-                    "resolved_link": resolved,
-                    "still_present": still_present,
-                }
-            return {"ok": True, "resolved_link": resolved, "still_present": still_present}
+                return _with_audit_warning(
+                    {
+                        "ok": False,
+                        "message": f"Issue-link deletion was not verified for {resolved['id']}.",
+                        "resolved_link": resolved,
+                        "still_present": still_present,
+                    },
+                    audit_warning,
+                )
+            return _with_audit_warning(
+                {"ok": True, "resolved_link": resolved, "still_present": still_present},
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -1956,14 +1994,16 @@ def jira_attach_file(
             result = validate_attachment_upload_response(
                 client.add_attachment(issue_key, file_path)
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="attach",
                 issue_key=issue_key,
                 payload={"file": file_path},
                 result={"attachments": result},
             )
-            return {"ok": True, "attachments": result}
+            return _with_audit_warning(
+                {"ok": True, "attachments": result}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2010,7 +2050,7 @@ def jira_delete_attachment(
                     "message": "Pass execute=true to delete this attachment from Jira.",
                 }
             result = client.delete_attachment(attachment_id, issue_key=issue_key)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="delete_attachment",
                 issue_key=issue_key,
@@ -2020,7 +2060,10 @@ def jira_delete_attachment(
                 },
                 result=result,
             )
-            return {"ok": True, "issue": issue_key, "deleted_attachment_id": attachment_id}
+            return _with_audit_warning(
+                {"ok": True, "issue": issue_key, "deleted_attachment_id": attachment_id},
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2498,7 +2541,7 @@ def jira_embed_existing_png_attachment(
             )
             verified_description = (verified.get("fields") or {}).get("description") or {}
             embedded = adf_contains_media_id(verified_description, media_id)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="embed_existing_png",
                 issue_key=issue_key,
@@ -2510,20 +2553,26 @@ def jira_embed_existing_png_attachment(
                 },
             )
             if not embedded:
-                return {
-                    "ok": False,
-                    "message": (
-                        f"Existing attachment {resolved_id} was not found inline after reread."
-                    ),
-                    "attachment_id": resolved_id,
-                }
-            return {
-                "ok": True,
-                "issue": issue_key,
-                "attachment": verified_attachment,
-                "media_id": media_id,
-                "embedded": True,
-            }
+                return _with_audit_warning(
+                    {
+                        "ok": False,
+                        "message": (
+                            f"Existing attachment {resolved_id} was not found inline after reread."
+                        ),
+                        "attachment_id": resolved_id,
+                    },
+                    audit_warning,
+                )
+            return _with_audit_warning(
+                {
+                    "ok": True,
+                    "issue": issue_key,
+                    "attachment": verified_attachment,
+                    "media_id": media_id,
+                    "embedded": True,
+                },
+                audit_warning,
+            )
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
     except JiraMissingConcurrencyTokenError as exc:
@@ -2605,7 +2654,7 @@ def jira_upsert_image_gallery(
             result = client.edit_issue_adf_description(
                 issue_key, description, expect_updated=expect_updated
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="upsert_image_gallery",
                 issue_key=issue_key,
@@ -2618,7 +2667,10 @@ def jira_upsert_image_gallery(
                 },
                 result=result,
             )
-            return {"ok": True, "issue": issue_key, "screenshot_count": len(filenames)}
+            return _with_audit_warning(
+                {"ok": True, "issue": issue_key, "screenshot_count": len(filenames)},
+                audit_warning,
+            )
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
     except JiraConcurrentEditError as exc:
@@ -2727,14 +2779,17 @@ def jira_transition_issue(
 
             ensure_issue_write_allowed(client.config, client, key)
             client.transition_issue(key, str(selected["id"]), fields=fields_payload or None)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="transition_issue",
                 issue_key=key,
                 payload={"transition": selected, "fields": fields_payload},
                 result={},
             )
-            return {"ok": True, "issue": key, "transition": selected, "fields": fields_payload}
+            return _with_audit_warning(
+                {"ok": True, "issue": key, "transition": selected, "fields": fields_payload},
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2779,14 +2834,16 @@ def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dic
                 }
 
             client.delete_comment(key, comment_id)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="delete_comment",
                 issue_key=key,
                 payload={"comment_id": comment_id},
                 result={},
             )
-            return {"ok": True, "issue": key, "deleted_comment_id": comment_id}
+            return _with_audit_warning(
+                {"ok": True, "issue": key, "deleted_comment_id": comment_id}, audit_warning
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2849,7 +2906,7 @@ def jira_set_issue_type(
                 }
 
             client.set_issue_type(key, issue_type_name, expect_updated=expect_updated)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="set_issue_type",
                 issue_key=key,
@@ -2859,7 +2916,9 @@ def jira_set_issue_type(
                 },
                 result={},
             )
-            return {"ok": True, "issue": key, "issue_type_name": issue_type_name}
+            return _with_audit_warning(
+                {"ok": True, "issue": key, "issue_type_name": issue_type_name}, audit_warning
+            )
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
     except JiraMissingConcurrencyTokenError as exc:
@@ -3057,7 +3116,7 @@ def jira_add_issues_to_sprint(
             except JiraApiError as exc:
                 verification_error = exc
 
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="add_issues_to_sprint",
                 issue_key=issue_keys[0],
@@ -3075,26 +3134,32 @@ def jira_add_issues_to_sprint(
             )
 
             if verification_error is not None:
-                return {
-                    "ok": False,
-                    "error_type": "sprint_verification_unavailable",
-                    "sprint_id": sprint_id,
-                    "issue_keys": issue_keys,
-                    "verified": None,
-                    "message": (
-                        "The sprint-add write was accepted by Jira, but the post-write "
-                        f"verification reread failed, so it could not be confirmed: "
-                        f"{verification_error}"
-                    ),
-                }
+                return _with_audit_warning(
+                    {
+                        "ok": False,
+                        "error_type": "sprint_verification_unavailable",
+                        "sprint_id": sprint_id,
+                        "issue_keys": issue_keys,
+                        "verified": None,
+                        "message": (
+                            "The sprint-add write was accepted by Jira, but the post-write "
+                            f"verification reread failed, so it could not be confirmed: "
+                            f"{verification_error}"
+                        ),
+                    },
+                    audit_warning,
+                )
 
             ok = all(entry["verified"] for entry in results)
-            return {
-                "ok": ok,
-                "sprint_id": sprint_id,
-                "issue_keys": issue_keys,
-                "results": results,
-            }
+            return _with_audit_warning(
+                {
+                    "ok": ok,
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "results": results,
+                },
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -3204,7 +3269,7 @@ def jira_move_issues_to_backlog(
             except JiraApiError as exc:
                 verification_error = exc
 
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="move_issues_to_backlog",
                 issue_key=issue_keys[0],
@@ -3221,26 +3286,32 @@ def jira_move_issues_to_backlog(
             )
 
             if verification_error is not None:
-                return {
-                    "ok": False,
-                    "error_type": "sprint_verification_unavailable",
-                    "sprint_id": sprint_id,
-                    "issue_keys": issue_keys,
-                    "verified": None,
-                    "message": (
-                        "The sprint-remove write was accepted by Jira, but the post-write "
-                        f"verification reread failed, so it could not be confirmed: "
-                        f"{verification_error}"
-                    ),
-                }
+                return _with_audit_warning(
+                    {
+                        "ok": False,
+                        "error_type": "sprint_verification_unavailable",
+                        "sprint_id": sprint_id,
+                        "issue_keys": issue_keys,
+                        "verified": None,
+                        "message": (
+                            "The sprint-remove write was accepted by Jira, but the post-write "
+                            f"verification reread failed, so it could not be confirmed: "
+                            f"{verification_error}"
+                        ),
+                    },
+                    audit_warning,
+                )
 
             ok = all(entry["verified"] for entry in results)
-            return {
-                "ok": ok,
-                "sprint_id": sprint_id,
-                "issue_keys": issue_keys,
-                "results": results,
-            }
+            return _with_audit_warning(
+                {
+                    "ok": ok,
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "results": results,
+                },
+                audit_warning,
+            )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

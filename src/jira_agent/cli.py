@@ -96,6 +96,14 @@ data_console = Console(markup=False, highlight=False, soft_wrap=True)
 # drops the interpretation.
 table_console = Console(markup=False, highlight=False)
 
+
+def _audit_committed_write(config: Any, **kwargs: Any) -> dict[str, Any] | None:
+    """Audit an accepted Jira mutation without ever turning it into retryable failure."""
+    warning = audit_committed_write(config, **kwargs, writer=audit_write)
+    if warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {warning['message']}")
+    return warning
+
 # The literal every command below uses as its own `--fields` default, computed once so every
 # comparison against "the caller did not narrow --fields" reads the same value `DEFAULT_FIELDS`
 # itself would produce. Commands that request this exact default (rather than an explicit
@@ -652,13 +660,15 @@ def add_comment(
         try:
             ensure_issue_write_allowed(client.config, client, key)
             data = client.add_comment(key, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="add_comment",
                 issue_key=key,
                 payload={"body": body},
                 result={"id": data.get("id")},
             )
+            if audit_warning:
+                data.update(audit_warning=audit_warning, partial_success=True)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
@@ -741,7 +751,7 @@ def edit_comment(
         try:
             ensure_issue_write_allowed(client.config, client, key)
             data = client.update_comment(key, comment_id, new_body)
-            audit_write(
+            _audit_committed_write(
                 client.config,
                 action="edit_comment",
                 issue_key=key,
@@ -818,7 +828,7 @@ def delete_comment(
         try:
             ensure_issue_write_allowed(client.config, client, key)
             data = client.delete_comment(key, comment_id)
-            audit_write(
+            _audit_committed_write(
                 client.config,
                 action="delete_comment",
                 issue_key=key,
@@ -1703,7 +1713,7 @@ def agent_plan_comment(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="agent_plan_comment",
                 issue_key=issue_key,
@@ -1793,7 +1803,7 @@ def human_brief(
             expect_updated = client.issue_version(issue_key) if concurrency_guard else None
 
             data = client.edit_issue(issue_key, description=body, expect_updated=expect_updated)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="human_brief",
                 issue_key=issue_key,
@@ -1864,14 +1874,18 @@ def factory_contract(
                 result = validate_attachment_upload_response(
                     client.add_attachment(issue_key, file_path)
                 )
-                audit_write(
+                _audit_committed_write(
                     config,
                     action="factory_contract_attachment",
                     issue_key=issue_key,
                     payload={"file": str(file_path)},
                     result={"attachments": result},
                 )
-                console.print(f"Attached Factory Contract to {issue_key}.")
+                for attachment in result:
+                    console.print(
+                        f"Attached Factory Contract {attachment.get('filename')} "
+                        f"({attachment.get('id')}) to {issue_key}."
+                    )
                 return
 
             contract = read_text_source(text, file_path)
@@ -1887,7 +1901,7 @@ def factory_contract(
                 console.print("Pass --execute to write it to Jira.")
                 return
             result = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="factory_contract_comment",
                 issue_key=issue_key,
@@ -1902,7 +1916,7 @@ def factory_contract(
             _print_error("Factory Contract error:", exc)
             raise typer.Exit(2) from exc
 
-    console.print(f"Added Factory Contract comment to {issue_key}.")
+    console.print(f"Added Factory Contract comment {result.get('id')} to {issue_key}.")
 
 
 @app.command("drift-reconcile-comment")
@@ -1948,7 +1962,7 @@ def drift_reconcile_comment(
                 console.print("Pass --execute to write it to Jira.")
                 return
             result = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="drift_reconcile_comment",
                 issue_key=issue_key,
@@ -2043,7 +2057,7 @@ def drift_labels(
                 labels_remove=remove_labels or None,
                 expect_updated=None,
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
@@ -2332,7 +2346,7 @@ def edit_issue(
                 fix_versions_remove=remove_fix_version,
                 expect_updated=expect_updated,
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="edit_issue",
                 issue_key=issue_key,
@@ -2406,7 +2420,7 @@ def clear_parent(
             result = client.edit_issue(issue_key, clear_parent=True)
             verified = client.get_issue(issue_key, fields=["parent"])
             after = (verified.get("fields") or {}).get("parent")
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="clear_parent",
                 issue_key=issue_key,
@@ -2610,7 +2624,7 @@ def patch_description_section(
             data = client.edit_issue_adf_description(
                 key, patch["document"], expect_updated=expect_updated
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="patch_description_section",
                 issue_key=key,
@@ -2733,7 +2747,7 @@ def smoke_write(
             ensure_issue_write_allowed(config, client, issue_key)
             added_comment = client.add_comment(issue_key, comment)
             client.assign_issue(issue_key, str(me["accountId"]))
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="smoke_write",
                 issue_key=issue_key,
@@ -2816,7 +2830,7 @@ def assign(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.assign_issue(issue_key, target_account_id)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="assign_issue",
                 issue_key=issue_key,
@@ -2877,7 +2891,7 @@ def assign_user(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.assign_issue(issue_key, str(user["accountId"]))
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="assign_user",
                 issue_key=issue_key,
@@ -2960,7 +2974,7 @@ def link_issue(
                 link_type=link_type,
                 comment=comment,
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="link_issue",
                 issue_key=comment_issue_key or outward_key,
@@ -3035,7 +3049,7 @@ def delete_issue_link(
                 outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
                 inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
             }
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="delete_issue_link",
                 issue_key=outward_key,
@@ -3104,7 +3118,7 @@ def attach(
             data = validate_attachment_upload_response(
                 client.add_attachment(issue_key, file_path)
             )
-            audit_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="attach",
                 issue_key=issue_key,
@@ -3117,7 +3131,10 @@ def attach(
             _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _emit_json({"attachments": data, "dry_run": False})
+        output: dict[str, Any] = {"attachments": data, "dry_run": False}
+        if audit_warning:
+            output.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(output)
         return
     for attachment in data:
         console.print(f"Attached {attachment.get('filename')} ({attachment.get('id')}).")
@@ -3178,7 +3195,7 @@ def delete_attachment(
                 return
 
             data = client.delete_attachment(attachment_id, issue_key=issue_key)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="delete_attachment",
                 issue_key=issue_key,
@@ -3565,7 +3582,7 @@ def embed_existing_png(
             )
             verified_description = (verified.get("fields") or {}).get("description") or {}
             embedded = adf_contains_media_id(verified_description, media_id)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="embed_existing_png",
                 issue_key=issue_key,
@@ -3695,7 +3712,7 @@ def upsert_image_gallery(
             result = client.edit_issue_adf_description(
                 key, description, expect_updated=expect_updated
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="upsert_image_gallery",
                 issue_key=key,
@@ -3968,7 +3985,7 @@ def transition(
             data = client.transition_issue(
                 key, str(selected["id"]), fields=fields_payload or None
             )
-            audit_write(
+            _audit_committed_write(
                 client.config,
                 action="transition_issue",
                 issue_key=key,
@@ -4328,7 +4345,7 @@ def sprint_add(
         except JiraApiError as exc:
             verification_error = exc
 
-        audit_write(
+        _audit_committed_write(
             client.config,
             action="sprint_add",
             issue_key=keys[0],
@@ -4563,7 +4580,7 @@ def sprint_remove(
         except JiraApiError as exc:
             verification_error = exc
 
-        audit_write(
+        _audit_committed_write(
             client.config,
             action="sprint_remove",
             issue_key=keys[0],
@@ -4739,7 +4756,7 @@ def issue_type(
             except JiraConcurrentEditError as exc:
                 _exit_concurrent_edit_error(exc, json_mode=json_output)
 
-            audit_write(
+            _audit_committed_write(
                 client.config,
                 action="issue_type",
                 issue_key=key,
