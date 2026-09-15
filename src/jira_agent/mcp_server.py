@@ -475,7 +475,8 @@ def jira_create_issue(
     description_section is an input filter, not an in-place edit. It selects one heading body out
     of the Markdown supplied in description or description_file, and that extract becomes the
     entire description field. To change one section of an issue that already exists, use
-    jira_patch_description_section.
+    jira_patch_description_section. A parent_key is validated as an existing issue in the same
+    Jira site and credential scope before either dry-run success or a write is reported.
     """
     try:
         body = (
@@ -505,6 +506,16 @@ def jira_create_issue(
         else 0
     )
 
+    config = None
+    if parent_key is not None:
+        config = load_config()
+        try:
+            require_shared_write_scope(config, [project_key, parent_key])
+            with JiraClient(config) as parent_client:
+                parent_client.get_issue(parent_key, fields=["project"])
+        except JiraApiError as exc:
+            return _error(exc)
+
     if not execute:
         return {
             "ok": True,
@@ -514,8 +525,9 @@ def jira_create_issue(
             "message": "Pass execute=true to create this issue in Jira.",
         }
 
-    try:
+    if config is None:
         config = load_config()
+    try:
         with JiraClient(config) as client:
             ensure_project_write_allowed(config, project_key)
             issue_result = client.create_issue(
@@ -784,7 +796,9 @@ def jira_edit_issue(
     guarded tool produces for the same condition. Pass false to skip the guard. A call with no
     whole-field write at all -- only labels_add/labels_remove/fix_versions_add/
     fix_versions_remove -- skips this read entirely regardless of guard_concurrent_edit: there is
-    nothing there for a token to protect.
+    nothing there for a token to protect. A parent_key is validated as an existing issue in the
+    same Jira site and credential scope as the child before either dry-run success or a write is
+    reported.
     """
     config = load_config()
     issue_key = key or config.test_issue_key
@@ -841,6 +855,9 @@ def jira_edit_issue(
 
     try:
         with JiraClient(config) as client:
+            if parent_key is not None:
+                require_shared_write_scope(config, [issue_key, parent_key])
+                client.get_issue(parent_key, fields=["project"])
             safety = ensure_issue_write_allowed(config, client, issue_key)
             expect_updated = (
                 client.issue_version(issue_key)
@@ -1800,6 +1817,7 @@ def jira_delete_issue_link(
     config = load_config()
     try:
         with JiraClient(config) as client:
+            require_shared_write_scope(config, [outward_key, inward_key])
             outward_safety = ensure_issue_write_allowed(config, client, outward_key)
             inward_safety = ensure_issue_write_allowed(config, client, inward_key)
             outward_issue = client.get_issue(outward_key, fields=["issuelinks"])
@@ -2217,6 +2235,10 @@ def jira_embed_diagram(
                     "message": "Pass execute=true to upload and embed this diagram.",
                 }
             uploaded = client.add_attachment(issue_key, file_path)
+            if not uploaded:
+                raise JiraApiError(
+                    f"Jira returned no attachment metadata for {Path(file_path).name}."
+                )
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
             uploaded_ids.append(attachment_id)

@@ -1324,6 +1324,7 @@ def _make_embed_diagram_fake_client(
     initial_description: dict[str, Any] | None = None,
     concurrent_description: dict[str, Any] | None = None,
     delete_attachment_raises: bool = False,
+    empty_upload_response: bool = False,
 ) -> tuple[type, list, list]:
     """Fake client for embed-diagram.
 
@@ -1379,6 +1380,8 @@ def _make_embed_diagram_fake_client(
             state["updated"] = after_upload_updated
             if concurrent_description is not None:
                 state["description"] = concurrent_description
+            if empty_upload_response:
+                return []
             return [{"id": "9001", "filename": Path(file_path).name}]
 
         def attachment_media_id(self, attachment_id: str, *, issue_key: str) -> str:
@@ -1477,6 +1480,29 @@ def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch
 
     assert result.exit_code == 0, result.stdout + result.stderr
     assert len(writes) == 1
+
+
+def test_embed_diagram_rejects_empty_upload_response_without_writing(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED,
+        empty_upload_response=True,
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["embed-diagram", ISSUE_KEY, "--file", str(png), "--execute"],
+    )
+
+    assert result.exit_code == 1
+    assert "returned no attachment metadata" in result.stderr
+    assert writes == []
+    assert deleted == []
 
 
 def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:

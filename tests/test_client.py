@@ -1548,6 +1548,39 @@ def test_create_issue_uses_the_target_project_credentials() -> None:
     assert seen[1][2] == basic_auth("user@example.com", "token")
 
 
+def test_create_issue_rejects_parent_from_different_credential_scope_before_request() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(201, json={"key": "FC-1"})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.create_issue(
+                project_key="FC",
+                issue_type_name="Task",
+                summary="Child",
+                parent_key="FINRP-9",
+            )
+
+    assert calls == []
+
+
+def test_edit_issue_rejects_parent_from_different_credential_scope_before_request() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(204)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.edit_issue("FC-1", parent_key="FINRP-9")
+
+    assert calls == []
+
+
 def test_myself_can_target_a_project_credential_set() -> None:
     seen: list[str] = []
 

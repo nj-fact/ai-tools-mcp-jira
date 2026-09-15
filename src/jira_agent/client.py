@@ -613,6 +613,8 @@ class JiraClient:
         priority: str | None = None,
         story_points: float | None = None,
     ) -> dict[str, Any]:
+        if parent_key is not None:
+            self.require_shared_write_scope([project_key, parent_key])
         return self._request(
             "POST",
             "/issue",
@@ -753,6 +755,8 @@ class JiraClient:
         all -- Jira applies those against its own current state -- so such a call should leave
         `expect_updated` at its default `None` rather than pay for a read that protects nothing.
         """
+        if parent_key is not None:
+            self.require_shared_write_scope([issue_key, parent_key])
         payload = edit_issue_payload(
             summary=summary,
             description=description,

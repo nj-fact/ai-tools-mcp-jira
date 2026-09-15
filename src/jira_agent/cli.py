@@ -1193,7 +1193,10 @@ def create_issue(
     ] = None,
     parent: Annotated[
         str | None,
-        typer.Option("--parent", help="Optional parent issue key."),
+        typer.Option(
+            "--parent",
+            help="Optional existing parent; must share the child's Jira site and credentials.",
+        ),
     ] = None,
     priority: Annotated[
         str | None,
@@ -1253,6 +1256,13 @@ def create_issue(
         if render_mermaid and isinstance(description_adf, dict)
         else 0
     )
+    if parent is not None:
+        try:
+            require_shared_write_scope(config, [project, parent])
+            with JiraClient(config) as parent_client:
+                parent_client.get_issue(parent, fields=["project"])
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
     if not execute:
         _say("[yellow]Dry run:[/yellow] would create this Jira issue", json_mode=json_output)
         if json_output:
@@ -2074,7 +2084,10 @@ def edit_issue(
     ] = None,
     parent: Annotated[
         str | None,
-        typer.Option("--parent", help="New parent issue key."),
+        typer.Option(
+            "--parent",
+            help="Existing new parent; must share the child's Jira site and credentials.",
+        ),
     ] = None,
     priority: Annotated[
         str | None,
@@ -2197,6 +2210,9 @@ def edit_issue(
 
     with JiraClient(config) as client:
         try:
+            if parent is not None:
+                require_shared_write_scope(config, [issue_key, parent])
+                client.get_issue(parent, fields=["project"])
             safety = ensure_issue_write_allowed(config, client, issue_key)
             if not execute:
                 _say("[yellow]Dry run:[/yellow] would edit issue", json_mode=json_output)
@@ -2906,6 +2922,7 @@ def delete_issue_link(
     config = _config()
     with JiraClient(config) as client:
         try:
+            require_shared_write_scope(config, [outward_key, inward_key])
             outward_safety = ensure_issue_write_allowed(config, client, outward_key)
             inward_safety = ensure_issue_write_allowed(config, client, inward_key)
             outward_issue = client.get_issue(outward_key, fields=["issuelinks"])
@@ -3208,6 +3225,10 @@ def embed_diagram(
                 return
 
             uploaded = client.add_attachment(issue_key, file_path)
+            if not uploaded:
+                raise JiraApiError(
+                    f"Jira returned no attachment metadata for {Path(file_path).name}."
+                )
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
             uploaded_ids.append(attachment_id)
@@ -4201,7 +4222,7 @@ def sprint_add(
         audit_write(
             client.config,
             action="sprint_add",
-            issue_key=None,
+            issue_key=keys[0],
             payload={
                 "sprint_id": sprint_id,
                 "issue_keys": list(keys),
@@ -4244,9 +4265,20 @@ def sprint_add(
         if entry["verified"]:
             _say(f"- {entry['key']}: verified in sprint {sprint_id}", json_mode=json_output)
         else:
+            if not entry["in_sprint"]:
+                detail = (
+                    f"target sprint {sprint_id} is missing; currently in "
+                    f"{_sprint_locations(entry['sprints'])}"
+                )
+            elif entry["still_in_replaced_sprints"]:
+                detail = (
+                    "target sprint is present, but the issue is still in replaced sprint(s) "
+                    f"{_sprint_locations(entry['still_in_replaced_sprints'])}"
+                )
+            else:
+                detail = "post-write sprint state did not match the requested move"
             _say(
-                f"- {entry['key']}: [red]FAILURE[/red] -- not in sprint {sprint_id} after write "
-                f"(currently in: {_sprint_locations(entry['sprints'])})",
+                f"- {entry['key']}: [red]FAILURE[/red] -- {detail}",
                 json_mode=json_output,
             )
 
@@ -4357,6 +4389,8 @@ def sprint_remove(
             ]
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
 
         sprint_field = client.config.sprint_field
         try:
@@ -4423,7 +4457,7 @@ def sprint_remove(
         audit_write(
             client.config,
             action="sprint_remove",
-            issue_key=None,
+            issue_key=keys[0],
             payload={
                 "sprint_id": sprint_id,
                 "issue_keys": list(keys),

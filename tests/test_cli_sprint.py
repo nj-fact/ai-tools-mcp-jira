@@ -28,6 +28,21 @@ def _config(tmp_path, *, write_project_keys: str = "FC") -> JiraConfig:
     )
 
 
+def _mixed_scope_config(tmp_path) -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_PROJECT__FINRP__EMAIL": "b@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "b-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://site-b.atlassian.net",
+            "JIRA_WRITE_PROJECT_KEYS": "FC,FINRP",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+
 def _install(monkeypatch, config, client) -> None:
     # cli.JiraClient(config) is stubbed to hand back the already-built fake client below, so its
     # own constructor never sees `config`; write commands read `client.config`, so bind it here.
@@ -546,7 +561,7 @@ def test_sprint_add_cli_execute_verifies_membership_by_reread_and_reports_per_ke
     ]
     assert len(audited) == 1
     assert audited[0]["action"] == "sprint_add"
-    assert audited[0]["issue_key"] is None
+    assert audited[0]["issue_key"] == "FC-1"
     assert audited[0]["payload"] == {
         "sprint_id": 7340,
         "issue_keys": ["FC-1", "FC-2", "FC-3"],
@@ -666,7 +681,72 @@ def test_sprint_add_cli_rejects_more_than_fifty_keys_before_write(tmp_path, monk
     assert client.add_calls == []
 
 
+def test_sprint_add_cli_human_failure_distinguishes_incomplete_reassignment(
+    tmp_path, monkeypatch
+) -> None:
+    old = {"id": 7339, "name": "Sprint 7339", "state": "active"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [old]})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    def _retain_old_sprint(sprint_id, issue_keys):
+        client.add_calls.append((sprint_id, list(issue_keys)))
+        target = {"id": sprint_id, "name": f"Sprint {sprint_id}", "state": "active"}
+        for issue_key in issue_keys:
+            client._sprints[issue_key].append(target)
+        return {}
+
+    client.add_issues_to_sprint = _retain_old_sprint
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "sprint-add",
+            "7340",
+            "FC-1",
+            "--execute",
+            "--allow-sprint-reassignment",
+        ],
+    )
+
+    assert result.exit_code == cli.SPRINT_VERIFICATION_EXIT_CODE
+    normalized = " ".join(result.stdout.split())
+    assert "target sprint is present" in normalized
+    assert "still in replaced sprint(s)" in normalized
+    assert "not in sprint 7340" not in normalized
+
+
 # --- sprint-remove --------------------------------------------------------------------------
+
+
+def test_sprint_remove_cli_rejects_more_than_fifty_keys_as_json(tmp_path, monkeypatch) -> None:
+    client = _SprintStateFakeClient()
+    _install(monkeypatch, _config(tmp_path), client)
+    keys = [f"FC-{index}" for index in range(1, 52)]
+
+    result = CliRunner().invoke(cli.app, ["sprint-remove", "7340", *keys, "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "jira_api_error"
+    assert "at most 50" in payload["message"]
+    assert client.remove_calls == []
+
+
+def test_sprint_remove_cli_rejects_mixed_scope_as_json_before_reads(
+    tmp_path, monkeypatch
+) -> None:
+    client = _SprintStateFakeClient()
+    _install(monkeypatch, _mixed_scope_config(tmp_path), client)
+
+    result = CliRunner().invoke(
+        cli.app, ["sprint-remove", "7340", "FC-1", "FINRP-9", "--json"]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "jira_api_error"
+    assert "different sites or credential sets" in payload["message"]
+    assert client.remove_calls == []
 
 
 def test_sprint_remove_cli_old_signature_no_longer_parses(tmp_path, monkeypatch) -> None:
@@ -982,7 +1062,7 @@ def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_ke
     assert audited == [
         {
             "action": "sprint_remove",
-            "issue_key": None,
+            "issue_key": "FC-1",
             "payload": {
                 "sprint_id": 7340,
                 "issue_keys": ["FC-1", "FC-2"],

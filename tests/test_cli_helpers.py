@@ -11,9 +11,31 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from jira_agent import cli
-from jira_agent.client import JiraClient as RealJiraClient
-from jira_agent.client import select_transition
+from jira_agent.client import (
+    JiraApiError,
+    select_transition,
+)
+from jira_agent.client import (
+    JiraClient as RealJiraClient,
+)
 from jira_agent.config import JiraConfig
+
+
+def _mixed_scope_config(tmp_path, *, same_site: bool = False) -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_PROJECT__FINRP__EMAIL": "b@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "b-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": (
+                "https://site-a.atlassian.net" if same_site else "https://site-b.atlassian.net"
+            ),
+            "JIRA_WRITE_PROJECT_KEYS": "FC,FINRP",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
 
 
 def test_select_transition_matches_id_or_case_insensitive_name() -> None:
@@ -571,6 +593,146 @@ def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -
     assert calls["embed"]["issue_key"] == "FC-123"
 
 
+class ParentValidationCliFakeClient:
+    def __init__(self, _config, *, missing_parent: str | None = None) -> None:
+        self.config = _config
+        self.missing_parent = missing_parent
+        self.reads: list[str] = []
+        self.creates: list[dict[str, object]] = []
+        self.edits: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, **_kwargs):
+        self.reads.append(issue_key)
+        if issue_key == self.missing_parent:
+            raise JiraApiError(f"Issue {issue_key} was not found.", status_code=404)
+        return {"key": issue_key, "fields": {"project": {"key": issue_key.split("-", 1)[0]}}}
+
+    def create_issue(self, **kwargs):
+        self.creates.append(kwargs)
+        return {"key": "FC-123"}
+
+    def edit_issue(self, issue_key, **kwargs):
+        self.edits.append({"issue_key": issue_key, **kwargs})
+        return {}
+
+
+def test_create_issue_cli_rejects_cross_scope_parent_before_client_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = _mixed_scope_config(tmp_path)
+    client = ParentValidationCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "create-issue",
+            "Child",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--parent",
+            "FINRP-9",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert "different sites or credential sets" in payload["message"]
+    assert client.reads == []
+    assert client.creates == []
+
+
+def test_create_issue_cli_rejects_nonexistent_parent_in_dry_run(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ParentValidationCliFakeClient(config, missing_parent="FC-999")
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "create-issue",
+            "Child",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--parent",
+            "FC-999",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["status_code"] == 404
+    assert client.reads == ["FC-999"]
+    assert client.creates == []
+
+
+def test_edit_issue_cli_rejects_cross_scope_parent_before_reads_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = _mixed_scope_config(tmp_path)
+    client = ParentValidationCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-1", "--summary", "Child", "--parent", "FINRP-9", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert "different sites or credential sets" in payload["message"]
+    assert client.reads == []
+    assert client.edits == []
+
+
+def test_edit_issue_cli_rejects_nonexistent_parent_in_dry_run(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ParentValidationCliFakeClient(config, missing_parent="FC-999")
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-1", "--summary", "Child", "--parent", "FC-999", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["status_code"] == 404
+    assert client.reads == ["FC-999"]
+    assert client.edits == []
+
+
 def _patch_description() -> dict[str, object]:
     """Indices: 0 h1, 1 h2 Observed, 2 paragraph, 3 h2 Acceptance criteria, 4 taskList."""
     return {
@@ -809,6 +971,7 @@ def test_clear_parent_cli_is_dry_run_by_default_and_verifies_execute(tmp_path, m
 class DeleteLinkCliFakeClient:
     def __init__(self, _config) -> None:
         self.deleted: list[str] = []
+        self.reads: list[tuple[str, object]] = []
 
     def __enter__(self):
         return self
@@ -817,6 +980,7 @@ class DeleteLinkCliFakeClient:
         return None
 
     def get_issue(self, issue_key, *, fields=None, expand=None):
+        self.reads.append((issue_key, fields))
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
         assert fields == ["issuelinks"]
@@ -862,6 +1026,27 @@ def test_delete_issue_link_cli_dry_run_resolves_without_delete(tmp_path, monkeyp
     assert result.exit_code == 0, result.output
     assert "would delete issue link" in result.output
     assert '"id": "10001"' in result.output
+    assert client.deleted == []
+
+
+def test_delete_issue_link_cli_rejects_cross_scope_before_reads_or_delete(
+    tmp_path, monkeypatch
+) -> None:
+    config = _mixed_scope_config(tmp_path, same_site=True)
+    client = DeleteLinkCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app, ["delete-issue-link", "FC-354", "FINRP-356", "--execute"]
+    )
+
+    assert result.exit_code == 1
+    normalized = " ".join(result.stderr.split())
+    assert "different sites or credential sets" in normalized
+    assert "a-token" not in normalized
+    assert "b-token" not in normalized
+    assert client.reads == []
     assert client.deleted == []
 
 

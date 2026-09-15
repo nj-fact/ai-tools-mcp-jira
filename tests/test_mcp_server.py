@@ -30,6 +30,21 @@ def make_config(tmp_path) -> JiraConfig:
     )
 
 
+def make_mixed_scope_config(tmp_path) -> JiraConfig:
+    return JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_PROJECT__FINRP__EMAIL": "b@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "b-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://site-b.atlassian.net",
+            "JIRA_WRITE_PROJECT_KEYS": "FC,FINRP",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+
 def test_jira_create_issue_dry_run_reports_mermaid_diagrams() -> None:
     result = mcp_server.jira_create_issue(
         project_key="FC",
@@ -41,6 +56,104 @@ def test_jira_create_issue_dry_run_reports_mermaid_diagrams() -> None:
     assert result["ok"] is True
     assert result["dry_run"] is True
     assert result["mermaid_diagrams"] == 1
+
+
+class ParentValidationMcpFakeClient:
+    def __init__(self, _config, *, missing_parent: str | None = None) -> None:
+        self.missing_parent = missing_parent
+        self.reads: list[str] = []
+        self.creates: list[dict[str, object]] = []
+        self.edits: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        self.reads.append(issue_key)
+        if issue_key == self.missing_parent:
+            raise JiraApiError(f"Issue {issue_key} was not found.", status_code=404)
+        return {"key": issue_key, "fields": {"project": {"key": issue_key.split("-", 1)[0]}}}
+
+    def create_issue(self, **kwargs):
+        self.creates.append(kwargs)
+        return {"key": "FC-123"}
+
+    def edit_issue(self, issue_key, **kwargs):
+        self.edits.append({"issue_key": issue_key, **kwargs})
+        return {}
+
+
+def test_jira_create_issue_rejects_cross_scope_parent_before_read_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_mixed_scope_config(tmp_path)
+    client = ParentValidationMcpFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_create_issue(
+        "FC", "Task", "Child", parent_key="FINRP-9", execute=True
+    )
+
+    assert result["ok"] is False
+    assert "different sites or credential sets" in result["message"]
+    assert "a-token" not in str(result)
+    assert "b-token" not in str(result)
+    assert client.reads == []
+    assert client.creates == []
+
+
+def test_jira_create_issue_rejects_nonexistent_parent_even_in_dry_run(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ParentValidationMcpFakeClient(config, missing_parent="FC-999")
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_create_issue("FC", "Task", "Child", parent_key="FC-999")
+
+    assert result["ok"] is False
+    assert result["status_code"] == 404
+    assert client.reads == ["FC-999"]
+    assert client.creates == []
+
+
+def test_jira_edit_issue_rejects_cross_scope_parent_before_read_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_mixed_scope_config(tmp_path)
+    client = ParentValidationMcpFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-1", summary="Child", parent_key="FINRP-9", execute=True
+    )
+
+    assert result["ok"] is False
+    assert "different sites or credential sets" in result["message"]
+    assert client.reads == []
+    assert client.edits == []
+
+
+def test_jira_edit_issue_rejects_nonexistent_parent_even_in_dry_run(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ParentValidationMcpFakeClient(config, missing_parent="FC-999")
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_edit_issue(key="FC-1", summary="Child", parent_key="FC-999")
+
+    assert result["ok"] is False
+    assert result["status_code"] == 404
+    assert client.reads == ["FC-999"]
+    assert client.edits == []
 
 
 def test_jira_create_issue_embeds_mermaid_after_creation(tmp_path, monkeypatch) -> None:
@@ -346,6 +459,7 @@ class LinkParentFakeClient:
         self, _config, *, duplicate_link: bool = False, verify_delete: bool = True
     ) -> None:
         self.deleted_link_ids: list[str] = []
+        self.reads: list[tuple[str, object]] = []
         self.clear_parent_calls = 0
         self.parent = {"key": "FC-300"}
         self.verify_delete = verify_delete
@@ -379,6 +493,7 @@ class LinkParentFakeClient:
         return None
 
     def get_issue(self, issue_key, *, fields=None, expand=None):
+        self.reads.append((issue_key, fields))
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
         if fields == ["parent"]:
@@ -420,6 +535,22 @@ def test_jira_delete_issue_link_dry_run_resolves_but_does_not_delete(tmp_path, m
     assert result["ok"] is True
     assert result["dry_run"] is True
     assert result["resolved_link"]["id"] == "10001"
+    assert client.deleted_link_ids == []
+
+
+def test_jira_delete_issue_link_rejects_cross_scope_before_reads_or_delete(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_mixed_scope_config(tmp_path)
+    client = LinkParentFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_delete_issue_link("FC-354", "FINRP-356", execute=True)
+
+    assert result["ok"] is False
+    assert "different sites or credential sets" in result["message"]
+    assert client.reads == []
     assert client.deleted_link_ids == []
 
 
@@ -2868,6 +2999,7 @@ class EmbedDiagramMcpFakeClient:
         at_put_time_updated=None,
         initial_description=None,
         concurrent_description=None,
+        empty_upload_response=False,
     ):
         self.state = {
             "updated": "T-before-upload",
@@ -2878,6 +3010,7 @@ class EmbedDiagramMcpFakeClient:
             at_put_time_updated if at_put_time_updated is not None else after_upload_updated
         )
         self.concurrent_description = concurrent_description
+        self.empty_upload_response = empty_upload_response
         self.writes: list[dict[str, object]] = []
         self.deleted: list[str] = []
 
@@ -2905,6 +3038,8 @@ class EmbedDiagramMcpFakeClient:
         self.state["updated"] = self.after_upload_updated
         if self.concurrent_description is not None:
             self.state["description"] = self.concurrent_description
+        if self.empty_upload_response:
+            return []
         return [{"id": "9001", "filename": Path(file_path).name}]
 
     def attachment_media_id(self, attachment_id, *, issue_key):
@@ -2958,6 +3093,26 @@ def test_jira_embed_diagram_succeeds_despite_the_upload_moving_updated(
 
     assert result["ok"] is True, result
     assert len(client.writes) == 1
+
+
+def test_jira_embed_diagram_rejects_empty_upload_response_without_writing(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        empty_upload_response=True,
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(str(png), key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert "returned no attachment metadata" in result["message"]
+    assert client.writes == []
+    assert client.deleted == []
 
 
 def test_jira_embed_diagram_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:
