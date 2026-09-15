@@ -4241,6 +4241,21 @@ def test_transition_required_fields_missing_is_empty_once_supplied() -> None:
     assert missing == []
 
 
+def test_transition_required_fields_missing_treats_none_and_blank_values_as_missing() -> None:
+    """A required field must carry a value, not merely occur as a key in the caller's mapping.
+
+    This catches both a CLI `--field resolution=` and an MCP `{\"resolution\": \" \"}` before
+    either surface can attempt the Jira write. Numeric zero and boolean false are covered by the
+    helper's implementation rather than this resolution-shaped fixture.
+    """
+    assert transition_required_fields_missing(_wont_do_transition(), {"resolution": None}) == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+    assert transition_required_fields_missing(_wont_do_transition(), {"resolution": "  "}) == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+
+
 def test_transition_required_fields_missing_ignores_non_required_fields() -> None:
     """`worklog` is present but NOT required (probed fact); it must never appear as missing."""
     missing = transition_required_fields_missing(_wont_do_transition(), {"resolution": "Done"})
@@ -4284,6 +4299,27 @@ def test_transition_fields_payload_wraps_reference_field_using_its_own_schema() 
         "resolution": {"name": "Won't Do"},
         "comment": "closing as won't do",
     }
+
+
+def test_transition_fields_payload_does_not_mis_shape_non_resolution_allowed_values() -> None:
+    """`allowedValues` alone does not mean Jira accepts a `{name: ...}` reference object.
+
+    The transition metadata API documents it on fields such as multi-select arrays too. This
+    helper supports the known resolution shape and must leave other values untouched rather than
+    inventing a universal reference representation.
+    """
+    transition = {
+        "id": "711",
+        "fields": {
+            "summary": {
+                "required": False,
+                "allowedValues": ["red", "blue"],
+                "schema": {"type": "string"},
+            }
+        },
+    }
+
+    assert transition_fields_payload(transition, {"summary": "red"}) == {"summary": "red"}
 
 
 def test_transition_fields_payload_passes_through_a_field_absent_from_metadata_as_plain_value() -> (

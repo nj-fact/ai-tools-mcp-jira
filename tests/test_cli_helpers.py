@@ -151,6 +151,7 @@ def test_transition_cli_allows_wont_do_straight_to_do_to_done(tmp_path, monkeypa
                     "fields": {
                         "resolution": {
                             "required": True,
+                            "schema": {"type": "resolution", "system": "resolution"},
                             "allowedValues": [
                                 {"id": "10000", "name": "Done"},
                                 {"id": "10001", "name": "Won't Do"},
@@ -362,6 +363,7 @@ def test_transition_cli_refuses_before_writing_when_a_required_field_is_missing(
                     "fields": {
                         "resolution": {
                             "required": True,
+                            "schema": {"type": "resolution", "system": "resolution"},
                             "allowedValues": [
                                 {"id": "10000", "name": "Done"},
                                 {"id": "10001", "name": "Won't Do"},
@@ -387,6 +389,35 @@ def test_transition_cli_refuses_before_writing_when_a_required_field_is_missing(
     assert fake.captured_transition_issue is None  # refused before any write
 
 
+def test_transition_cli_refuses_a_blank_required_field_before_writing(
+    tmp_path, monkeypatch
+) -> None:
+    fake = _TransitionFakeClient(
+        None,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {"resolution": {"required": True, "schema": {"type": "resolution"}}},
+                }
+            ]
+        },
+        status_category="To Do",
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: _transition_config(tmp_path))
+    _patch_transition_client(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        cli.app, ["transition", "FC-458", "Won't Do", "--field", "resolution=   ", "--json"]
+    )
+
+    assert result.exit_code == 1, result.stdout + result.stderr
+    assert json.loads(result.stdout)["error_type"] == "transition_fields_missing"
+    assert fake.captured_transition_issue is None
+
+
 def test_transition_cli_execute_with_a_supplied_required_field_writes_it(
     tmp_path, monkeypatch
 ) -> None:
@@ -401,6 +432,7 @@ def test_transition_cli_execute_with_a_supplied_required_field_writes_it(
                     "fields": {
                         "resolution": {
                             "required": True,
+                            "schema": {"type": "resolution", "system": "resolution"},
                             "allowedValues": [
                                 {"id": "10000", "name": "Done"},
                                 {"id": "10001", "name": "Won't Do"},

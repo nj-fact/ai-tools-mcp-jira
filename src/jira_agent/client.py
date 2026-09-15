@@ -2377,7 +2377,8 @@ def transition_required_fields_missing(
     supplied_fields: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     """Return every field `transition`'s own `fields` metadata marks required and
-    `supplied_fields` does not name, each with its `allowedValues` names when Jira provided any.
+    `supplied_fields` does not name with a non-empty value, each with its `allowedValues` names
+    when Jira provided any.
 
     Reads `transition["fields"]`, populated only when the transitions read used
     `expand=transitions.fields` (see `JiraClient.get_transitions`); a transition with no `fields`
@@ -2387,10 +2388,19 @@ def transition_required_fields_missing(
     fields_meta = transition.get("fields")
     if not isinstance(fields_meta, dict):
         return []
-    supplied_names = set((supplied_fields or {}).keys())
+    supplied = supplied_fields or {}
+    missing_value = object()
     missing: list[dict[str, Any]] = []
     for name, meta in fields_meta.items():
-        if not isinstance(meta, dict) or not meta.get("required") or name in supplied_names:
+        if not isinstance(meta, dict) or not meta.get("required"):
+            continue
+        value = supplied.get(name, missing_value)
+        # `0` and `False` can be legitimate values for required numeric/boolean fields. `None`
+        # and a blank string cannot satisfy a required transition field, though. Treating either
+        # as present only postpones the refusal until after the real write is attempted.
+        if value is not missing_value and value is not None and (
+            not isinstance(value, str) or bool(value.strip())
+        ):
             continue
         allowed_values = meta.get("allowedValues")
         allowed_names = None
@@ -2411,11 +2421,12 @@ def transition_fields_payload(
     """Shape caller-supplied transition field values against `transition`'s own `fields`
     metadata, keyed exactly as Jira named each field.
 
-    A field whose metadata carries an `allowedValues` list (a reference field, like FC-458's
-    `resolution`) is sent as `{"name": value}`, the shape Jira's transition POST expects for such
-    a field; every other field is sent as the plain supplied value. This is decided from each
-    field's own schema/metadata, not by special-casing the field id `resolution`, so a future
-    required reference field needs no code change here.
+    A field whose own schema has type `resolution` is sent as `{"name": value}`, the shape Jira's
+    transition POST expects for that reference field; every other field is sent as the plain
+    supplied value. The transition metadata can expose `allowedValues` for many other kinds of
+    fields (including an array option), for which `{"name": value}` is not a valid universal
+    representation. Therefore this decision keys on the schema type, never merely on the presence
+    of `allowedValues`, and never on the field id.
     """
     fields_meta = transition.get("fields")
     if not isinstance(fields_meta, dict):
@@ -2423,7 +2434,8 @@ def transition_fields_payload(
     payload: dict[str, Any] = {}
     for name, value in (supplied_fields or {}).items():
         meta = fields_meta.get(name)
-        if isinstance(meta, dict) and isinstance(meta.get("allowedValues"), list):
+        schema = meta.get("schema") if isinstance(meta, dict) else None
+        if isinstance(schema, dict) and schema.get("type") == "resolution":
             payload[name] = {"name": value}
         else:
             payload[name] = value

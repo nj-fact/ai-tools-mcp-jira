@@ -3480,6 +3480,7 @@ def test_jira_transition_issue_refuses_before_writing_when_a_required_field_is_m
                     "fields": {
                         "resolution": {
                             "required": True,
+                            "schema": {"type": "resolution", "system": "resolution"},
                             "allowedValues": [
                                 {"id": "10000", "name": "Done"},
                                 {"id": "10001", "name": "Won't Do"},
@@ -3501,6 +3502,33 @@ def test_jira_transition_issue_refuses_before_writing_when_a_required_field_is_m
     assert client.captured_transition_issue is None
 
 
+def test_jira_transition_issue_refuses_a_blank_required_field_before_writing(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_transition_client(
+        monkeypatch,
+        tmp_path,
+        transitions={
+            "transitions": [
+                {
+                    "id": "811",
+                    "name": "Won't Do",
+                    "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+                    "fields": {"resolution": {"required": True, "schema": {"type": "resolution"}}},
+                }
+            ]
+        },
+    )
+
+    result = mcp_server.jira_transition_issue(
+        key="FC-458", transition_name_or_id="Won't Do", fields={"resolution": "  "}
+    )
+
+    assert result["ok"] is False
+    assert result["error_type"] == "transition_fields_missing"
+    assert client.captured_transition_issue is None
+
+
 def test_jira_transition_issue_execute_with_a_supplied_required_field_writes_it(
     tmp_path, monkeypatch
 ) -> None:
@@ -3516,6 +3544,7 @@ def test_jira_transition_issue_execute_with_a_supplied_required_field_writes_it(
                     "fields": {
                         "resolution": {
                             "required": True,
+                            "schema": {"type": "resolution", "system": "resolution"},
                             "allowedValues": [
                                 {"id": "10000", "name": "Done"},
                                 {"id": "10001", "name": "Won't Do"},
