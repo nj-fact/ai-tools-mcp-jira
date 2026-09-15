@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from jira_agent import client as client_module
 from jira_agent.client import (
@@ -28,6 +29,7 @@ from jira_agent.client import (
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
+    sprint_add_verification_results,
     sprint_membership_report,
     sprint_verification_results,
     status_category_rank,
@@ -3967,6 +3969,97 @@ def test_add_issues_to_sprint_posts_issue_keys() -> None:
     assert seen["method"] == "POST"
     assert seen["url"] == "https://example.atlassian.net/rest/agile/1.0/sprint/7340/issue"
     assert seen["json"] == {"issues": ["FC-1", "FC-2"]}
+
+
+def test_add_issues_to_sprint_rejects_path_shaped_id_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="positive integer Jira id"):
+            client.add_issues_to_sprint("../backlog", ["FC-1"])
+
+    assert calls == 0
+
+
+def test_atomic_agile_batch_rejects_mixed_credentials_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.add_issues_to_sprint(7340, ["FC-1", "FINRP-9"])
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.move_issues_to_backlog(["FC-1", "FINRP-9"])
+
+    assert calls == 0
+
+
+def test_issue_link_rejects_mixed_credentials_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(201)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.link_issues(outward_issue_key="FC-1", inward_issue_key="FINRP-9")
+
+    assert calls == 0
+
+
+def test_agile_batch_rejects_more_than_fifty_keys_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    keys = [f"FC-{index}" for index in range(1, 52)]
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="at most 50"):
+            client.add_issues_to_sprint(7340, keys)
+
+    assert calls == 0
+
+
+def test_sprint_add_verification_fails_if_replaced_sprint_is_still_present() -> None:
+    old = {"id": 7339, "name": "Sprint 7339", "state": "active"}
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    precondition = [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [old],
+            "in_sprint": False,
+            "sprints_replaced": [old],
+        }
+    ]
+    post_write = [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [old, target],
+            "in_sprint": True,
+        }
+    ]
+
+    result = sprint_add_verification_results(precondition, post_write)
+
+    assert result[0]["in_sprint"] is True
+    assert result[0]["still_in_replaced_sprints"] == [old]
+    assert result[0]["verified"] is False
 
 
 def test_move_issues_to_backlog_posts_issue_keys() -> None:

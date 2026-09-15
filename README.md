@@ -286,6 +286,9 @@ uv run jira-agent link-issue FC-350 FC-352 --type Blocks
 Jira's create REST payload uses the inverse field names (`inwardIssue: FC-350`,
 `outwardIssue: FC-352`) to produce that display. This corrects earlier releases, which sent the
 two fields in the intuitive but wrong order and therefore created directional links reversed.
+That inverse mapping also controls Jira's inline `--comment`: Jira writes it to REST
+`outwardIssue`, which is this command's business `INWARD_KEY` (the second argument). The dry run
+prints that exact comment target, and the audit record uses it as its primary issue key.
 Existing directional links are not migrated; inspect and reconcile them deliberately with the
 dry-run `delete-issue-link` command before recreating them.
 
@@ -626,7 +629,11 @@ the workaround was creating a duplicate issue and retiring the original).
   `? (field not returned)`, never as the same `-` a genuine empty sprint list gets, and triggers
   the same "Jira did not return requested field(s)" warning `issue` already prints for any other
   missing field.
-- `sprint-add <SPRINT_ID> <KEY>...` — add one or more issues to a sprint. This is a single
+- `sprint-add <SPRINT_ID> <KEY>...` — move one or more issues to a sprint. Jira does not add a
+  second active/future membership: its endpoint replaces a different current active/future sprint
+  while retaining closed history. The command therefore reads membership before both dry-run and
+  execute, exposes each replaced sprint, and refuses the whole batch unless the caller passes
+  `--allow-sprint-reassignment`. This is a single
   batched `POST /sprint/{id}/issue` call carrying every key at once, not a per-issue loop, so
   there is no "key 7 of 13 failed, the rest already moved" state to report on the Jira side. The
   write-safety gate is checked for every key before the dry run reports success, not only before
@@ -635,15 +642,17 @@ the workaround was creating a duplicate issue and retiring the original).
   written, and the dry run reports the same per-key `safety` result `--execute` would have used.
   The write is audited as soon as Jira accepts it, before the post-write reread that verifies it
   runs; if that reread itself fails, the write is reported as accepted but unverified
-  (`verified: null`, exit code 6) rather than as a failed write with no audit record.
+  (`verified: null`, exit code 6) rather than as a failed write with no audit record. Jira accepts
+  at most 50 keys in this request; larger batches are rejected locally before any write.
 - `sprint-remove <SPRINT_ID> <KEY>...` — move one or more issues to the backlog. `SPRINT_ID` is a
   **precondition this command enforces, not a filter Jira applies**: the underlying endpoint
   (`POST /rest/agile/1.0/backlog/issue`) takes no sprint id at all. It is documented as
   equivalent to removing the FUTURE and ACTIVE sprints from the given issues — ALL of them, on
-  every key, not only the one named — and it leaves CLOSED sprints untouched. An issue can be in
-  more than one non-closed sprint at once (a long-lived issue on a board that has moved through
-  several sprints), so before any write every key's sprint field is re-read and the whole batch
-  is refused, nothing written for any key, if either: a key is not currently in `SPRINT_ID`
+  every key, not only the one named — and it leaves CLOSED sprints untouched. Jira normally
+  permits only one current active/future sprint per issue; the guard nevertheless evaluates every
+  non-closed entry Jira returns so anomalous data cannot hide destructive scope. Before any write
+  every key's sprint field is re-read and the whole batch is refused, nothing written for any key,
+  if either: a key is not currently in `SPRINT_ID`
   (exit code 5), or a key sits in another non-closed sprint besides `SPRINT_ID` (exit code 7) —
   that write would silently clear a sprint nobody named. Pass `--allow-multi-sprint-removal` to
   proceed anyway once you have seen what it would additionally clear. The dry run lists, per key,
@@ -670,16 +679,18 @@ the workaround was creating a duplicate issue and retiring the original).
   site's probed default), so a caller can check which ids are actually in effect before running
   anything that writes rather than guessing.
 
-`sprint-add` and `sprint-remove` add three exit codes beyond the general ones (1 generic API
+`sprint-add` and `sprint-remove` add four exit codes beyond the general ones (1 generic API
 error, 2 bad arguments, 3 write-safety refusal, 4 concurrent-edit refusal): 5 fires before any
 write when a key is not currently in `SPRINT_ID` (`sprint-remove` only); 6 fires after a write
 Jira accepted when the post-write reread did not confirm it, OR when that reread itself failed
 and the write's outcome is therefore unknown rather than failed (`verified: null`); 7 fires
 before any write, like 5, but for a different reason specific to `sprint-remove` — a key IS in
 `SPRINT_ID` but ALSO in another non-closed sprint the write would silently clear too. Under
-`--json`, the three failure states carry distinct `error_type` values —
+`--json`, those failure states carry distinct `error_type` values —
 `sprint_precondition_failed`, `sprint_multi_removal_refused`, and
 `sprint_verification_unavailable` — so a script never has to parse prose to tell them apart.
+Exit code 9 is the `sprint-add` pre-write refusal when a different active/future sprint would be
+replaced without `--allow-sprint-reassignment` (`sprint_reassignment_refused`).
 
 `transition` adds exit code 8, beyond every code above: it fires before any write when the
 chosen transition's target status category is EARLIER than the issue's current one, or when a

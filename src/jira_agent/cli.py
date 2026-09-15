@@ -21,6 +21,7 @@ from jira_agent.client import (
     JiraMissingConcurrencyTokenError,
     SprintMultiRemovalError,
     SprintPreconditionError,
+    SprintReassignmentError,
     TransitionDirectionRefusedError,
     TransitionFieldsMissingError,
     adf_contains_media_id,
@@ -31,18 +32,22 @@ from jira_agent.client import (
     issue_link_payload,
     issue_status_category,
     issue_type_allowed_values,
+    normalize_jira_numeric_id,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     require_concurrency_token,
+    require_shared_write_scope,
     select_transition,
+    sprint_add_blast_radius,
+    sprint_add_verification_results,
     sprint_membership_report,
     sprint_removal_blast_radius,
     sprint_removal_verification_results,
-    sprint_verification_results,
     transition_fields_payload,
     transition_required_fields_missing,
     transition_target_category,
+    validate_agile_issue_batch,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -2814,14 +2819,25 @@ def link_issue(
     ] = "Relates",
     comment: Annotated[
         str | None,
-        typer.Option("--comment", help="Optional comment sent with the Jira link."),
+        typer.Option(
+            "--comment",
+            help=(
+                "Optional comment written to INWARD_KEY (the second argument), because Jira "
+                "attaches an issue-link comment to its inverse REST outwardIssue."
+            ),
+        ),
     ] = None,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually create the issue link in Jira."),
     ] = False,
 ) -> None:
-    """Link two Jira issues by their business direction. Defaults to dry-run."""
+    """Link two Jira issues by business direction. Defaults to dry-run.
+
+    Jira's REST endpoint inverts the business endpoint names used by this command. Its optional
+    inline comment lands on REST ``outwardIssue``, which is this command's ``INWARD_KEY`` (the
+    second argument). The dry run prints that target explicitly.
+    """
     config = _config()
     payload = issue_link_payload(
         outward_issue_key=outward_key,
@@ -2831,12 +2847,16 @@ def link_issue(
     )
     with JiraClient(config) as client:
         try:
+            require_shared_write_scope(config, [outward_key, inward_key])
             outward_safety = ensure_issue_write_allowed(config, client, outward_key)
             inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            comment_issue_key = inward_key if comment else None
             if not execute:
                 console.print("[yellow]Dry run:[/yellow] would create issue link")
                 console.print(f"outward safety: {outward_safety}")
                 console.print(f"inward safety: {inward_safety}")
+                if comment_issue_key:
+                    console.print(f"comment issue: {comment_issue_key}")
                 _print_json(payload)
                 console.print("Pass --execute to write it to Jira.")
                 return
@@ -2850,8 +2870,8 @@ def link_issue(
             audit_write(
                 config,
                 action="link_issue",
-                issue_key=outward_key,
-                payload=payload,
+                issue_key=comment_issue_key or outward_key,
+                payload={**payload, "comment_issue_key": comment_issue_key},
                 result=data,
             )
         except JiraWriteSafetyError as exc:
@@ -3161,6 +3181,19 @@ def embed_diagram(
             # below, which reads a fresh copy after the upload.
             issue = client.get_issue(issue_key, fields=["description", "attachment"])
             attachments = issue.get("fields", {}).get("attachment") or []
+            current_attachment_ids = {
+                str(attachment.get("id"))
+                for attachment in attachments
+                if isinstance(attachment, dict) and attachment.get("id") is not None
+            }
+            unknown_delete_ids = delete_ids - current_attachment_ids
+            if unknown_delete_ids:
+                _print_error(
+                    "Attachment delete refused:",
+                    "every --delete-attachment-id must belong to the target issue; not present "
+                    f"on {issue_key}: {', '.join(sorted(unknown_delete_ids))}.",
+                )
+                raise typer.Exit(2)
             for attachment in attachments:
                 if attachment.get("filename") in delete_names:
                     delete_ids.add(str(attachment.get("id")))
@@ -4044,14 +4077,29 @@ def sprint_add(
     ],
     execute: Annotated[
         bool,
-        typer.Option("--execute", help="Actually add the issues to the sprint."),
+        typer.Option("--execute", help="Actually move the issues to the sprint."),
+    ] = False,
+    allow_sprint_reassignment: Annotated[
+        bool,
+        typer.Option(
+            "--allow-sprint-reassignment",
+            help=(
+                "Proceed when Jira will move a key out of its current active/future sprint. "
+                "Without this flag, the whole batch is refused before any write."
+            ),
+        ),
     ] = False,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Add one or more issues to a sprint. Defaults to dry-run.
+    """Move one or more issues to a sprint. Defaults to dry-run.
+
+    Jira's endpoint replaces a different current active/future sprint; it is not an additive
+    membership operation. Every invocation reads membership first, reports the replaced sprint,
+    and requires ``--allow-sprint-reassignment`` before that destructive move. Closed historical
+    sprint entries remain. Jira accepts at most 50 issues per request.
 
     This is a single batched POST (`add_issues_to_sprint` sends every key in one request), not a
     per-issue loop, so there is no "key 7 of 13 failed" partial state to report on the Jira side.
@@ -4073,9 +4121,15 @@ def sprint_add(
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
         raise typer.Exit(2)
+    try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
 
     with _client() as client:
         try:
+            validate_agile_issue_batch(list(keys))
+            require_shared_write_scope(client.config, keys)
             # Check every key's write permission before writing any of them, on both the dry run
             # and the real write. The write itself is one batched call, so this loop is what keeps
             # a rejection on key N from following a write that already happened for keys 1..N-1:
@@ -4083,8 +4137,22 @@ def sprint_add(
             safety = [
                 ensure_issue_write_allowed(client.config, client, issue_key) for issue_key in keys
             ]
+            sprint_field = client.config.sprint_field
+            precondition = sprint_add_blast_radius(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                sprint_id,
+            )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        if any(entry["sprints_replaced"] for entry in precondition) and not (
+            allow_sprint_reassignment
+        ):
+            _exit_sprint_reassignment_error(
+                SprintReassignmentError(sprint_id, precondition), json_mode=json_output
+            )
 
         if not execute:
             _say(
@@ -4092,7 +4160,14 @@ def sprint_add(
                 json_mode=json_output,
             )
             for issue_key in keys:
-                _say(f"- {issue_key} -> sprint {sprint_id}", json_mode=json_output)
+                entry = next(row for row in precondition if row["key"] == issue_key)
+                replaced = entry["sprints_replaced"]
+                suffix = (
+                    f", replacing {_sprint_locations(replaced)}"
+                    if replaced
+                    else ", no current sprint replaced"
+                )
+                _say(f"- {issue_key} -> sprint {sprint_id}{suffix}", json_mode=json_output)
             _say(f"safety: {safety}", json_mode=json_output)
             if json_output:
                 _emit_json(
@@ -4100,13 +4175,14 @@ def sprint_add(
                         "sprint_id": sprint_id,
                         "issue_keys": list(keys),
                         "safety": safety,
+                        "precondition": precondition,
+                        "allow_sprint_reassignment": allow_sprint_reassignment,
                         "dry_run": True,
                     }
                 )
             _say("Pass --execute to write it to Jira.", json_mode=json_output)
             return
 
-        sprint_field = client.config.sprint_field
         try:
             data = client.add_issues_to_sprint(sprint_id, list(keys))
         except JiraApiError as exc:
@@ -4115,9 +4191,9 @@ def sprint_add(
         verification_error: JiraApiError | None = None
         results: list[dict[str, Any]] | None = None
         try:
-            results = sprint_verification_results(
+            results = sprint_add_verification_results(
+                precondition,
                 sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
-                expected_in_sprint=True,
             )
         except JiraApiError as exc:
             verification_error = exc
@@ -4126,7 +4202,12 @@ def sprint_add(
             client.config,
             action="sprint_add",
             issue_key=None,
-            payload={"sprint_id": sprint_id, "issue_keys": list(keys)},
+            payload={
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "precondition": precondition,
+                "allow_sprint_reassignment": allow_sprint_reassignment,
+            },
             result=(
                 {**data, "verification": results}
                 if verification_error is None
@@ -4232,10 +4313,9 @@ def sprint_remove(
     (`POST /rest/agile/1.0/backlog/issue`) takes no sprint id at all. It is documented as
     equivalent to removing the FUTURE and ACTIVE sprints from the given issues -- ALL of them,
     on every key in the batch, not only the one this command was told to check. Closed sprints
-    are unaffected. An issue can be in more than one non-closed sprint at once (a long-lived
-    issue on a board that has moved through several sprints), so "the named sprint" and "every
-    sprint this write actually clears" are not the same set, and this command never conflates
-    them.
+    are unaffected. Jira normally permits only one current active/future sprint per issue; this
+    command nevertheless evaluates every non-closed entry Jira returns so anomalous data cannot
+    hide destructive scope.
 
     Before any write, every key's current sprint field is re-read, and the WHOLE batch is
     refused -- nothing written for any key -- if even one key is not currently in `SPRINT_ID`,
@@ -4263,9 +4343,15 @@ def sprint_remove(
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
         raise typer.Exit(2)
+    try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
 
     with _client() as client:
         try:
+            validate_agile_issue_batch(list(keys))
+            require_shared_write_scope(client.config, keys)
             safety = [
                 ensure_issue_write_allowed(client.config, client, issue_key) for issue_key in keys
             ]
@@ -4744,10 +4830,13 @@ def _exit_concurrent_edit_error(exc: JiraConcurrentEditError, *, json_mode: bool
 # fires before any write, like 5, but for a different reason -- a key IS in SPRINT_ID but ALSO in
 # another non-closed sprint the write would silently clear too. A script can tell "refused, wrong
 # sprint" (5) apart from "refused, would also hit an unnamed sprint" (7) apart from "wrote, but
-# did not verify or could not check" (6) without parsing prose.
+# did not verify or could not check" (6) without parsing prose. 9 is the sprint-add counterpart:
+# the target write would replace a different current active/future sprint and the caller did not
+# explicitly opt in.
 SPRINT_PRECONDITION_EXIT_CODE = 5
 SPRINT_VERIFICATION_EXIT_CODE = 6
 SPRINT_MULTI_REMOVAL_EXIT_CODE = 7
+SPRINT_REASSIGNMENT_EXIT_CODE = 9
 
 # Distinct from every exit code above (1 API, 2 usage, 3 write-safety, 4 concurrent-edit/guard
 # unavailable, 5-7 sprint): `transition` refuses by default when the chosen transition's target
@@ -4832,6 +4921,27 @@ def _exit_sprint_multi_removal_error(exc: SprintMultiRemovalError, *, json_mode:
             }
         )
     raise typer.Exit(SPRINT_MULTI_REMOVAL_EXIT_CODE) from exc
+
+
+def _exit_sprint_reassignment_error(exc: SprintReassignmentError, *, json_mode: bool) -> None:
+    """Refuse sprint-add when Jira would replace another current active/future sprint."""
+    _print_error("Refusing sprint-add:", str(exc))
+    for entry in exc.at_risk:
+        _say(
+            f"- {entry['key']}: would leave {_sprint_locations(entry['sprints_replaced'])}",
+            json_mode=json_mode,
+        )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "sprint_reassignment_refused",
+                "sprint_id": exc.sprint_id,
+                "report": exc.report,
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(SPRINT_REASSIGNMENT_EXIT_CODE) from exc
 
 
 def _exit_missing_concurrency_token_error(

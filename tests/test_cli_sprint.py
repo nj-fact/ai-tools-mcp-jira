@@ -446,7 +446,11 @@ class _SprintStateFakeClient:
         if self._apply_writes:
             sprint = {"id": sprint_id, "name": f"Sprint {sprint_id}", "state": "active"}
             for issue_key in issue_keys:
-                current = [s for s in self._sprints.get(issue_key, []) if s.get("id") != sprint_id]
+                current = [
+                    sprint
+                    for sprint in self._sprints.get(issue_key, [])
+                    if sprint.get("state") == "closed"
+                ]
                 current.append(sprint)
                 self._sprints[issue_key] = current
         return {}
@@ -489,6 +493,17 @@ def test_sprint_add_cli_dry_run_writes_nothing_and_names_every_issue(tmp_path, m
             {"key": "FC-2", "project": "FC", "allowed_by": "project allowlist"},
             {"key": "FC-3", "project": "FC", "allowed_by": "project allowlist"},
         ],
+        "precondition": [
+            {
+                "key": key,
+                "sprint_id": 7340,
+                "sprints": [],
+                "in_sprint": False,
+                "sprints_replaced": [],
+            }
+            for key in ("FC-1", "FC-2", "FC-3")
+        ],
+        "allow_sprint_reassignment": False,
         "dry_run": True,
     }
     assert client.add_calls == []
@@ -521,6 +536,9 @@ def test_sprint_add_cli_execute_verifies_membership_by_reread_and_reports_per_ke
             "sprint_id": 7340,
             "sprints": [{"id": 7340, "name": "Sprint 7340", "state": "active"}],
             "in_sprint": True,
+            "pre_write_sprints": [],
+            "sprints_replaced": [],
+            "still_in_replaced_sprints": [],
             "expected_in_sprint": True,
             "verified": True,
         }
@@ -529,7 +547,21 @@ def test_sprint_add_cli_execute_verifies_membership_by_reread_and_reports_per_ke
     assert len(audited) == 1
     assert audited[0]["action"] == "sprint_add"
     assert audited[0]["issue_key"] is None
-    assert audited[0]["payload"] == {"sprint_id": 7340, "issue_keys": ["FC-1", "FC-2", "FC-3"]}
+    assert audited[0]["payload"] == {
+        "sprint_id": 7340,
+        "issue_keys": ["FC-1", "FC-2", "FC-3"],
+        "precondition": [
+            {
+                "key": key,
+                "sprint_id": 7340,
+                "sprints": [],
+                "in_sprint": False,
+                "sprints_replaced": [],
+            }
+            for key in ("FC-1", "FC-2", "FC-3")
+        ],
+        "allow_sprint_reassignment": False,
+    }
     assert audited[0]["result"]["verification"] == payload["results"]
 
 
@@ -588,6 +620,49 @@ def test_sprint_add_cli_dry_run_also_catches_the_safety_gate(tmp_path, monkeypat
     )
 
     assert result.exit_code == 3, result.stdout + result.stderr
+    assert client.add_calls == []
+
+
+def test_sprint_add_cli_refuses_current_sprint_replacement_without_opt_in(
+    tmp_path, monkeypatch
+) -> None:
+    current = {"id": 7339, "name": "Sprint 7339", "state": "active"}
+    client = _SprintStateFakeClient(initial_sprints={"FC-1": [current]})
+    _install(monkeypatch, _config(tmp_path), client)
+
+    result = CliRunner().invoke(cli.app, ["sprint-add", "7340", "FC-1", "--execute", "--json"])
+
+    assert result.exit_code == cli.SPRINT_REASSIGNMENT_EXIT_CODE
+    payload = json.loads(result.stdout)
+    assert payload["error_type"] == "sprint_reassignment_refused"
+    assert payload["report"][0]["sprints_replaced"] == [current]
+    assert client.add_calls == []
+
+    allowed = CliRunner().invoke(
+        cli.app,
+        [
+            "sprint-add",
+            "7340",
+            "FC-1",
+            "--execute",
+            "--allow-sprint-reassignment",
+            "--json",
+        ],
+    )
+    assert allowed.exit_code == 0, allowed.stdout + allowed.stderr
+    assert client.add_calls == [(7340, ["FC-1"])]
+    assert json.loads(allowed.stdout)["results"][0]["sprints_replaced"] == [current]
+
+
+def test_sprint_add_cli_rejects_more_than_fifty_keys_before_write(tmp_path, monkeypatch) -> None:
+    client = _SprintStateFakeClient()
+    _install(monkeypatch, _config(tmp_path), client)
+    keys = [f"FC-{index}" for index in range(1, 52)]
+
+    result = CliRunner().invoke(cli.app, ["sprint-add", "7340", *keys, "--execute", "--json"])
+
+    assert result.exit_code == 1
+    assert "at most 50" in result.stdout
     assert client.add_calls == []
 
 
@@ -698,9 +773,7 @@ def test_sprint_remove_cli_precondition_refuses_whole_batch_when_a_key_is_elsewh
             cli.app, ["sprint-remove", "7340", "FC-1", "FC-2", "FC-3", "--json", *execute_flag]
         )
 
-        assert result.exit_code == cli.SPRINT_PRECONDITION_EXIT_CODE, (
-            result.stdout + result.stderr
-        )
+        assert result.exit_code == cli.SPRINT_PRECONDITION_EXIT_CODE, result.stdout + result.stderr
         payload = json.loads(result.stdout)
         assert payload["ok"] is False
         assert payload["error_type"] == "sprint_precondition_failed"
@@ -760,9 +833,7 @@ def test_sprint_remove_cli_refuses_by_default_when_a_key_is_also_in_another_acti
             cli.app, ["sprint-remove", "7340", "FC-1", "--json", *execute_flag]
         )
 
-        assert result.exit_code == cli.SPRINT_MULTI_REMOVAL_EXIT_CODE, (
-            result.stdout + result.stderr
-        )
+        assert result.exit_code == cli.SPRINT_MULTI_REMOVAL_EXIT_CODE, result.stdout + result.stderr
         payload = json.loads(result.stdout)
         assert payload["ok"] is False
         assert payload["error_type"] == "sprint_multi_removal_refused"
@@ -857,9 +928,7 @@ def test_sprint_remove_cli_unverifiable_write_is_audited_and_reported_as_unknown
 
     client.get_issue_sprints = _flaky_get_issue_sprints
 
-    result = CliRunner().invoke(
-        cli.app, ["sprint-remove", "7340", "FC-1", "--execute", "--json"]
-    )
+    result = CliRunner().invoke(cli.app, ["sprint-remove", "7340", "FC-1", "--execute", "--json"])
 
     assert result.exit_code == cli.SPRINT_VERIFICATION_EXIT_CODE, result.stdout + result.stderr
     assert client.remove_calls == [["FC-1"]]  # the write itself went through
@@ -1157,9 +1226,7 @@ def test_issue_cli_json_passes_the_raw_sprint_field_through(tmp_path, monkeypatc
     assert payload["fields"]["customfield_10020"] == [_SPRINT_ON_ISSUE]
 
 
-def test_issue_cli_explicit_fields_does_not_request_or_render_sprint(
-    tmp_path, monkeypatch
-) -> None:
+def test_issue_cli_explicit_fields_does_not_request_or_render_sprint(tmp_path, monkeypatch) -> None:
     client = _IssueWithSprintFakeClient()
     _install(monkeypatch, _config(tmp_path), client)
 
@@ -1241,9 +1308,10 @@ def test_sprint_locations_skips_a_legacy_non_dict_sprint_entry(tmp_path, monkeyp
     `sprint.get(...)` on a plain string raises `AttributeError` instead of just skipping it.
     """
     assert cli._sprint_locations(["not-a-dict-legacy-entry"]) == "no sprint"
-    assert cli._sprint_locations(
-        ["legacy-string-entry", {"id": 1, "name": "Sprint 1"}]
-    ) == "1 'Sprint 1'"
+    assert (
+        cli._sprint_locations(["legacy-string-entry", {"id": 1, "name": "Sprint 1"}])
+        == "1 'Sprint 1'"
+    )
 
 
 # --- config-fields ----------------------------------------------------------------------------

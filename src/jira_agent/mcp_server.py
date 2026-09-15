@@ -18,6 +18,7 @@ from jira_agent.client import (
     JiraMissingConcurrencyTokenError,
     SprintMultiRemovalError,
     SprintPreconditionError,
+    SprintReassignmentError,
     TransitionDirectionRefusedError,
     TransitionFieldsMissingError,
     adf_contains_media_id,
@@ -28,17 +29,21 @@ from jira_agent.client import (
     issue_link_payload,
     issue_status_category,
     issue_type_allowed_values,
+    normalize_jira_numeric_id,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     require_concurrency_token,
+    require_shared_write_scope,
     select_transition,
+    sprint_add_blast_radius,
+    sprint_add_verification_results,
     sprint_membership_report,
     sprint_removal_blast_radius,
     sprint_removal_verification_results,
-    sprint_verification_results,
     transition_fields_payload,
     transition_required_fields_missing,
+    validate_agile_issue_batch,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -208,9 +213,7 @@ def _concurrent_edit_error(exc: JiraConcurrentEditError) -> dict[str, Any]:
     }
 
 
-def _cleanup_uploaded_attachments(
-    config: Any, issue_key: str, attachment_ids: list[str]
-) -> None:
+def _cleanup_uploaded_attachments(config: Any, issue_key: str, attachment_ids: list[str]) -> None:
     """Best-effort delete of attachments a call uploaded when the write that would have
     referenced them never happened. Shared by jira_render_mermaid_diagrams's guard-refusal
     paths and its pre-existing generic-failure path, so a refused concurrency guard leaves the
@@ -221,7 +224,10 @@ def _cleanup_uploaded_attachments(
     try:
         with JiraClient(config) as cleanup_client:
             for attachment_id in attachment_ids:
-                cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
+                try:
+                    cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
+                except JiraApiError:
+                    pass
     except JiraApiError:
         pass
 
@@ -1718,7 +1724,10 @@ def jira_link_issue(
     """Link two Jira issues by business direction. Defaults to dry-run.
 
     outward_key displays the link type's outward label (for example, "blocks"); inward_key
-    displays its inward label (for example, "is blocked by").
+    displays its inward label (for example, "is blocked by"). Jira's create-link REST mapping is
+    inverse to those business names, and its optional inline comment is written to the REST
+    outwardIssue -- therefore to this tool's ``inward_key`` (the second argument). The dry run,
+    result, and audit payload expose that exact ``comment_issue_key``.
     """
     config = load_config()
     payload = issue_link_payload(
@@ -1729,8 +1738,10 @@ def jira_link_issue(
     )
     try:
         with JiraClient(config) as client:
+            require_shared_write_scope(config, [outward_key, inward_key])
             outward_safety = ensure_issue_write_allowed(config, client, outward_key)
             inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            comment_issue_key = inward_key if comment else None
             if not execute:
                 return {
                     "ok": True,
@@ -1738,6 +1749,11 @@ def jira_link_issue(
                     "payload": payload,
                     "outward_safety": outward_safety,
                     "inward_safety": inward_safety,
+                    **(
+                        {"comment_issue_key": comment_issue_key}
+                        if comment_issue_key is not None
+                        else {}
+                    ),
                     "message": "Pass execute=true to create this issue link in Jira.",
                 }
 
@@ -1750,11 +1766,18 @@ def jira_link_issue(
             audit_write(
                 config,
                 action="link_issue",
-                issue_key=outward_key,
-                payload=payload,
+                issue_key=comment_issue_key or outward_key,
+                payload={**payload, "comment_issue_key": comment_issue_key},
                 result=result,
             )
-            return {"ok": True, "outward_key": outward_key, "inward_key": inward_key}
+            response = {
+                "ok": True,
+                "outward_key": outward_key,
+                "inward_key": inward_key,
+            }
+            if comment_issue_key is not None:
+                response["comment_issue_key"] = comment_issue_key
+            return response
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
@@ -2030,6 +2053,8 @@ def jira_render_mermaid_diagrams(
             media: list[tuple[str, str, int, int]] = []
             for path, alt in zip(paths, alts, strict=True):
                 uploaded = client.add_attachment(issue_key, path)
+                if not uploaded:
+                    raise JiraApiError(f"Jira returned no attachment metadata for {path.name}.")
                 attachment = uploaded[0]
                 attachment_id = str(attachment.get("id"))
                 uploaded_ids.append(attachment_id)
@@ -2063,7 +2088,8 @@ def jira_render_mermaid_diagrams(
             result = client.edit_issue_adf_description(
                 issue_key, updated_description, expect_updated=expect_updated
             )
-            to_delete = sorted(previous_ids - set(uploaded_ids))
+            committed_attachment_ids = list(uploaded_ids)
+            to_delete = sorted(previous_ids - set(committed_attachment_ids))
             # The write above succeeded, so every id in uploaded_ids is now referenced by the
             # live description. Clear it (after computing to_delete, which must still exclude
             # them) so a failure in the OLD-attachment cleanup below cannot trigger this call's
@@ -2079,7 +2105,7 @@ def jira_render_mermaid_diagrams(
                 issue_key=issue_key,
                 payload={
                     "files": [str(path) for path in paths],
-                    "attachment_ids": uploaded_ids,
+                    "attachment_ids": committed_attachment_ids,
                     "deleted_attachment_ids": deleted,
                     "guard_concurrent_edit": guard_concurrent_edit,
                 },
@@ -2109,6 +2135,7 @@ def jira_render_mermaid_diagrams(
         _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
         return _error(exc)
     except (OSError, RuntimeError, ValueError) as exc:
+        _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
         return {"ok": False, "message": str(exc)}
 
 
@@ -2161,6 +2188,20 @@ def jira_embed_diagram(
             safety = ensure_issue_write_allowed(config, client, issue_key)
             issue = client.get_issue(issue_key, fields=["description", "attachment"])
             attachments = issue.get("fields", {}).get("attachment") or []
+            current_attachment_ids = {
+                str(attachment.get("id"))
+                for attachment in attachments
+                if isinstance(attachment, dict) and attachment.get("id") is not None
+            }
+            unknown_delete_ids = delete_ids - current_attachment_ids
+            if unknown_delete_ids:
+                return {
+                    "ok": False,
+                    "message": (
+                        "Every delete_attachment_id must belong to the target issue; not present "
+                        f"on {issue_key}: {', '.join(sorted(unknown_delete_ids))}."
+                    ),
+                }
             for attachment in attachments:
                 if attachment.get("filename") in delete_names:
                     delete_ids.add(str(attachment.get("id")))
@@ -2743,9 +2784,7 @@ def jira_list_boards(
     """
     try:
         with _client() as client:
-            boards = client.list_boards(
-                board_type=board_type, name=name, max_results=max_results
-            )
+            boards = client.list_boards(board_type=board_type, name=name, max_results=max_results)
             values = boards.get("values") or []
             return {
                 "ok": True,
@@ -2840,8 +2879,15 @@ def jira_add_issues_to_sprint(
     sprint_id: int | str,
     issue_keys: list[str],
     execute: bool = False,
+    allow_sprint_reassignment: bool = False,
 ) -> dict[str, Any]:
-    """Add one or more issues to a sprint. Defaults to dry-run.
+    """Move one or more issues to a sprint. Defaults to dry-run.
+
+    Jira's endpoint is destructive move semantics, not additive membership: when a key is in a
+    different active/future sprint, it leaves that sprint. Every invocation therefore reads the
+    current sprint field before the dry run or write. ``precondition[].sprints_replaced`` exposes
+    the blast radius, and the whole batch is refused unless ``allow_sprint_reassignment=true``.
+    Closed historical sprint entries are retained. Jira accepts at most 50 keys per call.
 
     The Agile add endpoint returns 204 with no body, so Jira accepting the request is not proof
     the issue ended up in the sprint. The write is audited as soon as Jira accepts it -- before
@@ -2859,11 +2905,30 @@ def jira_add_issues_to_sprint(
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
     try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
         with _client() as client:
+            validate_agile_issue_batch(issue_keys)
+            require_shared_write_scope(client.config, issue_keys)
             safety = {
                 issue_key: ensure_issue_write_allowed(client.config, client, issue_key)
                 for issue_key in issue_keys
             }
+            sprint_field = client.config.sprint_field
+            precondition = sprint_add_blast_radius(
+                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
+                sprint_id,
+            )
+            if any(entry["sprints_replaced"] for entry in precondition) and not (
+                allow_sprint_reassignment
+            ):
+                exc = SprintReassignmentError(sprint_id, precondition)
+                return {
+                    "ok": False,
+                    "error_type": "sprint_reassignment_refused",
+                    "message": str(exc),
+                    "sprint_id": sprint_id,
+                    "report": precondition,
+                }
             if not execute:
                 return {
                     "ok": True,
@@ -2871,20 +2936,21 @@ def jira_add_issues_to_sprint(
                     "sprint_id": sprint_id,
                     "issue_keys": issue_keys,
                     "safety": safety,
-                    "message": "Pass execute=true to add these issues to the sprint in Jira.",
+                    "precondition": precondition,
+                    "allow_sprint_reassignment": allow_sprint_reassignment,
+                    "message": "Pass execute=true to move these issues to the sprint in Jira.",
                 }
 
-            sprint_field = client.config.sprint_field
             client.add_issues_to_sprint(sprint_id, issue_keys)
 
             verification_error: JiraApiError | None = None
             results: list[dict[str, Any]] | None = None
             try:
-                results = sprint_verification_results(
+                results = sprint_add_verification_results(
+                    precondition,
                     sprint_membership_report(
                         client, issue_keys, sprint_id, sprint_field=sprint_field
                     ),
-                    expected_in_sprint=True,
                 )
             except JiraApiError as exc:
                 verification_error = exc
@@ -2893,7 +2959,12 @@ def jira_add_issues_to_sprint(
                 client.config,
                 action="add_issues_to_sprint",
                 issue_key=issue_keys[0],
-                payload={"sprint_id": sprint_id, "issue_keys": issue_keys},
+                payload={
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "precondition": precondition,
+                    "allow_sprint_reassignment": allow_sprint_reassignment,
+                },
                 result=(
                     {"verification": results}
                     if verification_error is None
@@ -2942,10 +3013,9 @@ def jira_move_issues_to_backlog(
     NOT A FILTER JIRA APPLIES: the underlying endpoint (`POST /rest/agile/1.0/backlog/issue`)
     takes no sprint id at all. It is documented as equivalent to removing the FUTURE and ACTIVE
     sprints from the given issues -- ALL of them, on every key in the batch, not only the one
-    this tool was told to check. Closed sprints are unaffected. An issue can be in more than one
-    non-closed sprint at once (a long-lived issue on a board that has moved through several
-    sprints), so "the named sprint" and "every sprint this write actually clears" are not the
-    same set, and this tool never conflates them.
+    this tool was told to check. Closed sprints are unaffected. Jira normally permits only one
+    current active/future sprint per issue; this tool nevertheless evaluates every non-closed
+    entry Jira returns so anomalous data cannot hide destructive scope.
 
     Before any write (including the dry run, so it predicts what execute=true does), every key's
     current sprint field is re-read, and the whole batch is refused -- via
@@ -2971,7 +3041,10 @@ def jira_move_issues_to_backlog(
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
     try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
         with _client() as client:
+            validate_agile_issue_batch(issue_keys)
+            require_shared_write_scope(client.config, issue_keys)
             safety = {
                 issue_key: ensure_issue_write_allowed(client.config, client, issue_key)
                 for issue_key in issue_keys
@@ -2979,9 +3052,7 @@ def jira_move_issues_to_backlog(
 
             sprint_field = client.config.sprint_field
             precondition = sprint_removal_blast_radius(
-                sprint_membership_report(
-                    client, issue_keys, sprint_id, sprint_field=sprint_field
-                ),
+                sprint_membership_report(client, issue_keys, sprint_id, sprint_field=sprint_field),
                 sprint_id,
             )
             if any(not entry["in_sprint"] for entry in precondition):
@@ -3038,9 +3109,7 @@ def jira_move_issues_to_backlog(
                 payload={
                     "sprint_id": sprint_id,
                     "issue_keys": issue_keys,
-                    "pre_write_sprints": {
-                        entry["key"]: entry["sprints"] for entry in precondition
-                    },
+                    "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
                 },
                 result=(
                     {"verification": results}

@@ -1435,6 +1435,34 @@ def test_embed_diagram_execute_refuses_on_concurrent_edit(tmp_path, monkeypatch)
     assert deleted == ["9001"]
 
 
+def test_embed_diagram_rejects_attachment_id_not_owned_by_target_issue(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "embed-diagram",
+            ISSUE_KEY,
+            "--file",
+            str(png),
+            "--delete-attachment-id",
+            "foreign-9000",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "must belong to the target issue" in " ".join(result.stderr.split())
+    assert writes == []
+    assert deleted == []
+
+
 def test_embed_diagram_execute_writes_when_updated_matches(tmp_path, monkeypatch) -> None:
     FakeClient, writes, deleted = _make_embed_diagram_fake_client(after_upload_updated=READ_UPDATED)
     png = tmp_path / "diagram.png"

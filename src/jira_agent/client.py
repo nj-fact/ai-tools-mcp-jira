@@ -45,6 +45,31 @@ class JiraApiError(RuntimeError):
         self.details = details
 
 
+class JiraWriteScopeError(JiraApiError):
+    """A single Jira write was given keys served by different sites or credentials."""
+
+
+class SprintReassignmentError(RuntimeError):
+    """A sprint-add would move at least one issue out of its current active/future sprint."""
+
+    def __init__(self, sprint_id: int, report: list[dict[str, Any]]) -> None:
+        at_risk = [entry for entry in report if entry["sprints_replaced"]]
+        detail = "; ".join(
+            f"{entry['key']} currently in "
+            f"{', '.join(str(sprint.get('id')) for sprint in entry['sprints_replaced'])}"
+            for entry in at_risk
+        )
+        super().__init__(
+            f"Refusing to move issues to sprint {sprint_id}: Jira's sprint endpoint replaces an "
+            f"issue's current active/future sprint ({detail}). Pass --allow-sprint-reassignment "
+            "(CLI) or allow_sprint_reassignment=true (MCP) after reviewing the dry-run blast "
+            "radius."
+        )
+        self.sprint_id = sprint_id
+        self.report = report
+        self.at_risk = at_risk
+
+
 class JiraConcurrentEditError(JiraApiError):
     """A guarded whole-field rewrite found the issue had changed since it was read.
 
@@ -117,6 +142,67 @@ class SprintPreconditionError(RuntimeError):
         self.report = report
 
 
+def normalize_jira_numeric_id(value: int | str, *, name: str) -> int:
+    """Return a positive Jira numeric id, refusing URL/path-shaped strings.
+
+    IDs interpolated into REST paths must never be accepted as arbitrary strings: httpx resolves
+    ``../`` path segments before sending the request, which can silently turn a sprint write into
+    a different Agile endpoint.  Normalizing once at the public client boundary protects CLI,
+    MCP, and direct Python callers alike.
+    """
+    if isinstance(value, bool):
+        raise JiraApiError(f"{name} must be a positive integer Jira id, got {value!r}.")
+    if isinstance(value, int):
+        normalized = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        normalized = int(value.strip())
+    else:
+        raise JiraApiError(f"{name} must be a positive integer Jira id, got {value!r}.")
+    if normalized <= 0:
+        raise JiraApiError(f"{name} must be a positive integer Jira id, got {value!r}.")
+    return normalized
+
+
+def validate_agile_issue_batch(issue_keys: list[str]) -> None:
+    """Enforce Jira Agile's one-to-fifty issue batch contract locally."""
+    if not issue_keys:
+        raise JiraApiError("issue_keys must not be empty.")
+    if len(issue_keys) > 50:
+        raise JiraApiError(
+            f"Jira Agile accepts at most 50 issues per sprint/backlog write; got {len(issue_keys)}."
+        )
+
+
+def require_shared_write_scope(config: JiraConfig, issue_keys: Iterable[str]) -> None:
+    """Refuse one write whose referenced keys resolve to different site/auth tuples."""
+    keys = list(issue_keys)
+    if not keys:
+        return
+    scopes: list[tuple[str, str, str]] = []
+    details: list[dict[str, str]] = []
+    for key in keys:
+        credentials = config.credentials_for(key)
+        scopes.append(
+            (
+                credentials.site_url,
+                credentials.email,
+                credentials.api_token.get_secret_value(),
+            )
+        )
+        details.append(
+            {
+                "key": key,
+                "credential_source": config.credential_source_for(key),
+                "site_url": credentials.site_url,
+            }
+        )
+    if any(scope != scopes[0] for scope in scopes[1:]):
+        raise JiraWriteScopeError(
+            "A single Jira write cannot span different sites or credential sets.",
+            details={"scopes": details},
+        )
+
+
 def require_concurrency_token(
     issue_key: str, read_updated: Any, *, guard_enabled: bool
 ) -> str | None:
@@ -149,6 +235,21 @@ class JiraClient:
         self._owned_clients: list[httpx.Client] = []
         if http_client is not None:
             self._clients[(DEFAULT_CREDENTIAL_SOURCE, API_BASE_PATH)] = http_client
+
+    def require_shared_write_scope(self, issue_keys: Iterable[str]) -> None:
+        """Refuse an atomic write whose keys resolve to different Jira sites/authentication.
+
+        Multi-key Agile writes and issue-link creation are one HTTP request.  Routing that
+        request by only the first key is safe solely when every referenced key is served by the
+        same site and credentials that performed each key's safety check.  The credential tuple
+        is compared internally; error details deliberately expose only source names and sites,
+        never email addresses or API tokens.
+        """
+        require_shared_write_scope(self.config, issue_keys)
+
+    @staticmethod
+    def validate_agile_issue_batch(issue_keys: list[str]) -> None:
+        validate_agile_issue_batch(issue_keys)
 
     def _http_client_for(self, key: str | None, *, base_path: str = API_BASE_PATH) -> httpx.Client:
         """Return the HTTP client for one (credential set, API base) pair, cached per pair.
@@ -711,6 +812,7 @@ class JiraClient:
         link_type: str = "Relates",
         comment: str | None = None,
     ) -> dict[str, Any]:
+        self.require_shared_write_scope([outward_issue_key, inward_issue_key])
         return self._request(
             "POST",
             "/issueLink",
@@ -830,6 +932,7 @@ class JiraClient:
         state: str | None = None,
         max_results: int = 50,
     ) -> dict[str, Any]:
+        board_id = normalize_jira_numeric_id(board_id, name="board_id")
         params: dict[str, Any] = {"maxResults": max_results}
         if state:
             params["state"] = state
@@ -868,6 +971,9 @@ class JiraClient:
         return list(value) if isinstance(value, list) else []
 
     def add_issues_to_sprint(self, sprint_id: int | str, issue_keys: list[str]) -> dict[str, Any]:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
+        self.validate_agile_issue_batch(issue_keys)
+        self.require_shared_write_scope(issue_keys)
         return self._request(
             "POST",
             f"/sprint/{sprint_id}/issue",
@@ -877,6 +983,8 @@ class JiraClient:
         )
 
     def move_issues_to_backlog(self, issue_keys: list[str]) -> dict[str, Any]:
+        self.validate_agile_issue_batch(issue_keys)
+        self.require_shared_write_scope(issue_keys)
         return self._request(
             "POST",
             "/backlog/issue",
@@ -1004,15 +1112,65 @@ def active_or_future_sprints(sprints: list[dict[str, Any]]) -> list[dict[str, An
     """Every non-closed (state `"future"` or `"active"`) entry in a parsed sprint list --
     exactly what `POST /rest/agile/1.0/backlog/issue` is documented to clear from an issue's
     sprint field. That endpoint takes no sprint id and is not scoped to one sprint at all: it is
-    documented as equivalent to removing the FUTURE and ACTIVE sprints from the given issues,
-    plural, and leaves closed sprints untouched. An issue can carry more than one non-closed
-    entry -- a board can have more than one active sprint in flight across its states, and a
-    long-lived issue accumulates future-sprint entries -- so this can return more than the one
-    sprint a `sprint-remove` caller named.
+    documented as equivalent to removing the FUTURE and ACTIVE sprint from each issue and leaves
+    closed historical sprints untouched. Jira normally permits one current active/future sprint
+    per issue. This helper nevertheless evaluates every non-closed entry returned by Jira so an
+    anomalous response cannot hide additional destructive scope.
     """
     return [
         sprint for sprint in sprints if isinstance(sprint, dict) and sprint.get("state") != "closed"
     ]
+
+
+def sprint_add_blast_radius(
+    report: list[dict[str, Any]], sprint_id: int | str
+) -> list[dict[str, Any]]:
+    """Describe which current active/future sprint a sprint-add would replace.
+
+    Jira names this operation "move issues to sprint", not an additive membership update. Closed
+    historical sprint entries remain, while a different active/future sprint is replaced by the
+    target. The report is read before both dry-run and execute so the caller sees that destructive
+    effect and must opt in explicitly.
+    """
+    target = str(sprint_id)
+    return [
+        {
+            **entry,
+            "sprints_replaced": [
+                sprint
+                for sprint in active_or_future_sprints(entry["sprints"])
+                if str(sprint.get("id")) != target
+            ],
+        }
+        for entry in report
+    ]
+
+
+def sprint_add_verification_results(
+    precondition: list[dict[str, Any]], post_write: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Verify target membership and departure from the replaced current sprint."""
+    pre_by_key = {entry["key"]: entry for entry in precondition}
+    results: list[dict[str, Any]] = []
+    for entry in post_write:
+        pre = pre_by_key[entry["key"]]
+        replaced_ids = {str(sprint.get("id")) for sprint in pre["sprints_replaced"]}
+        still_in_replaced = [
+            sprint
+            for sprint in entry["sprints"]
+            if isinstance(sprint, dict) and str(sprint.get("id")) in replaced_ids
+        ]
+        results.append(
+            {
+                **entry,
+                "pre_write_sprints": pre["sprints"],
+                "sprints_replaced": pre["sprints_replaced"],
+                "still_in_replaced_sprints": still_in_replaced,
+                "expected_in_sprint": True,
+                "verified": entry["in_sprint"] is True and not still_in_replaced,
+            }
+        )
+    return results
 
 
 def sprint_removal_blast_radius(
@@ -1024,18 +1182,16 @@ def sprint_removal_blast_radius(
     what `move_issues_to_backlog` will really clear, per `active_or_future_sprints`) and
     `"other_sprints"` (`sprints_removed` minus `sprint_id` itself). `other_sprints` is non-empty
     exactly when the write would ALSO take the key out of a sprint nobody named -- the gap a
-    named-sprint-only precondition and verification used to miss entirely, because an issue can
-    be in more than one sprint at once and the backlog endpoint does not take a sprint id to
-    scope itself to just one of them.
+    named-sprint-only precondition and verification used to miss entirely. Jira normally permits
+    one current active/future sprint, but the backlog endpoint still does not take a sprint id and
+    the guard intentionally fails closed if Jira returns anomalous extra non-closed entries.
     """
     target = str(sprint_id)
     result: list[dict[str, Any]] = []
     for entry in report:
         sprints_removed = active_or_future_sprints(entry["sprints"])
         other_sprints = [s for s in sprints_removed if str(s.get("id")) != target]
-        result.append(
-            {**entry, "sprints_removed": sprints_removed, "other_sprints": other_sprints}
-        )
+        result.append({**entry, "sprints_removed": sprints_removed, "other_sprints": other_sprints})
     return result
 
 
@@ -1087,8 +1243,9 @@ def sprint_removal_verification_results(
 class SprintMultiRemovalError(RuntimeError):
     """`sprint-remove`'s default refusal when the write would ALSO clear a non-closed sprint
     besides the one named. `POST /rest/agile/1.0/backlog/issue` removes every FUTURE and ACTIVE
-    sprint an issue is in, not only `sprint_id`, so a key that also sits in another such sprint
-    would silently lose that membership too unless this refuses first, before any write.
+    sprint Jira reports on an issue, not only `sprint_id`, so an anomalous response with another
+    such sprint would silently lose that membership too unless this refuses first, before any
+    write.
 
     Carries the full `sprint_removal_blast_radius` report, not just the at-risk keys, so a
     caller can show exactly what every key would additionally leave. `--allow-multi-sprint-removal`
@@ -1098,8 +1255,7 @@ class SprintMultiRemovalError(RuntimeError):
     def __init__(self, sprint_id: int | str, report: list[dict[str, Any]]) -> None:
         at_risk = [entry for entry in report if entry["other_sprints"]]
         detail = "; ".join(
-            f"{entry['key']} also in "
-            f"{', '.join(str(s.get('id')) for s in entry['other_sprints'])}"
+            f"{entry['key']} also in {', '.join(str(s.get('id')) for s in entry['other_sprints'])}"
             for entry in at_risk
         )
         super().__init__(
@@ -2154,6 +2310,9 @@ def issue_link_payload(
 
     ``outward_issue_key`` is the work item that displays the link type's outward label (for
     example, "blocks"). Jira's create endpoint names the *other* endpoint ``outwardIssue``.
+    Jira attaches an inline ``comment`` to that REST ``outwardIssue``, so with this business-name
+    interface the comment lands on ``inward_issue_key``. CLI/MCP surface and audit that target
+    explicitly rather than implying the first key receives it.
     """
     payload: dict[str, Any] = {
         "type": {"name": link_type},

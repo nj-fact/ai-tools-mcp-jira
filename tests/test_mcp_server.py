@@ -470,6 +470,51 @@ def test_jira_link_issue_keeps_fc_350_blocks_fc_352_business_direction(
     assert executed == {"ok": True, "outward_key": "FC-350", "inward_key": "FC-352"}
 
 
+def test_jira_link_issue_comment_names_and_audits_the_actual_second_issue_target(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = LinkCreateFakeClient(config)
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda _config, **kwargs: audited.append(kwargs))
+
+    dry_run = mcp_server.jira_link_issue("FC-350", "FC-352", comment="Dependency", execute=False)
+    executed = mcp_server.jira_link_issue("FC-350", "FC-352", comment="Dependency", execute=True)
+
+    assert dry_run["comment_issue_key"] == "FC-352"
+    assert executed["comment_issue_key"] == "FC-352"
+    assert audited[0]["issue_key"] == "FC-352"
+    assert audited[0]["payload"]["comment_issue_key"] == "FC-352"
+
+
+def test_jira_link_issue_rejects_cross_credential_keys_before_safety_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_PROJECT__FINRP__EMAIL": "b@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "b-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://site-b.atlassian.net",
+            "JIRA_WRITE_PROJECT_KEYS": "FC,FINRP",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = LinkCreateFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_link_issue("FC-1", "FINRP-9", execute=True)
+
+    assert result["ok"] is False
+    assert "different sites or credential sets" in result["message"]
+    assert client.created == []
+
+
 class ExistingPngFakeClient:
     def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
         self.description = {"type": "doc", "version": 1, "content": []}
@@ -666,9 +711,7 @@ def test_jira_delete_issue_link_refuses_ambiguous_or_mismatched_target_without_d
     client = _install_link_parent_client(monkeypatch, tmp_path, duplicate_link=True)
 
     ambiguous = mcp_server.jira_delete_issue_link("FC-354", "FC-356", execute=True)
-    mismatch = mcp_server.jira_delete_issue_link(
-        "FC-354", "FC-356", link_id="10002", execute=True
-    )
+    mismatch = mcp_server.jira_delete_issue_link("FC-354", "FC-356", link_id="10002", execute=True)
 
     assert ambiguous["ok"] is False
     assert "Expected exactly one directed" in ambiguous["message"]
@@ -1880,9 +1923,7 @@ class IssueTypeFakeClient:
         return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
 
     def get_edit_metadata(self, issue_key):
-        allowed_values = (
-            [{"name": "Bug"}, {"name": "Task"}] if self.allowed else [{"name": "Bug"}]
-        )
+        allowed_values = [{"name": "Bug"}, {"name": "Task"}] if self.allowed else [{"name": "Bug"}]
         return {"fields": {"issuetype": {"allowedValues": allowed_values}}}
 
     def is_issue_type_allowed(self, issue_key, issue_type_name):
@@ -2037,7 +2078,7 @@ class SprintFakeClient:
                 current = [
                     entry
                     for entry in self._sprints.get(issue_key, [])
-                    if entry.get("id") != sprint_id
+                    if entry.get("state") == "closed"
                 ]
                 current.append(sprint)
                 self._sprints[issue_key] = current
@@ -2157,6 +2198,9 @@ def test_jira_add_issues_to_sprint_dry_run_then_execute(tmp_path, monkeypatch) -
                 "sprint_id": 42,
                 "sprints": [{"id": 42, "name": "Sprint 42", "state": "active"}],
                 "in_sprint": True,
+                "pre_write_sprints": [],
+                "sprints_replaced": [],
+                "still_in_replaced_sprints": [],
                 "expected_in_sprint": True,
                 "verified": True,
             }
@@ -2188,6 +2232,73 @@ def test_jira_add_issues_to_sprint_refuses_an_empty_list(tmp_path, monkeypatch) 
     result = mcp_server.jira_add_issues_to_sprint(42, [])
 
     assert result == {"ok": False, "message": "issue_keys must not be empty."}
+
+
+def test_jira_add_issues_to_sprint_rejects_path_traversal_id_before_opening_client() -> None:
+    result = mcp_server.jira_add_issues_to_sprint("../backlog", ["FC-405"], execute=True)
+
+    assert result["ok"] is False
+    assert "positive integer Jira id" in result["message"]
+
+
+def test_jira_add_issues_to_sprint_rejects_more_than_fifty_keys(tmp_path, monkeypatch) -> None:
+    client = _install_sprint_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_add_issues_to_sprint(
+        42, [f"FC-{index}" for index in range(1, 52)], execute=True
+    )
+
+    assert result["ok"] is False
+    assert "at most 50" in result["message"]
+    assert client.added == []
+
+
+def test_jira_add_issues_to_sprint_rejects_cross_site_batch_before_write(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://site-a.atlassian.net",
+            "JIRA_EMAIL": "a@example.com",
+            "JIRA_API_TOKEN": "a-token",
+            "JIRA_PROJECT__FINRP__EMAIL": "b@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "b-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://site-b.atlassian.net",
+            "JIRA_WRITE_PROJECT_KEYS": "FC,FINRP",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = SprintFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_add_issues_to_sprint(42, ["FC-405", "FINRP-9"], execute=True)
+
+    assert result["ok"] is False
+    assert "different sites or credential sets" in result["message"]
+    assert client.added == []
+
+
+def test_jira_add_issues_to_sprint_requires_opt_in_before_replacing_current_sprint(
+    tmp_path, monkeypatch
+) -> None:
+    current = {"id": 41, "name": "Sprint 41", "state": "active"}
+    client = _install_sprint_client(monkeypatch, tmp_path, initial_sprints={"FC-405": [current]})
+
+    refused = mcp_server.jira_add_issues_to_sprint(42, ["FC-405"], execute=True)
+
+    assert refused["ok"] is False
+    assert refused["error_type"] == "sprint_reassignment_refused"
+    assert refused["report"][0]["sprints_replaced"] == [current]
+    assert client.added == []
+
+    executed = mcp_server.jira_add_issues_to_sprint(
+        42, ["FC-405"], execute=True, allow_sprint_reassignment=True
+    )
+    assert executed["ok"] is True
+    assert executed["results"][0]["pre_write_sprints"] == [current]
+    assert executed["results"][0]["sprints_replaced"] == [current]
+    assert client.added == [(42, ["FC-405"])]
 
 
 def test_jira_move_issues_to_backlog_dry_run_then_execute(tmp_path, monkeypatch) -> None:
@@ -2323,9 +2434,7 @@ def test_jira_move_issues_to_backlog_unverifiable_write_is_audited_and_reported_
         initial_sprints={"FC-405": [{"id": 42, "name": "Sprint 42", "state": "active"}]},
     )
     audited: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        mcp_server, "audit_write", lambda config, **kwargs: audited.append(kwargs)
-    )
+    monkeypatch.setattr(mcp_server, "audit_write", lambda config, **kwargs: audited.append(kwargs))
     real_get_issue_sprints = client.get_issue_sprints
     calls = {"n": 0}
 
@@ -2541,9 +2650,7 @@ def test_jira_update_drift_labels_clear_reads_once_and_removes_only_drift_prefix
         monkeypatch, tmp_path, initial_labels=["jira-agent", "drift-old", "drift-keep"]
     )
 
-    result = mcp_server.jira_update_drift_labels(
-        "FC-1", add=["new"], clear=True, execute=True
-    )
+    result = mcp_server.jira_update_drift_labels("FC-1", add=["new"], clear=True, execute=True)
 
     assert result["ok"] is True
     assert client.get_issue_calls == 1, "--clear reads the issue exactly once"
@@ -2715,9 +2822,7 @@ def test_jira_upsert_image_gallery_refuses_on_concurrent_edit(tmp_path, monkeypa
     )
     manifest_path = _gallery_manifest(tmp_path)
 
-    result = mcp_server.jira_upsert_image_gallery(
-        str(manifest_path), key="FC-1", execute=True
-    )
+    result = mcp_server.jira_upsert_image_gallery(str(manifest_path), key="FC-1", execute=True)
 
     assert result["ok"] is False
     assert result["error_type"] == "concurrent_edit"
@@ -2728,9 +2833,7 @@ def test_jira_upsert_image_gallery_executes_when_updated_matches(tmp_path, monke
     client = _install_gallery_client(monkeypatch, tmp_path)
     manifest_path = _gallery_manifest(tmp_path)
 
-    result = mcp_server.jira_upsert_image_gallery(
-        str(manifest_path), key="FC-1", execute=True
-    )
+    result = mcp_server.jira_upsert_image_gallery(str(manifest_path), key="FC-1", execute=True)
 
     assert result["ok"] is True
     assert len(client.writes) == 1
@@ -2740,9 +2843,7 @@ def test_jira_upsert_image_gallery_refuses_when_updated_missing(tmp_path, monkey
     client = _install_gallery_client(monkeypatch, tmp_path, updated=None)
     manifest_path = _gallery_manifest(tmp_path)
 
-    result = mcp_server.jira_upsert_image_gallery(
-        str(manifest_path), key="FC-1", execute=True
-    )
+    result = mcp_server.jira_upsert_image_gallery(str(manifest_path), key="FC-1", execute=True)
 
     assert result["ok"] is False
     assert result["error_type"] == "concurrent_edit_guard_unavailable"
@@ -2833,9 +2934,7 @@ class EmbedDiagramMcpFakeClient:
         return {}
 
 
-def _install_embed_diagram_mcp_client(
-    monkeypatch, tmp_path, **kwargs
-) -> EmbedDiagramMcpFakeClient:
+def _install_embed_diagram_mcp_client(monkeypatch, tmp_path, **kwargs) -> EmbedDiagramMcpFakeClient:
     config = make_config(tmp_path)
     client = EmbedDiagramMcpFakeClient(config, **kwargs)
     monkeypatch.setattr(mcp_server, "load_config", lambda: config)
@@ -2973,6 +3072,25 @@ def test_jira_embed_diagram_refused_write_leaves_no_attachment_behind(
     assert client.deleted == ["9001"], "the uploaded attachment must be cleaned up, not orphaned"
 
 
+def test_jira_embed_diagram_rejects_attachment_id_not_owned_by_target_issue(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(
+        str(png), key="FC-1", delete_attachment_ids=["foreign-9000"], execute=True
+    )
+
+    assert result["ok"] is False
+    assert "must belong to the target issue" in result["message"]
+    assert client.writes == []
+    assert client.deleted == []
+
+
 class MermaidFakeClient:
     """Fake for jira_render_mermaid_diagrams. Each `add_attachment` call (one per rendered
     diagram) bumps the live `updated` state, modelling Jira's real behaviour; `issue_version`
@@ -3100,6 +3218,114 @@ def test_jira_render_mermaid_diagrams_succeeds_despite_the_upload_moving_updated
     assert result["ok"] is True, result
     assert len(client.writes) == 1
     assert client.deleted == []
+
+
+def test_jira_render_mermaid_audit_keeps_committed_attachment_ids(tmp_path, monkeypatch) -> None:
+    client = _install_mermaid_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(mcp_server, "audit_write", lambda _config, **kwargs: audited.append(kwargs))
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is True
+    assert audited[0]["payload"]["attachment_ids"] == client.uploaded
+    assert audited[0]["payload"]["attachment_ids"] != []
+
+
+def test_jira_render_mermaid_empty_later_upload_cleans_up_prior_upload(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    client.description["content"].append(
+        {
+            "type": "codeBlock",
+            "attrs": {"language": "mermaid"},
+            "content": [{"type": "text", "text": "graph TD; B-->C;"}],
+        }
+    )
+    original_add = client.add_attachment
+    calls = 0
+
+    def empty_second_upload(issue_key, path):
+        nonlocal calls
+        calls += 1
+        return original_add(issue_key, path) if calls == 1 else []
+
+    client.add_attachment = empty_second_upload
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is False
+    assert "no attachment metadata" in result["message"]
+    assert client.deleted == client.uploaded == ["9201"]
+
+
+def test_jira_render_mermaid_png_inspection_failure_cleans_up_upload(tmp_path, monkeypatch) -> None:
+    client = _install_mermaid_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    monkeypatch.setattr(
+        mcp_server,
+        "png_dimensions",
+        lambda _path: (_ for _ in ()).throw(ValueError("invalid generated PNG")),
+    )
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result == {"ok": False, "message": "invalid generated PNG"}
+    assert client.deleted == client.uploaded == ["9201"]
+
+
+def test_jira_render_mermaid_cleanup_attempts_every_id_when_first_delete_fails(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(
+        monkeypatch, tmp_path, after_upload_updated="2026-01-01T00:01:00.000+0000"
+    )
+    client.description["content"].append(
+        {
+            "type": "codeBlock",
+            "attrs": {"language": "mermaid"},
+            "content": [{"type": "text", "text": "graph TD; B-->C;"}],
+        }
+    )
+    original_get = client.get_issue
+    reads = 0
+
+    def fail_post_upload_read(issue_key, *, fields=None, expand=None):
+        nonlocal reads
+        reads += 1
+        if reads > 2:
+            raise JiraApiError("post-upload read failed")
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    attempted: list[str] = []
+
+    def flaky_delete(attachment_id, *, issue_key):
+        attempted.append(attachment_id)
+        if len(attempted) == 1:
+            raise JiraApiError("first cleanup failed")
+        return {}
+
+    client.get_issue = fail_post_upload_read
+    client.delete_attachment = flaky_delete
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is False
+    assert attempted == client.uploaded == ["9201", "9202"]
 
 
 def test_jira_render_mermaid_diagrams_refuses_on_genuine_concurrent_edit_and_cleans_up_upload(
