@@ -98,6 +98,142 @@ def test_build_agent_report_normalizes_issue_context() -> None:
     assert report["write_scope"] == "FC-107"
 
 
+def _report_comment(n: int) -> dict[str, object]:
+    return {
+        "id": str(n),
+        "author": {"displayName": "Norman Janert"},
+        "created": f"2026-01-{n:02d}T00:00:00.000+0000",
+        "body": {
+            "type": "doc",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": f"c{n}"}]}],
+        },
+    }
+
+
+def _report_issue() -> dict[str, object]:
+    return {
+        "key": "FC-1",
+        "fields": {
+            "summary": "Subject",
+            "status": {"name": "Open"},
+            "issuetype": {"name": "Task"},
+            "project": {"key": "FC", "name": "First Cloud"},
+        },
+    }
+
+
+def test_build_agent_report_flags_truncation_on_partial_comment_page() -> None:
+    report = build_agent_report(
+        site_url="https://example.atlassian.net",
+        issue=_report_issue(),
+        comments={"total": 18, "comments": [_report_comment(n) for n in range(1, 6)]},
+        transitions={"transitions": []},
+    )
+
+    assert report["comment_count"] == 18
+    assert report["comments_returned"] == 5
+    assert report["comments_truncated"] is True
+
+
+def test_build_agent_report_comments_order_is_always_newest_first() -> None:
+    """A reader must never infer comment order from `--comments N` vs `--comments all`.
+
+    Regression for the F1 finding: `report["comments_order"]` states the order explicitly so a
+    caller never has to guess it from which option was passed.
+    """
+    report = build_agent_report(
+        site_url="https://example.atlassian.net",
+        issue=_report_issue(),
+        comments={"total": 1, "comments": [_report_comment(1)]},
+        transitions={"transitions": []},
+    )
+
+    assert report["comments_order"] == "newest-first"
+
+
+def test_build_agent_report_is_not_truncated_when_every_comment_is_present() -> None:
+    report = build_agent_report(
+        site_url="https://example.atlassian.net",
+        issue=_report_issue(),
+        comments={"total": 18, "comments": [_report_comment(n) for n in range(1, 19)]},
+        transitions={"transitions": []},
+    )
+
+    assert report["comment_count"] == 18
+    assert report["comments_returned"] == 18
+    assert report["comments_truncated"] is False
+
+
+def test_fetch_agent_report_int_limit_fetches_newest_first() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeClient:
+        def get_issue(self, _issue_key: str, *, fields: list[str]) -> dict[str, object]:
+            return _report_issue()
+
+        def list_comments(
+            self, _issue_key: str, *, limit: int, order_by: str | None = None
+        ) -> dict[str, object]:
+            calls["limit"] = limit
+            calls["order_by"] = order_by
+            return {"comments": [], "total": 18}
+
+        def get_transitions(self, _issue_key: str) -> dict[str, object]:
+            return {"transitions": []}
+
+    from jira_agent.reporting import fetch_agent_report
+
+    report = fetch_agent_report(
+        FakeClient(),
+        issue_key="FC-1",
+        site_url="https://example.atlassian.net",
+        comment_limit=5,
+    )
+
+    assert calls == {"limit": 5, "order_by": "-created"}
+    assert report["comment_count"] == 18
+    assert report["comments_returned"] == 0
+    assert report["comments_truncated"] is True
+
+
+def test_fetch_agent_report_all_pages_through_list_all_comments() -> None:
+    """Regression for F1: `--comments all` used to call `list_all_comments` with no
+    `order_by`, returning the OLDEST comment first while `--comments N` returned the newest
+    first — the same report key flipped meaning depending on which option was passed. Both
+    branches must now request `orderBy=-created` so `report["comments"][0]` is always newest.
+    """
+    calls: dict[str, object] = {}
+
+    class FakeClient:
+        def get_issue(self, _issue_key: str, *, fields: list[str]) -> dict[str, object]:
+            return _report_issue()
+
+        def list_all_comments(
+            self, issue_key: str, *, order_by: str | None = None
+        ) -> dict[str, object]:
+            calls["issue_key"] = issue_key
+            calls["order_by"] = order_by
+            return {"comments": [_report_comment(n) for n in range(1, 19)], "total": 18}
+
+        def get_transitions(self, _issue_key: str) -> dict[str, object]:
+            return {"transitions": []}
+
+    from jira_agent.reporting import fetch_agent_report
+
+    report = fetch_agent_report(
+        FakeClient(),
+        issue_key="FC-1",
+        site_url="https://example.atlassian.net",
+        comment_limit="all",
+    )
+
+    assert calls == {"issue_key": "FC-1", "order_by": "-created"}
+    assert report["comment_count"] == 18
+    assert report["comments_returned"] == 18
+    assert report["comments_truncated"] is False
+    assert report["comments_order"] == "newest-first"
+
+
 def test_build_agent_report_can_include_changelog_via_fetch_mock() -> None:
     class FakeClient:
         def get_issue(self, _issue_key: str, *, fields: list[str]) -> dict[str, object]:
@@ -111,7 +247,9 @@ def test_build_agent_report_can_include_changelog_via_fetch_mock() -> None:
                 },
             }
 
-        def list_comments(self, _issue_key: str, *, limit: int) -> dict[str, object]:
+        def list_comments(
+            self, _issue_key: str, *, limit: int, order_by: str | None = None
+        ) -> dict[str, object]:
             return {"comments": [], "total": 0}
 
         def get_transitions(self, _issue_key: str) -> dict[str, object]:

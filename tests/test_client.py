@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from jira_agent import client as client_module
 from jira_agent.client import (
@@ -12,14 +13,30 @@ from jira_agent.client import (
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    JiraConcurrentEditError,
+    SprintPreconditionError,
+    TransitionDirectionRefusedError,
+    TransitionFieldsMissingError,
+    adf_contains_media_id,
     adf_heading_text,
+    check_transition_direction,
     create_issue_payload,
+    describe_transition_options,
     edit_issue_payload,
+    is_in_sprint,
     issue_link_payload,
+    issue_status_category,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
+    sprint_add_verification_results,
+    sprint_membership_report,
+    sprint_verification_results,
+    status_category_rank,
     text_to_adf,
+    transition_fields_payload,
+    transition_required_fields_missing,
+    transition_target_category,
 )
 from jira_agent.config import JiraConfig
 from jira_agent.image_gallery import (
@@ -152,7 +169,11 @@ def test_add_comment_posts_adf_body() -> None:
     )
 
 
-def test_get_transitions_uses_issue_transitions_endpoint() -> None:
+def test_get_transitions_uses_issue_transitions_endpoint_with_fields_expand() -> None:
+    """`expand=transitions.fields` is required so each transition's `fields` metadata (required
+    flags and `allowedValues`) comes back in this same read -- see `JiraClient.get_transitions`'s
+    own docstring and FC-458's probed `resolution` field.
+    """
     seen: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -169,7 +190,10 @@ def test_get_transitions_uses_issue_transitions_endpoint() -> None:
 
     client.get_transitions("ABC-123")
 
-    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
+        "?expand=transitions.fields"
+    )
 
 
 def test_transition_issue_posts_transition_id() -> None:
@@ -191,6 +215,32 @@ def test_transition_issue_posts_transition_id() -> None:
     assert client.transition_issue("ABC-123", "31") == {}
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/ABC-123/transitions"
     assert seen["json"] == '{"transition":{"id":"31"}}'
+
+
+def test_transition_issue_includes_fields_when_supplied() -> None:
+    """A transition that requires a field (FC-458's `resolution`) must be able to carry it in the
+    same POST, shaped exactly as the caller/`transition_fields_payload` built it -- this method
+    must not silently drop a non-empty `fields` argument.
+    """
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.transition_issue("ABC-123", "811", fields={"resolution": {"name": "Won't Do"}})
+
+    assert seen["json"] == (
+        '{"transition":{"id":"811"},"fields":{"resolution":{"name":"Won\'t Do"}}}'
+    )
 
 
 def test_create_metadata_uses_project_and_issue_type_filters() -> None:
@@ -427,6 +477,17 @@ def test_edit_issue_payload_supports_parent_and_priority() -> None:
     }
 
 
+def test_edit_issue_payload_omits_parent_unless_set_or_explicitly_cleared() -> None:
+    assert "parent" not in edit_issue_payload(summary="Updated")["fields"]
+    assert edit_issue_payload(clear_parent=True)["fields"] == {"parent": None}
+    try:
+        edit_issue_payload(parent_key="FC-900", clear_parent=True)
+    except ValueError as exc:
+        assert str(exc) == "Use either parent_key or clear_parent, not both"
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_create_issue_payload_sets_one_fix_version() -> None:
     payload = create_issue_payload(
         project_key="FC",
@@ -477,6 +538,314 @@ def test_edit_issue_sends_fix_versions_in_the_jira_shape() -> None:
     client.edit_issue("FC-107", fix_versions=["FCL-MVP"])
 
     assert seen["json"] == '{"fields":{"fixVersions":[{"name":"FCL-MVP"}]}}'
+
+
+# --- Atomic `update` operations for labels / fixVersions -------------------------------------
+#
+# Jira's editmeta for this site advertises `operations: ["add", "set", "remove"]` for `labels`
+# (string items) and `operations: ["set", "add", "remove"]` for `fixVersions` (version-object
+# items, `{"name": ...}`). `add`/`remove` are applied server-side against whatever the field
+# currently holds, unlike `fields`, which replaces the whole value outright -- see
+# `edit_issue_payload`'s docstring.
+
+
+def test_edit_issue_payload_builds_atomic_labels_add_remove_ops() -> None:
+    payload = edit_issue_payload(labels_add=["needs-review"], labels_remove=["stale"])
+
+    # No "fields" key at all -- not even an empty one -- when the request is purely atomic: the
+    # real PUT `edit_issue` sends never carries an empty `fields` section (see
+    # `_guarded_issue_put`), so a dry-run preview built from this same payload must not show one
+    # either.
+    assert payload == {
+        "update": {"labels": [{"add": "needs-review"}, {"remove": "stale"}]},
+    }
+
+
+def test_edit_issue_payload_builds_atomic_fix_versions_add_remove_ops() -> None:
+    payload = edit_issue_payload(fix_versions_add=["FCL-MVP"], fix_versions_remove=["FCL-1.0"])
+
+    assert payload == {
+        "update": {
+            "fixVersions": [{"add": {"name": "FCL-MVP"}}, {"remove": {"name": "FCL-1.0"}}]
+        },
+    }
+
+
+def test_edit_issue_payload_combines_a_whole_field_set_with_an_unrelated_atomic_op() -> None:
+    """Different fields in one PUT: `fields` and `update` may both appear, as long as no field
+    is named in both."""
+    payload = edit_issue_payload(summary="New title", labels_add=["needs-review"])
+
+    assert payload == {
+        "fields": {"summary": "New title"},
+        "update": {"labels": [{"add": "needs-review"}]},
+    }
+
+
+def test_edit_issue_payload_combines_a_whole_array_set_with_an_atomic_op_on_another_field() -> (
+    None
+):
+    """K7: the README-advertised combination of a whole-array write on one field with an atomic
+    operation on a DIFFERENT field (`--labels a,b --add-fix-version V1`). Jira allows this; only
+    set-and-update of the SAME field is refused (see the refusal tests below)."""
+    payload = edit_issue_payload(labels=["a", "b"], fix_versions_add=["V1"])
+
+    assert payload == {
+        "fields": {"labels": ["a", "b"]},
+        "update": {"fixVersions": [{"add": {"name": "V1"}}]},
+    }
+
+
+def test_edit_issue_payload_clears_labels_with_an_empty_list() -> None:
+    """`labels=[]` is a whole-field CLEAR, not an empty request: it keys `fields` with an empty
+    list, which is a non-empty dict (one key) even though the list inside it is empty. This is
+    the case where "empty" in the caller's argument and "empty" in the payload mean opposite
+    things -- the guard-read decision on the CLI and MCP surfaces must key off THIS, not off
+    whether the caller's own list was empty."""
+    payload = edit_issue_payload(labels=[])
+
+    assert payload == {"fields": {"labels": []}}
+
+
+def test_edit_issue_payload_labels_add_wins_over_remove_for_the_same_label() -> None:
+    """K3: the same label named in both `labels_add` and `labels_remove` must resolve to added,
+    never removed -- the same add-wins precedence `workflows.drift_label_operations` applies for
+    the identical conflict -- rather than sending both operations and letting Jira's own,
+    unestablished processing order within one array decide."""
+    payload = edit_issue_payload(labels_add=["open"], labels_remove=["open"])
+
+    assert payload == {"update": {"labels": [{"add": "open"}]}}
+
+
+def test_edit_issue_payload_fix_versions_add_wins_over_remove_for_the_same_version() -> None:
+    """K3, `fixVersions` side of the same fix."""
+    payload = edit_issue_payload(fix_versions_add=["FCL-MVP"], fix_versions_remove=["FCL-MVP"])
+
+    assert payload == {"update": {"fixVersions": [{"add": {"name": "FCL-MVP"}}]}}
+
+
+def test_edit_issue_payload_labels_add_wins_leaves_other_removes_untouched() -> None:
+    """Add-wins precedence resolves only the overlapping value; an unrelated remove alongside it
+    is unaffected."""
+    payload = edit_issue_payload(labels_add=["open"], labels_remove=["open", "stale"])
+
+    assert payload == {"update": {"labels": [{"add": "open"}, {"remove": "stale"}]}}
+
+
+def test_edit_issue_payload_refuses_a_blank_labels_add_value() -> None:
+    try:
+        edit_issue_payload(labels_add=["  "])
+    except ValueError as exc:
+        assert "labels_add" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_labels_remove_value() -> None:
+    try:
+        edit_issue_payload(labels_remove=[""])
+    except ValueError as exc:
+        assert "labels_remove" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_fix_versions_add_value() -> None:
+    try:
+        edit_issue_payload(fix_versions_add=[" "])
+    except ValueError as exc:
+        assert "fix_versions_add" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_a_blank_fix_versions_remove_value() -> None:
+    try:
+        edit_issue_payload(fix_versions_remove=[""])
+    except ValueError as exc:
+        assert "fix_versions_remove" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_labels_set_and_update_together() -> None:
+    try:
+        edit_issue_payload(labels=["a"], labels_add=["b"])
+    except ValueError as exc:
+        assert "labels" in str(exc)
+        assert "both sets a field via `fields` and updates it via `update`" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_payload_refuses_fix_versions_set_and_update_together() -> None:
+    try:
+        edit_issue_payload(fix_versions=["FCL-MVP"], fix_versions_remove=["FCL-MVP"])
+    except ValueError as exc:
+        assert "fixVersions" in str(exc)
+        assert "both sets a field via `fields` and updates it via `update`" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_edit_issue_sends_update_section_in_the_jira_shape() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-107", labels_add=["needs-review"], labels_remove=["stale"])
+
+    # No "fields" key at all when the request is purely atomic -- not even an empty one.
+    assert seen["json"] == '{"update":{"labels":[{"add":"needs-review"},{"remove":"stale"}]}}'
+
+
+def test_edit_issue_atomic_label_ops_send_no_extra_read_though_method_is_guardable() -> None:
+    """Mirrors test_edit_issue_adf_description_without_guard_sends_no_extra_read: `edit_issue`
+    is a guardable method (it calls `_guarded_issue_put`), but a caller that never passes
+    `expect_updated` gets exactly the unguarded behaviour -- no extra GET -- whether the payload
+    is a whole-field rewrite or, as here, purely atomic add/remove operations that never needed
+    one in the first place.
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue("FC-1", labels_add=["needs-review"])
+
+    assert calls == ["PUT"]
+
+
+class _StatefulLabelsServer:
+    """Stands in for Jira's own issue resource for exactly one behaviour: `labels` is a single
+    array this fake stores server-side, and a PUT can either replace it outright (`fields`) or
+    apply `add`/`remove` operations against whatever it currently holds (`update`) -- the same
+    two shapes `editmeta` advertises for this field on the real site. A test can mutate
+    `self.labels` directly to model "a concurrent editor's write already landed", independently
+    of anything this process itself read or is about to send.
+    """
+
+    def __init__(self, labels: list[str]) -> None:
+        self.labels = list(labels)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"labels": list(self.labels)}})
+        assert request.method == "PUT"
+        body = json.loads(request.read().decode())
+        fields = body.get("fields") or {}
+        update = body.get("update") or {}
+        if "labels" in fields and "labels" in update:
+            # Real Jira rejects a PUT that both sets and updates the same field. Without this
+            # check the fake would happily apply both, which is exactly the regression the local
+            # refusal in `edit_issue_payload` exists to prevent -- and exactly what this fake
+            # would then be unable to catch.
+            return httpx.Response(
+                400,
+                json={"errorMessages": ["Field 'labels' cannot be both set and updated."]},
+            )
+        if "labels" in fields:
+            self.labels = list(fields["labels"])
+        for op in update.get("labels", []):
+            if "add" in op:
+                if op["add"] not in self.labels:
+                    self.labels.append(op["add"])
+            elif "remove" in op:
+                if op["remove"] in self.labels:
+                    self.labels.remove(op["remove"])
+        return httpx.Response(204)
+
+
+def _client_against(server: _StatefulLabelsServer) -> JiraClient:
+    return JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(server.handler),
+        ),
+    )
+
+
+def test_stateful_labels_server_rejects_a_put_that_both_sets_and_updates_labels() -> None:
+    """K8: real Jira rejects a PUT that both sets a field via `fields` and updates it via
+    `update`. `edit_issue_payload` already refuses to build such a payload locally, so no
+    production call path can reach this fake with both `fields.labels` and `update.labels` in
+    one PUT -- but the fake must still reject the combination itself the way Jira does, or it
+    could not catch a regression that starts sending both anyway (for example a caller of the
+    lower-level `_guarded_issue_put`, which does not go through `edit_issue_payload`'s guard at
+    all). Neither the whole-array set nor the atomic op is applied when it does."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    try:
+        client._guarded_issue_put(
+            "FC-1",
+            {"labels": ["a", "b"]},
+            update={"labels": [{"add": "c"}]},
+            expect_updated=None,
+        )
+    except JiraApiError as exc:
+        assert exc.status_code == 400
+    else:
+        raise AssertionError("Expected JiraApiError")
+
+    assert server.labels == ["existing"]
+
+
+def test_atomic_label_add_survives_a_label_a_concurrent_editor_already_added() -> None:
+    """The claim this task exists to prove: an atomic `add` operation, sent with no whole-array
+    read at all, cannot lose a label a concurrent editor already wrote server-side, because Jira
+    applies it against whatever the array holds AT WRITE TIME, not against a value this process
+    read."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    # A concurrent editor's own write already landed on the server before ours is sent.
+    server.labels.append("concurrent-label")
+
+    client.edit_issue("FC-1", labels_add=["mine"])
+
+    assert set(server.labels) == {"existing", "concurrent-label", "mine"}
+
+
+def test_whole_array_label_set_loses_a_label_a_concurrent_editor_already_added() -> None:
+    """Same scenario, but through the OLD whole-array shape (`labels=[...]`, computed from a
+    read taken before the concurrent write landed): the stale computed array overwrites the
+    concurrent editor's label outright. This is the exact failure `labels_add`/`labels_remove`
+    exists to make impossible, demonstrated here rather than only asserted."""
+    server = _StatefulLabelsServer(labels=["existing"])
+    client = _client_against(server)
+
+    # This read happens BEFORE the concurrent write below -- exactly the race window a
+    # read-transform-whole-field-rewrite cannot close.
+    read_labels = client.get_issue("FC-1", fields=["labels"])["fields"]["labels"]
+    computed = sorted({*read_labels, "mine"})
+
+    server.labels.append("concurrent-label")
+
+    client.edit_issue("FC-1", labels=computed)
+
+    assert "concurrent-label" not in server.labels
+    assert set(server.labels) == {"existing", "mine"}
 
 
 def test_create_issue_payload_writes_story_points_to_the_configured_field() -> None:
@@ -530,6 +899,47 @@ def test_a_malformed_story_points_field_id_is_rejected_at_config_time() -> None:
         raise AssertionError("Expected ValueError")
 
 
+def test_sprint_field_defaults_to_the_probed_id() -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+        }
+    )
+
+    assert config.sprint_field == "customfield_10020"
+
+
+def test_sprint_field_honours_its_env_alias() -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_SPRINT_FIELD": "customfield_12345",
+        }
+    )
+
+    assert config.sprint_field == "customfield_12345"
+
+
+def test_a_malformed_sprint_field_id_is_rejected_at_config_time() -> None:
+    try:
+        JiraConfig.model_validate(
+            {
+                "JIRA_SITE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_SPRINT_FIELD": "Sprint",
+            }
+        )
+    except ValueError as exc:
+        assert "customfield_10020" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
 def test_edit_issue_sends_story_points_using_the_client_config() -> None:
     seen: dict[str, object] = {}
 
@@ -566,8 +976,8 @@ def test_issue_link_payload_supports_optional_comment() -> None:
         comment="Related work",
     ) == {
         "type": {"name": "Relates"},
-        "outwardIssue": {"key": "FC-107"},
-        "inwardIssue": {"key": "FC-101"},
+        "inwardIssue": {"key": "FC-107"},
+        "outwardIssue": {"key": "FC-101"},
         "comment": {
             "body": {
                 "type": "doc",
@@ -602,8 +1012,43 @@ def test_link_issues_posts_issue_link_payload() -> None:
     assert client.link_issues(outward_issue_key="FC-107", inward_issue_key="FC-101") == {}
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issueLink"
     assert seen["json"] == (
-        '{"type":{"name":"Relates"},"outwardIssue":{"key":"FC-107"},"inwardIssue":{"key":"FC-101"}}'
+        '{"type":{"name":"Relates"},"inwardIssue":{"key":"FC-107"},"outwardIssue":{"key":"FC-101"}}'
     )
+
+
+def test_issue_link_payload_maps_fc_350_blocks_fc_352_to_jira_rest_direction() -> None:
+    assert issue_link_payload(
+        outward_issue_key="FC-350",
+        inward_issue_key="FC-352",
+        link_type="Blocks",
+    ) == {
+        "type": {"name": "Blocks"},
+        "inwardIssue": {"key": "FC-350"},
+        "outwardIssue": {"key": "FC-352"},
+    }
+
+
+def test_delete_issue_link_uses_issue_link_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.delete_issue_link("10001", issue_key="FC-107") == {}
+    assert seen == {
+        "method": "DELETE",
+        "url": "https://example.atlassian.net/rest/api/3/issueLink/10001",
+    }
 
 
 def test_get_changelog_uses_paginated_endpoint() -> None:
@@ -650,6 +1095,86 @@ def test_add_attachment_posts_multipart_without_json_content_type(tmp_path) -> N
     assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-107/attachments"
     assert seen["token"] == "no-check"
     assert seen["content_type"].startswith("multipart/form-data; boundary=")
+
+
+@pytest.mark.parametrize("payload", [[], [{}], [{"id": ""}], [{"id": "../content"}]])
+def test_add_attachment_rejects_empty_or_idless_success_payload(tmp_path, payload) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(JiraApiError, match="attachment"):
+        client.add_attachment("FC-107", file_path)
+
+
+def test_raw_path_ids_are_rejected_before_any_http_request() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+    operations = [
+        lambda: client.get_comment("FC-1", "../transitions"),
+        lambda: client.update_comment("FC-1", "../transitions", "body"),
+        lambda: client.delete_comment("FC-1", "../transitions"),
+        lambda: client.delete_issue_link("../issue/FC-2", issue_key="FC-1"),
+        lambda: client.delete_attachment("../100", issue_key="FC-1"),
+        lambda: client.attachment_media_id("../100", issue_key="FC-1"),
+    ]
+
+    for operation in operations:
+        with pytest.raises(JiraApiError, match="positive integer Jira id"):
+            operation()
+
+    assert requests == []
+
+
+def test_path_shaped_issue_keys_are_rejected_before_any_http_request(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+    operations = [
+        lambda: client.get_issue("../myself"),
+        lambda: client.get_comment("FC-1/../FC-2", "1"),
+        lambda: client.add_comment("FC-1/../FC-2", "body"),
+        lambda: client.assign_issue("FC-1/../FC-2", None),
+        lambda: client.add_attachment("FC-1/../FC-2", file_path),
+        lambda: client.get_changelog("FC-1/../FC-2"),
+    ]
+
+    for operation in operations:
+        with pytest.raises(JiraApiError, match="Jira issue key"):
+            operation()
+
+    assert requests == []
+
+
+def test_get_comment_rejects_mismatched_response_id() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "2", "body": {}})
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(JiraApiError, match="while 1 was requested"):
+        client.get_comment("FC-1", "1")
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
 
 
 def test_delete_attachment_uses_attachment_endpoint() -> None:
@@ -878,6 +1403,38 @@ def test_replace_diagram_with_media_handles_multiple_mermaid_blocks_in_order() -
     assert not any(block["type"] == "codeBlock" for block in second["content"])
 
 
+def test_replace_diagram_with_media_can_target_one_existing_media_id() -> None:
+    adf = {
+        "type": "doc",
+        "version": 1,
+        "content": [
+            {
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{"type": "media", "attrs": {"id": "old-media"}}],
+            },
+            {
+                "type": "mediaSingle",
+                "attrs": {"layout": "center"},
+                "content": [{"type": "media", "attrs": {"id": "keep-media"}}],
+            },
+        ],
+    }
+
+    replaced = replace_diagram_with_media(
+        adf,
+        media_id="new-media",
+        alt="Updated diagram",
+        width=1600,
+        height=900,
+        replace_media_id="old-media",
+    )
+
+    assert adf_contains_media_id(replaced, "new-media")
+    assert adf_contains_media_id(replaced, "keep-media")
+    assert not adf_contains_media_id(replaced, "old-media")
+
+
 def test_image_gallery_blocks_build_linked_tables() -> None:
     manifest = {
         "title": "UI/UX Reference",
@@ -1069,6 +1626,39 @@ def test_create_issue_uses_the_target_project_credentials() -> None:
         basic_auth("finrp@example.com", "finrp-token"),
     )
     assert seen[1][2] == basic_auth("user@example.com", "token")
+
+
+def test_create_issue_rejects_parent_from_different_credential_scope_before_request() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(201, json={"key": "FC-1"})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.create_issue(
+                project_key="FC",
+                issue_type_name="Task",
+                summary="Child",
+                parent_key="FINRP-9",
+            )
+
+    assert calls == []
+
+
+def test_edit_issue_rejects_parent_from_different_credential_scope_before_request() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(204)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.edit_issue("FC-1", parent_key="FINRP-9")
+
+    assert calls == []
 
 
 def test_myself_can_target_a_project_credential_set() -> None:
@@ -2750,3 +3340,1199 @@ def test_a_non_ascii_name_is_printed_readably_and_still_copies_back() -> None:
         expect_swallowed_headings=_copy_back(message),
     )
     assert patch["swallowed_headings"] == ["Prüfung ⚠ Sicherheit"]
+
+
+# --- Optimistic concurrency guard (issue_version, expect_updated) --------------------------
+
+
+def test_issue_version_reads_updated_field() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {"updated": "2026-09-01T10:00:00.000+0200"}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.issue_version("FC-1") == "2026-09-01T10:00:00.000+0200"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1?fields=updated"
+
+
+def test_edit_issue_adf_description_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(200, json={"id": "FC-1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    adf = {"type": "doc", "version": 1, "content": []}
+    try:
+        client.edit_issue_adf_description("FC-1", adf, expect_updated="T0")
+    except JiraConcurrentEditError as exc:
+        assert exc.issue_key == "FC-1"
+        assert exc.expected_updated == "T0"
+        assert exc.found_updated == "T1"
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    # The mismatch must be caught before the PUT is ever issued.
+    assert calls == ["GET"]
+
+
+def test_edit_issue_adf_description_guard_allows_matching_update() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(200, json={"id": "FC-1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    adf = {"type": "doc", "version": 1, "content": []}
+    result = client.edit_issue_adf_description("FC-1", adf, expect_updated="T1")
+
+    assert result == {"id": "FC-1"}
+    assert calls == ["GET", "PUT"]
+
+
+def test_edit_issue_adf_description_without_guard_sends_no_extra_read() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.edit_issue_adf_description("FC-1", {"type": "doc", "version": 1, "content": []})
+
+    assert calls == ["PUT"]
+
+
+def test_edit_issue_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    try:
+        client.edit_issue("FC-1", summary="Updated", expect_updated="T0")
+    except JiraConcurrentEditError:
+        pass
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    assert calls == ["GET"]
+
+
+def test_set_issue_type_puts_issuetype_name() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.set_issue_type("FC-1", "Bug") == {}
+    assert seen["method"] == "PUT"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1"
+    assert seen["json"] == {"fields": {"issuetype": {"name": "Bug"}}}
+
+
+def test_set_issue_type_guard_blocks_stale_write_without_putting() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"fields": {"updated": "T1"}})
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    try:
+        client.set_issue_type("FC-1", "Bug", expect_updated="T0")
+    except JiraConcurrentEditError:
+        pass
+    else:
+        raise AssertionError("Expected JiraConcurrentEditError")
+
+    assert calls == ["GET"]
+
+
+def test_get_edit_metadata_uses_editmeta_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.get_edit_metadata("FC-1")
+
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1/editmeta"
+
+
+def test_is_issue_type_allowed_matches_allowed_values_case_insensitively() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "fields": {
+                    "issuetype": {
+                        "allowedValues": [
+                            {"id": "10001", "name": "Story"},
+                            {"id": "10002", "name": "Bug"},
+                        ]
+                    }
+                }
+            },
+        )
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.is_issue_type_allowed("FC-1", "bug") is True
+    assert client.is_issue_type_allowed("FC-1", "Epic") is False
+
+
+# --- Comment delete, and update_comment's ADF rendering vs add_comment ----------------------
+
+
+def test_delete_comment_uses_delete_verb_and_path() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.delete_comment("FC-1", "667040") == {}
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/issue/FC-1/comment/667040"
+
+
+def test_update_comment_renders_markdown_to_adf_the_same_way_as_add_comment() -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content.decode())["body"])
+        return httpx.Response(200, json={"id": "1"})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    markdown = "**Bold** and a [link](https://example.com)\n\n- one\n- two"
+    client.add_comment("FC-1", markdown)
+    client.update_comment("FC-1", "1", markdown)
+
+    assert bodies[0] == bodies[1] == text_to_adf(markdown)
+
+
+# --- Comment paging and ordering ------------------------------------------------------------
+
+
+def test_list_comments_passes_order_by_only_when_set() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"comments": [], "total": 0})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    client.list_comments("FC-1", limit=5)
+    client.list_comments("FC-1", limit=5, order_by="-created")
+
+    assert "orderBy" not in seen[0]
+    assert seen[1].endswith("orderBy=-created")
+
+
+def test_list_all_comments_pages_until_total_is_reached() -> None:
+    pages = [
+        {"comments": [{"id": "1"}, {"id": "2"}], "total": 5},
+        {"comments": [{"id": "3"}, {"id": "4"}], "total": 5},
+        {"comments": [{"id": "5"}], "total": 5},
+    ]
+    seen_start_at: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_start_at.append(int(params["startAt"]))
+        return httpx.Response(200, json=pages[len(seen_start_at) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=2)
+
+    assert [comment["id"] for comment in result["comments"]] == ["1", "2", "3", "4", "5"]
+    assert result["total"] == 5
+    assert seen_start_at == [0, 2, 4]
+
+
+def test_list_all_comments_stops_on_an_empty_page() -> None:
+    pages = [
+        {"comments": [{"id": "1"}], "total": 5},
+        {"comments": [], "total": 5},
+    ]
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(200, json=pages[calls["count"]])
+        calls["count"] += 1
+        return response
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=1)
+
+    assert [comment["id"] for comment in result["comments"]] == ["1"]
+    assert result["total"] == 5
+    assert calls["count"] == 2
+
+
+def test_list_all_comments_keeps_the_first_pages_total_not_the_last() -> None:
+    """F6 regression: the old code kept overwriting `total` with each page's own `total`, so the
+    LAST page's value won, not the first's. A deletion between pages can make that last value
+    smaller than the first: `comment_count: 90` alongside `comments_returned: 100` reads as
+    `comments_truncated: false` while claiming fewer comments exist than were just returned.
+    """
+    pages = [
+        {"comments": [{"id": str(i)} for i in range(1, 51)], "total": 100},
+        {"comments": [{"id": str(i)} for i in range(51, 101)], "total": 90},
+    ]
+    calls = {"count": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(200, json=pages[calls["count"]])
+        calls["count"] += 1
+        return response
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=50)
+
+    assert len(result["comments"]) == 100
+    assert result["total"] == 100
+    assert result["total"] >= len(result["comments"])
+
+
+def test_list_all_comments_total_is_never_less_than_comments_returned() -> None:
+    """F6 regression, the exact synthetic case from the finding: a page reporting `total: 0`
+    alongside one actual comment used to report `total: 0` with `comments_returned: 1` — fewer
+    comments claimed to exist than were just handed back in the same response.
+    """
+    pages = [{"comments": [{"id": "1"}], "total": 0}]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages[0])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.list_all_comments("FC-1", page_size=50)
+
+    assert len(result["comments"]) == 1
+    assert result["total"] == 1
+
+
+# --- Search paging with no fabricated total, and the approximate-count endpoint -------------
+
+
+def test_search_all_issues_follows_next_page_token_until_is_last() -> None:
+    pages = [
+        {"issues": [{"key": "FC-1"}, {"key": "FC-2"}], "isLast": False, "nextPageToken": "tok-1"},
+        {"issues": [{"key": "FC-3"}, {"key": "FC-4"}], "isLast": False, "nextPageToken": "tok-2"},
+        {"issues": [{"key": "FC-5"}], "isLast": True},
+    ]
+    seen_tokens: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_tokens.append(params.get("nextPageToken"))
+        return httpx.Response(200, json=pages[len(seen_tokens) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC ORDER BY created ASC", page_size=2)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3", "FC-4", "FC-5"]
+    assert result["returned"] == 5
+    # This method's own result spells it `is_last`, snake_case like the rest of this tool's
+    # result documents; only the raw Jira pages above keep Jira's own `isLast` casing.
+    assert result["is_last"] is True
+    assert "isLast" not in result
+    assert "nextPageToken" not in result
+    assert "total" not in result
+    assert seen_tokens == [None, "tok-1", "tok-2"]
+
+
+def test_search_all_issues_limit_truncates_and_keeps_next_page_token() -> None:
+    pages = [
+        {"issues": [{"key": "FC-1"}, {"key": "FC-2"}], "isLast": False, "nextPageToken": "tok-1"},
+        {"issues": [{"key": "FC-3"}], "isLast": False, "nextPageToken": "tok-2"},
+    ]
+    seen_max_results: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        seen_max_results.append(int(params["maxResults"]))
+        return httpx.Response(200, json=pages[len(seen_max_results) - 1])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC", limit=3, page_size=2)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2", "FC-3"]
+    assert result["returned"] == 3
+    assert result["nextPageToken"] == "tok-2"
+    assert result["is_last"] is False
+    assert "isLast" not in result
+    assert seen_max_results == [2, 1]
+    assert "total" not in result
+
+
+def test_search_all_issues_missing_is_last_stops_without_looping_and_reports_unknown() -> None:
+    """R1 regression: a page with no `isLast` and no `nextPageToken` must not be read as complete.
+
+    Before the fix, `is_last = bool(page.get("isLast", True))` defaulted the missing signal to
+    `True`, which happened to terminate the loop correctly here but reported false completeness.
+    A more dangerous variant of the same bug is covered by the next test: `if is_last: break` used
+    to be the *only* termination check, and `None` is falsy, so a missing signal with no token to
+    resume with would have looped again with `next_page_token=None`, re-fetching the same first
+    page up to `_MAX_SEARCH_PAGES` times instead of stopping after one request.
+    """
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"issues": [{"key": "FC-1"}]})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC")
+
+    assert request_count == 1
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1"]
+    assert result["returned"] == 1
+    assert result["is_last"] is None
+    assert "isLast" not in result
+    assert "nextPageToken" not in result
+    assert "total" not in result
+
+
+def test_search_all_issues_missing_is_last_with_token_keeps_paging_to_explicit_signal() -> None:
+    """A missing `isLast` with a `nextPageToken` present still has something to resume with, so
+    the walk keeps going (per the documented termination rule) until a page gives an explicit
+    signal — here `isLast: True` on the second page.
+    """
+    pages = [
+        {"issues": [{"key": "FC-1"}], "nextPageToken": "tok-1"},  # isLast absent
+        {"issues": [{"key": "FC-2"}], "isLast": True},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = dict(request.url.params)
+        index = 0 if params.get("nextPageToken") is None else 1
+        return httpx.Response(200, json=pages[index])
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = client.search_all_issues("project = FC", page_size=1)
+
+    assert [issue["key"] for issue in result["issues"]] == ["FC-1", "FC-2"]
+    assert result["is_last"] is True
+    assert "nextPageToken" not in result
+
+
+def test_approximate_issue_count_posts_jql_and_returns_raw_count() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"count": 812})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.approximate_issue_count("project = FC") == 812
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/api/3/search/approximate-count"
+    assert seen["json"] == {"jql": "project = FC"}
+
+
+# --- Agile API: boards, sprints, backlog -----------------------------------------------------
+
+
+def test_list_boards_uses_agile_board_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_boards(board_type="scrum", name="FC board", max_results=25)
+
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/agile/1.0/board?maxResults=25&type=scrum&name=FC+board"
+    )
+
+
+def test_list_board_sprints_uses_agile_sprint_endpoint() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_board_sprints(814, state="active")
+
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/agile/1.0/board/814/sprint?maxResults=50&state=active"
+    )
+
+
+def test_get_issue_sprints_parses_the_sprint_field() -> None:
+    seen: dict[str, str] = {}
+    sprint = {
+        "id": 7340,
+        "name": "10 SEPA-Mandate, Disbursement",
+        "state": "active",
+        "boardId": 814,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"fields": {"customfield_10020": [sprint]}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == [sprint]
+    assert seen["url"] == (
+        "https://example.atlassian.net/rest/api/3/issue/FC-1?fields=customfield_10020"
+    )
+
+
+def test_get_issue_sprints_returns_empty_list_when_field_absent() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"fields": {}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == []
+
+
+def test_get_issue_sprints_returns_empty_list_when_field_is_null() -> None:
+    """Verified fact: an issue in no sprint on this Jira site returns the sprint field PRESENT
+    with the value `null` -- not `[]`, not absent -- confirmed via `jql=project = FC AND Sprint
+    IS EMPTY`. This already passes against the current code (`isinstance(None, list)` is False,
+    so it falls through to `[]` exactly like an absent field or an empty list), so this is
+    recorded as a regression test rather than left unverified, per the hardening brief's own
+    instruction to check what the current code does with `null` before assuming it needs a fix.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"fields": {"customfield_10020": None}})
+
+    client = JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    assert client.get_issue_sprints("FC-1") == []
+
+
+def test_is_in_sprint_matches_by_id_regardless_of_int_or_str() -> None:
+    sprints = [{"id": 7340, "name": "10 SEPA-Mandate, Disbursement", "state": "active"}]
+
+    assert is_in_sprint(sprints, 7340) is True
+    assert is_in_sprint(sprints, "7340") is True
+    assert is_in_sprint(sprints, 9001) is False
+    assert is_in_sprint([], 7340) is False
+
+
+def test_sprint_membership_report_reads_each_key_and_reports_membership() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        def get_issue_sprints(self, issue_key, *, sprint_field):
+            self.calls.append((issue_key, sprint_field))
+            if issue_key == "FC-1":
+                return [{"id": 7340, "name": "Sprint 7340", "state": "active"}]
+            return []
+
+    client = FakeClient()
+
+    report = sprint_membership_report(
+        client, ["FC-1", "FC-2"], 7340, sprint_field="customfield_10020"
+    )
+
+    assert report == [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [{"id": 7340, "name": "Sprint 7340", "state": "active"}],
+            "in_sprint": True,
+        },
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+    assert client.calls == [("FC-1", "customfield_10020"), ("FC-2", "customfield_10020")]
+
+
+def test_sprint_verification_results_marks_verified_against_expected_polarity() -> None:
+    report = [
+        {"key": "FC-1", "sprint_id": 7340, "sprints": [{"id": 7340}], "in_sprint": True},
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+
+    added = sprint_verification_results(report, expected_in_sprint=True)
+    assert [entry["verified"] for entry in added] == [True, False]
+    assert [entry["expected_in_sprint"] for entry in added] == [True, True]
+
+    removed = sprint_verification_results(report, expected_in_sprint=False)
+    assert [entry["verified"] for entry in removed] == [False, True]
+
+
+def test_sprint_precondition_error_names_the_mismatched_keys() -> None:
+    report = [
+        {"key": "FC-1", "sprint_id": 7340, "sprints": [{"id": 7340}], "in_sprint": True},
+        {"key": "FC-2", "sprint_id": 7340, "sprints": [], "in_sprint": False},
+    ]
+
+    error = SprintPreconditionError(7340, report)
+
+    assert "FC-2" in str(error)
+    assert "FC-1" not in str(error)
+    assert error.sprint_id == 7340
+    assert error.report == report
+
+
+def test_add_issues_to_sprint_posts_issue_keys() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        assert client.add_issues_to_sprint(7340, ["FC-1", "FC-2"]) == {}
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/agile/1.0/sprint/7340/issue"
+    assert seen["json"] == {"issues": ["FC-1", "FC-2"]}
+
+
+def test_add_issues_to_sprint_rejects_path_shaped_id_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="positive integer Jira id"):
+            client.add_issues_to_sprint("../backlog", ["FC-1"])
+
+    assert calls == 0
+
+
+def test_atomic_agile_batch_rejects_mixed_credentials_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.add_issues_to_sprint(7340, ["FC-1", "FINRP-9"])
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.move_issues_to_backlog(["FC-1", "FINRP-9"])
+
+    assert calls == 0
+
+
+def test_issue_link_rejects_mixed_credentials_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(201)
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="different sites or credential sets"):
+            client.link_issues(outward_issue_key="FC-1", inward_issue_key="FINRP-9")
+
+    assert calls == 0
+
+
+def test_agile_batch_rejects_more_than_fifty_keys_before_any_request() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(204)
+
+    keys = [f"FC-{index}" for index in range(1, 52)]
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(JiraApiError, match="at most 50"):
+            client.add_issues_to_sprint(7340, keys)
+
+    assert calls == 0
+
+
+def test_sprint_add_verification_fails_if_replaced_sprint_is_still_present() -> None:
+    old = {"id": 7339, "name": "Sprint 7339", "state": "active"}
+    target = {"id": 7340, "name": "Sprint 7340", "state": "active"}
+    precondition = [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [old],
+            "in_sprint": False,
+            "sprints_replaced": [old],
+        }
+    ]
+    post_write = [
+        {
+            "key": "FC-1",
+            "sprint_id": 7340,
+            "sprints": [old, target],
+            "in_sprint": True,
+        }
+    ]
+
+    result = sprint_add_verification_results(precondition, post_write)
+
+    assert result[0]["in_sprint"] is True
+    assert result[0]["still_in_replaced_sprints"] == [old]
+    assert result[0]["verified"] is False
+
+
+def test_move_issues_to_backlog_posts_issue_keys() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content.decode())
+        return httpx.Response(204)
+
+    with JiraClient(make_config(), transport=httpx.MockTransport(handler)) as client:
+        assert client.move_issues_to_backlog(["FC-1"]) == {}
+
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://example.atlassian.net/rest/agile/1.0/backlog/issue"
+    assert seen["json"] == {"issues": ["FC-1"]}
+
+
+def test_agile_calls_use_the_agile_base_and_still_honour_project_credential_overrides() -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((str(request.url), request.headers["Authorization"]))
+        return httpx.Response(200, json={"values": []})
+
+    with JiraClient(make_override_config(), transport=httpx.MockTransport(handler)) as client:
+        client.list_boards()
+        client.add_issues_to_sprint(1, ["FINRP-9"])
+        client.get_issue("FC-1")
+
+    assert seen[0] == (
+        "https://example.atlassian.net/rest/agile/1.0/board?maxResults=50",
+        basic_auth("user@example.com", "token"),
+    )
+    assert seen[1] == (
+        "https://example.atlassian.net/rest/agile/1.0/sprint/1/issue",
+        basic_auth("finrp@example.com", "finrp-token"),
+    )
+    assert seen[2] == (
+        "https://example.atlassian.net/rest/api/3/issue/FC-1",
+        basic_auth("user@example.com", "token"),
+    )
+
+
+def test_agile_call_uses_per_project_site_url_override() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"issues": []})
+
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_PROJECT__FINRP__EMAIL": "finrp@example.com",
+            "JIRA_PROJECT__FINRP__API_TOKEN": "finrp-token",
+            "JIRA_PROJECT__FINRP__SITE_URL": "https://other.atlassian.net",
+        }
+    )
+    with JiraClient(config, transport=httpx.MockTransport(handler)) as client:
+        client.add_issues_to_sprint(1, ["FINRP-9"])
+
+    assert seen["url"] == "https://other.atlassian.net/rest/agile/1.0/sprint/1/issue"
+
+
+# --- Backwards-transition direction check (jira-agent FC-492 incident) ----------------------
+#
+# FC-492 was moved backwards to Open this afternoon by an agent looping over "the first
+# available transition". Nobody asked for that and nobody noticed until later. These tests pin
+# the direction check that now refuses such a move by default, using the exact response shapes
+# probed today against the real instance: `to.statusCategory.name` present on an offered
+# transition, and `statusCategory.id` values (2/4/3) that must NOT be used as an ordering.
+
+
+def test_status_category_rank_orders_the_three_fixed_categories_case_insensitively() -> None:
+    assert status_category_rank("To Do") == 0
+    assert status_category_rank("in progress") == 1
+    assert status_category_rank("DONE") == 2
+    todo_rank = status_category_rank("To Do")
+    progress_rank = status_category_rank("In Progress")
+    done_rank = status_category_rank("Done")
+    assert todo_rank < progress_rank < done_rank
+
+
+def test_status_category_rank_returns_none_for_missing_or_unrecognized_name() -> None:
+    assert status_category_rank(None) is None
+    assert status_category_rank("") is None
+    assert status_category_rank("Backlog") is None  # not one of Jira's three fixed categories
+
+
+def test_issue_status_category_reads_nested_status_category_name() -> None:
+    issue = {
+        "fields": {"status": {"name": "In Progress", "statusCategory": {"name": "In Progress"}}}
+    }
+    assert issue_status_category(issue) == "In Progress"
+    assert issue_status_category({"fields": {}}) is None
+    assert issue_status_category({}) is None
+
+
+def test_transition_target_category_reads_nested_to_status_category_name() -> None:
+    transition = {"to": {"name": "Closed", "statusCategory": {"name": "Done"}}}
+    assert transition_target_category(transition) == "Done"
+    assert transition_target_category({"to": {"name": "Closed"}}) is None
+    assert transition_target_category({}) is None
+
+
+def test_describe_transition_options_lists_id_name_target_and_category() -> None:
+    data = {
+        "transitions": [
+            {
+                "id": "21",
+                "name": "Start Progress",
+                "to": {"name": "In Progress", "statusCategory": {"name": "In Progress"}},
+            },
+            {
+                "id": "31",
+                "name": "Done",
+                "to": {"name": "Done", "statusCategory": {"name": "Done"}},
+            },
+        ]
+    }
+    assert describe_transition_options(data) == [
+        {"id": "21", "name": "Start Progress", "to": "In Progress", "to_category": "In Progress"},
+        {"id": "31", "name": "Done", "to": "Done", "to_category": "Done"},
+    ]
+
+
+def test_describe_transition_options_returns_empty_list_for_malformed_transitions() -> None:
+    """Probed fact: FC-425 and FC-389 both returned an EMPTY transitions list from the live
+    instance. This must produce an empty list here, not an error, so a caller can distinguish
+    "no options" from "response was malformed".
+    """
+    assert describe_transition_options({"transitions": []}) == []
+    assert describe_transition_options({}) == []
+    assert describe_transition_options({"transitions": "not-a-list"}) == []
+
+
+def test_check_transition_direction_allows_forward_and_same_category_without_the_flag() -> None:
+    forward = {
+        "id": "21",
+        "name": "Start Progress",
+        "to": {"statusCategory": {"name": "In Progress"}},
+    }
+    check_transition_direction(
+        issue_key="FC-1", transition=forward, current_category="To Do", allow_backwards=False
+    )  # must not raise
+
+    same = {"id": "5", "name": "Reassign", "to": {"statusCategory": {"name": "In Progress"}}}
+    check_transition_direction(
+        issue_key="FC-1", transition=same, current_category="In Progress", allow_backwards=False
+    )  # must not raise
+
+
+def test_check_transition_direction_allows_wont_do_straight_to_do_to_done() -> None:
+    """FC-458's real, probed transition: "Won't Do" moves a "Prepare" (To Do category) issue
+    straight to "Closed" (Done category). This skips "In Progress" entirely but is still FORWARD
+    and must be allowed without --allow-backwards-transition.
+    """
+    wont_do = {
+        "id": "811",
+        "name": "Won't Do",
+        "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+    }
+    check_transition_direction(
+        issue_key="FC-458", transition=wont_do, current_category="To Do", allow_backwards=False
+    )  # must not raise
+
+
+def test_check_transition_direction_refuses_backward_without_the_flag() -> None:
+    reopen = {"id": "11", "name": "Reopen", "to": {"statusCategory": {"name": "To Do"}}}
+    try:
+        check_transition_direction(
+            issue_key="FC-492",
+            transition=reopen,
+            current_category="In Progress",
+            allow_backwards=False,
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "backward"
+        assert exc.issue_key == "FC-492"
+        assert exc.current_category == "In Progress"
+        assert exc.target_category == "To Do"
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_allows_backward_with_the_flag() -> None:
+    reopen = {"id": "11", "name": "Reopen", "to": {"statusCategory": {"name": "To Do"}}}
+    check_transition_direction(
+        issue_key="FC-492",
+        transition=reopen,
+        current_category="In Progress",
+        allow_backwards=True,
+    )  # must not raise
+
+
+def test_check_transition_direction_refuses_when_current_category_is_missing() -> None:
+    """Probed fact: FC-425 and FC-389 both hit exactly this shape when transitions ARE offered
+    but the caller's own issue read did not resolve a category. Must refuse, not guess.
+    """
+    transition = {"id": "9", "name": "Close", "to": {"statusCategory": {"name": "Done"}}}
+    try:
+        check_transition_direction(
+            issue_key="FC-1", transition=transition, current_category=None, allow_backwards=False
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "unknown"
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_refuses_when_target_category_is_missing() -> None:
+    transition = {"id": "9", "name": "Mystery", "to": {"name": "Somewhere"}}
+    try:
+        check_transition_direction(
+            issue_key="FC-1",
+            transition=transition,
+            current_category="To Do",
+            allow_backwards=False,
+        )
+    except TransitionDirectionRefusedError as exc:
+        assert exc.direction == "unknown"
+        assert exc.target_category is None
+    else:
+        raise AssertionError("Expected TransitionDirectionRefusedError")
+
+
+def test_check_transition_direction_unknown_direction_allowed_with_the_flag() -> None:
+    transition = {"id": "9", "name": "Mystery", "to": {"name": "Somewhere"}}
+    check_transition_direction(
+        issue_key="FC-1",
+        transition=transition,
+        current_category="To Do",
+        allow_backwards=True,
+    )  # must not raise
+
+
+# --- Required transition fields (FC-458's `resolution`) --------------------------------------
+
+
+def _wont_do_transition() -> dict[str, Any]:
+    return {
+        "id": "811",
+        "name": "Won't Do",
+        "to": {"name": "Closed", "statusCategory": {"name": "Done"}},
+        "fields": {
+            "resolution": {
+                "required": True,
+                "schema": {"type": "resolution", "system": "resolution"},
+                "allowedValues": [
+                    {"id": "10000", "name": "Done"},
+                    {"id": "10001", "name": "Won't Do"},
+                ],
+            },
+            "worklog": {"required": False, "schema": {"type": "worklog"}},
+        },
+    }
+
+
+def test_transition_required_fields_missing_names_field_and_allowed_values() -> None:
+    missing = transition_required_fields_missing(_wont_do_transition(), None)
+    assert missing == [{"field": "resolution", "allowed_values": ["Done", "Won't Do"]}]
+
+
+def test_transition_required_fields_missing_is_empty_once_supplied() -> None:
+    missing = transition_required_fields_missing(
+        _wont_do_transition(), {"resolution": "Won't Do"}
+    )
+    assert missing == []
+
+
+def test_transition_required_fields_missing_treats_none_and_blank_values_as_missing() -> None:
+    """A required field must carry a value, not merely occur as a key in the caller's mapping.
+
+    This catches both a CLI `--field resolution=` and an MCP `{\"resolution\": \" \"}` before
+    either surface can attempt the Jira write. Numeric zero and boolean false are covered by the
+    helper's implementation rather than this resolution-shaped fixture.
+    """
+    assert transition_required_fields_missing(_wont_do_transition(), {"resolution": None}) == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+    assert transition_required_fields_missing(_wont_do_transition(), {"resolution": "  "}) == [
+        {"field": "resolution", "allowed_values": ["Done", "Won't Do"]}
+    ]
+
+
+def test_transition_required_fields_missing_ignores_non_required_fields() -> None:
+    """`worklog` is present but NOT required (probed fact); it must never appear as missing."""
+    missing = transition_required_fields_missing(_wont_do_transition(), {"resolution": "Done"})
+    assert missing == []
+
+
+def test_transition_required_fields_missing_is_empty_when_transition_has_no_fields_metadata() -> (
+    None
+):
+    """A transition read without `expand=transitions.fields` (or one Jira genuinely has no
+    required fields for) has no `fields` key at all; nothing can be checked, so nothing is
+    reported missing.
+    """
+    assert transition_required_fields_missing({"id": "31", "name": "Done"}, None) == []
+
+
+def test_transition_fields_missing_error_message_names_field_and_allowed_values() -> None:
+    exc = TransitionFieldsMissingError(
+        transition_name="Won't Do",
+        missing=[{"field": "resolution", "allowed_values": ["Done", "Won't Do"]}],
+    )
+    message = str(exc)
+    assert "resolution" in message
+    assert "Won't Do" in message
+    assert "Done" in message
+
+
+def test_transition_fields_payload_wraps_reference_field_using_its_own_schema() -> None:
+    """`resolution` is shaped as `{"name": ...}` because ITS metadata carries `allowedValues` --
+    not because the field happens to be named "resolution". A plain string field with no
+    `allowedValues` is sent literally.
+    """
+    transition = _wont_do_transition()
+    transition["fields"]["comment"] = {"required": False, "schema": {"type": "string"}}
+
+    payload = transition_fields_payload(
+        transition, {"resolution": "Won't Do", "comment": "closing as won't do"}
+    )
+
+    assert payload == {
+        "resolution": {"name": "Won't Do"},
+        "comment": "closing as won't do",
+    }
+
+
+def test_transition_fields_payload_does_not_mis_shape_non_resolution_allowed_values() -> None:
+    """`allowedValues` alone does not mean Jira accepts a `{name: ...}` reference object.
+
+    The transition metadata API documents it on fields such as multi-select arrays too. This
+    helper supports the known resolution shape and must leave other values untouched rather than
+    inventing a universal reference representation.
+    """
+    transition = {
+        "id": "711",
+        "fields": {
+            "summary": {
+                "required": False,
+                "allowedValues": ["red", "blue"],
+                "schema": {"type": "string"},
+            }
+        },
+    }
+
+    assert transition_fields_payload(transition, {"summary": "red"}) == {"summary": "red"}
+
+
+def test_transition_fields_payload_passes_through_a_field_absent_from_metadata_as_plain_value() -> (
+    None
+):
+    """A caller-supplied field name the transition's own metadata does not mention at all (no
+    `expand`, or a field Jira did not describe) is passed through literally rather than dropped.
+    """
+    payload = transition_fields_payload({"id": "31", "name": "Done"}, {"comment": "done"})
+    assert payload == {"comment": "done"}

@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "jira_assign_issue",
     "jira_agent_report",
     "jira_edit_issue",
+    "jira_clear_issue_parent",
     "jira_patch_description_section",
     "jira_agent_plan_comment",
     "jira_write_human_brief",
@@ -35,10 +36,15 @@ EXPECTED_TOOLS = {
     "jira_add_comment",
     "jira_list_transitions",
     "jira_link_issue",
+    "jira_delete_issue_link",
     "jira_attach_file",
     "jira_render_mermaid_diagrams",
     "jira_changelog",
     "jira_transition_issue",
+    "jira_get_issue_sprints",
+    "jira_add_issues_to_sprint",
+    "jira_move_issues_to_backlog",
+    "jira_config_fields",
 }
 
 

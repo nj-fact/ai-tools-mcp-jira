@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from jira_agent.audit import audit_write
+from jira_agent.audit import audit_committed_write, audit_write
 from jira_agent.config import JiraConfig
 
 
@@ -55,3 +55,41 @@ def test_audit_write_records_credential_source_without_secrets(tmp_path) -> None
     assert records[0]["credential_source"] == "FINRP"
     assert records[1]["credential_source"] == "default"
     assert "finrp-secret-token" not in raw
+
+
+def test_audit_committed_write_returns_explicit_warning_instead_of_retryable_failure(
+    tmp_path,
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+    def failing_writer(*_args, **_kwargs) -> None:
+        raise OSError("audit disk unavailable")
+
+    remote_result = {"id": "7001"}
+    warning = audit_committed_write(
+        config,
+        action="embed_diagram",
+        issue_key="FC-107",
+        result=remote_result,
+        writer=failing_writer,
+    )
+
+    assert warning == {
+        "error_type": "audit_write_failed_after_commit",
+        "committed": True,
+        "action": "embed_diagram",
+        "message": (
+            "Jira accepted the mutation, but writing the local audit record failed: "
+            "OSError: audit disk unavailable"
+        ),
+    }
+    assert remote_result["id"] == "7001"
+    assert remote_result["partial_success"] is True
+    assert remote_result["audit_warning"] == warning

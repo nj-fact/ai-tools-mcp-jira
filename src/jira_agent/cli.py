@@ -7,21 +7,55 @@ from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
-from jira_agent.audit import audit_write
+from jira_agent.audit import (
+    audit_committed_write,
+    audit_write,
+    committed_sequence_warning,
+    committed_verification_warning,
+)
 from jira_agent.client import (
+    DEFAULT_FIELDS,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
     JiraClient,
+    JiraConcurrentEditError,
+    JiraMissingConcurrencyTokenError,
+    SprintMultiRemovalError,
+    SprintPreconditionError,
+    SprintReassignmentError,
+    TransitionDirectionRefusedError,
+    TransitionFieldsMissingError,
+    adf_contains_media_id,
+    check_transition_direction,
     create_issue_payload,
+    describe_transition_options,
     edit_issue_payload,
     issue_link_payload,
+    issue_status_category,
+    issue_type_allowed_values,
+    normalize_jira_issue_key,
+    normalize_jira_numeric_id,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
+    require_concurrency_token,
+    require_matching_jira_numeric_id,
+    require_shared_write_scope,
     select_transition,
+    sprint_add_blast_radius,
+    sprint_add_verification_results,
+    sprint_membership_report,
+    sprint_removal_blast_radius,
+    sprint_removal_verification_results,
+    transition_fields_payload,
+    transition_required_fields_missing,
+    transition_target_category,
+    validate_agile_issue_batch,
+    validate_attachment_upload_response,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -42,10 +76,13 @@ from jira_agent.safety import (
     ensure_project_write_allowed,
 )
 from jira_agent.workflows import (
+    drift_label_operations,
     drift_reconcile_comment_body,
     factory_contract_comment_body,
+    issue_contains_link_id,
     read_text_source,
-    update_drift_labels,
+    resolve_directed_issue_link,
+    resolve_png_attachment,
 )
 
 app = typer.Typer(
@@ -54,15 +91,39 @@ app = typer.Typer(
 )
 console = Console()
 error_console = Console(stderr=True)
+# Structured output is data, not presentation. A markup interpreter rewrites a name containing
+# [...], word-wrap injects newlines into long values, and highlighting adds ANSI on a terminal;
+# all three silently change bytes a caller is expected to copy back. This console opts out of
+# every one of them in one named place instead of at each call site.
+data_console = Console(markup=False, highlight=False, soft_wrap=True)
+# Table cells hold Jira text too, and rich reads markup in them: a summary "Costs [in EUR/m2]"
+# renders as "Costs". Tables still need width handling, so this console keeps wrapping and only
+# drops the interpretation.
+table_console = Console(markup=False, highlight=False)
 
-DEFAULT_FIELDS = ["summary", "status", "assignee", "issuetype", "project", "updated"]
+
+def _audit_committed_write(config: Any, **kwargs: Any) -> dict[str, Any] | None:
+    """Audit an accepted Jira mutation without ever turning it into retryable failure."""
+    warning = audit_committed_write(config, **kwargs, writer=audit_write)
+    if warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {warning['message']}")
+    return warning
+
+# The literal every command below uses as its own `--fields` default, computed once so every
+# comparison against "the caller did not narrow --fields" reads the same value `DEFAULT_FIELDS`
+# itself would produce. Commands that request this exact default (rather than an explicit
+# narrower --fields) also get the config-resolved sprint field appended to what they ask Jira
+# for -- see `issue` and `_run_search`. It is never folded into `DEFAULT_FIELDS` itself: that
+# constant is shared with the MCP surface and other non-issue/search callers, and the sprint
+# field id is instance-specific, resolved from config at call time, not a shared literal.
+_DEFAULT_FIELDS_CSV = ",".join(DEFAULT_FIELDS)
 
 
 def _client() -> JiraClient:
     try:
         config = load_config()
     except Exception as exc:
-        error_console.print(f"[red]Config error:[/red] {exc}")
+        _print_error("Config error:", exc)
         raise typer.Exit(2) from exc
     return JiraClient(config)
 
@@ -71,12 +132,43 @@ def _config():
     try:
         return load_config()
     except Exception as exc:
-        error_console.print(f"[red]Config error:[/red] {exc}")
+        _print_error("Config error:", exc)
         raise typer.Exit(2) from exc
 
 
 def _print_json(data: Any) -> None:
-    console.print(json.dumps(data, indent=2, ensure_ascii=False))
+    """Print structured output byte-exactly. Never through a formatter."""
+    data_console.print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _emit_json(data: Any) -> None:
+    """Write exactly one JSON document to stdout and nothing else.
+
+    This is the call every ``--json`` code path uses for its result. By the time it runs, every
+    prose line for that invocation has already gone to stderr through ``_say``, so stdout ends
+    up carrying only this document, with no `find('{')` slicing required on the caller's side.
+    """
+    _print_json(data)
+
+
+def _say(message: str, *, json_mode: bool) -> None:
+    """Print one line of human prose: stdout normally, stderr when the caller passed --json.
+
+    A --json caller needs stdout to hold nothing but the JSON document, so every prose line a
+    command would otherwise print goes through this one named place instead of a conditional at
+    each call site. With ``json_mode=False`` this is exactly ``console.print``, so it changes
+    nothing about normal-mode output.
+    """
+    (error_console if json_mode else console).print(message)
+
+
+def _print_error(label: str, detail: object) -> None:
+    """Print a labelled error without letting the detail be read as markup.
+
+    Every detail here is untrusted: exception text carries Jira heading and issue text, and a
+    name like "[/red] Detail" raises MarkupError inside the handler that was meant to report it.
+    """
+    error_console.print(f"[red]{label}[/red] {escape(str(detail))}")
 
 
 def _field_list(value: str | None) -> list[str] | None:
@@ -86,6 +178,26 @@ def _field_list(value: str | None) -> list[str] | None:
     return fields or None
 
 
+def _parse_transition_fields(values: list[str] | None) -> dict[str, str]:
+    """Parse repeatable `--field NAME=VALUE` options into a `{name: value}` mapping.
+
+    A malformed entry (no `=`, or an empty NAME) is a local usage error -- it needs no Jira read
+    to detect -- so it exits 2, the same code every other pure-argument-shape refusal in this
+    file uses, distinct from the transition-specific refusals below that need a live transitions
+    read first. A name repeated across multiple `--field` options keeps its LAST value, the same
+    "last one wins" rule `dict` assignment already gives every other repeated-key case here.
+    """
+    fields: dict[str, str] = {}
+    for raw in values or []:
+        name, separator, value = raw.partition("=")
+        name = name.strip()
+        if not separator or not name:
+            _print_error("Invalid --field:", f"{raw!r} (expected NAME=VALUE)")
+            raise typer.Exit(2)
+        fields[name] = value
+    return fields
+
+
 def _csv_list(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -93,13 +205,71 @@ def _csv_list(value: str | None) -> list[str] | None:
     return items
 
 
-def _issue_row(issue: dict[str, Any]) -> dict[str, str]:
+# Sentinel so a sprint-field key genuinely absent from a `fields` dict is distinguishable from
+# one present with a `None` or empty-list value. `dict.get(key, _SPRINT_FIELD_MISSING)` returns
+# this object only when the key was never in the response at all. Shared by `_sprint_cell`,
+# `issue-sprint`, and `_warn_missing_fields`'s callers, so all three treat "absent" the same way.
+_SPRINT_FIELD_MISSING = object()
+
+
+def _warn_missing_fields(
+    requested_fields: list[str] | None, returned_fields: set[str], *, json_mode: bool
+) -> list[str]:
+    """Compare what a command asked Jira for against what actually came back, and print the one
+    shared "Jira did not return requested field(s)" banner when something is missing.
+
+    Originally written for `issue` alone; `_run_search` (and therefore `search`, `mine`,
+    `fc-open`, `by-status`, `recent`, and `test-scope`) reuses this exact function rather than
+    growing a second copy of the same check, so a caller of any of those commands gets the same
+    warning `issue` already gave when, for example, `JIRA_SPRINT_FIELD` names a field id this
+    Jira site does not recognize -- Jira returns HTTP 200 and just leaves the field out, with no
+    error of its own to warn the caller instead.
+    """
+    if not requested_fields:
+        return []
+    missing_fields = [name for name in requested_fields if name not in returned_fields]
+    if missing_fields:
+        _say(
+            "[yellow]Jira did not return requested field(s):[/yellow] "
+            f"{', '.join(missing_fields)}",
+            json_mode=json_mode,
+        )
+    return missing_fields
+
+
+def _sprint_cell(fields: dict[str, Any], sprint_field: str) -> str:
+    """Render an issue's sprint field as its name(s) and state, never the raw Jira object.
+
+    Keeps the same three states `issue-sprint` keeps apart, rather than collapsing "we don't
+    know" into "no sprint": the field genuinely absent from this row's response (this Jira
+    site's sprint field id may differ from `sprint_field`, or `JIRA_SPRINT_FIELD` may be
+    misconfigured -- Jira returns HTTP 200 and silently drops an unknown field id, with no error
+    of its own) renders distinctly from `null` or an empty list, Jira's own shape for "in no
+    sprint" on this site, verified via `Sprint IS EMPTY` JQL. Collapsing those two used to mean
+    a wrong field id rendered every row as "in no sprint" with nothing to say otherwise; see the
+    per-call-site "Jira did not return requested field(s)" warning (`_warn_missing_fields`) for
+    the accompanying banner this cell alone cannot carry.
+    """
+    raw = fields.get(sprint_field, _SPRINT_FIELD_MISSING)
+    if raw is _SPRINT_FIELD_MISSING:
+        return "? (field not returned)"
+    sprints = raw if isinstance(raw, list) else []
+    if not sprints:
+        return "-"
+    return ", ".join(
+        f"{sprint.get('name')} ({sprint.get('state')})"
+        for sprint in sprints
+        if isinstance(sprint, dict)
+    )
+
+
+def _issue_row(issue: dict[str, Any], *, sprint_field: str | None = None) -> dict[str, str]:
     fields = issue.get("fields") or {}
     status = fields.get("status") or {}
     assignee = fields.get("assignee") or {}
     issue_type = fields.get("issuetype") or {}
     project = fields.get("project") or {}
-    return {
+    row = {
         "key": str(issue.get("key") or ""),
         "summary": str(fields.get("summary") or ""),
         "status": str(status.get("name") or ""),
@@ -108,18 +278,31 @@ def _issue_row(issue: dict[str, Any]) -> dict[str, str]:
         "project": str(project.get("key") or ""),
         "updated": str(fields.get("updated") or ""),
     }
+    if sprint_field:
+        row["sprint"] = _sprint_cell(fields, sprint_field)
+    return row
 
 
-def _print_issues_table(issues: list[dict[str, Any]]) -> None:
+def _print_issues_table(issues: list[dict[str, Any]], *, sprint_field: str | None = None) -> None:
+    """Render the shared issue table. `sprint_field` is opt-in per call site (only `issue` and
+    the search-backed commands pass it) rather than baked into every caller of this shared
+    renderer, since a caller such as `test-issue` that never requested the sprint field would
+    otherwise render an always-blank column for a field it never asked Jira for.
+    """
     table = Table(show_header=True, header_style="bold")
     table.add_column("Key", no_wrap=True)
     table.add_column("Status", no_wrap=True)
     table.add_column("Assignee", no_wrap=True)
     table.add_column("Summary")
+    if sprint_field:
+        table.add_column("Sprint")
     for issue in issues:
-        row = _issue_row(issue)
-        table.add_row(row["key"], row["status"], row["assignee"], row["summary"])
-    console.print(table)
+        row = _issue_row(issue, sprint_field=sprint_field)
+        values = [row["key"], row["status"], row["assignee"], row["summary"]]
+        if sprint_field:
+            values.append(row["sprint"])
+        table.add_row(*values)
+    table_console.print(table)
 
 
 def _print_create_metadata(data: dict[str, Any]) -> None:
@@ -142,7 +325,7 @@ def _print_create_metadata(data: dict[str, Any]) -> None:
                 str(issue_type.get("id") or ""),
                 ", ".join(required),
             )
-    console.print(table)
+    table_console.print(table)
 
 
 def _adf_to_text(node: Any) -> str:
@@ -150,7 +333,9 @@ def _adf_to_text(node: Any) -> str:
 
 
 def _print_agent_report(report: dict[str, Any]) -> None:
-    console.print(f"[bold]{report['key']}[/bold] {report.get('summary') or ''}")
+    console.print(
+        f"[bold]{escape(str(report['key']))}[/bold] {escape(str(report.get('summary') or ''))}"
+    )
     console.print(report["url"])
     console.print(f"status: {(report.get('status') or {}).get('name')}")
     assignee = report.get("assignee") or {}
@@ -170,6 +355,22 @@ def _print_agent_report(report: dict[str, Any]) -> None:
         console.print(description)
 
     console.print("\n[bold]Comments[/bold]")
+    comment_count = report.get("comment_count")
+    comments_returned = report.get("comments_returned")
+    comments_truncated = report.get("comments_truncated")
+    comments_order = report.get("comments_order")
+    if comments_returned is not None and comment_count is not None:
+        status_word = "truncated" if comments_truncated else "complete"
+        # G4: `--comments all` used to return oldest-first in human mode and now returns
+        # newest-first, with `comments_order` reaching only `--json`. Stating the order next to
+        # the count here means a reader who "learned the last line is the newest" is corrected
+        # in the same place they read the count, not left to discover the flip by misreading a
+        # comment's date.
+        order_suffix = f", {comments_order}" if comments_order else ""
+        console.print(
+            f"comments: {comments_returned} of {comment_count} returned "
+            f"({status_word}{order_suffix})"
+        )
     comments = report.get("comments") or []
     if comments:
         for comment in comments:
@@ -195,7 +396,7 @@ def _print_agent_report(report: dict[str, Any]) -> None:
                 str(transition.get("name") or ""),
                 str(target.get("name") or ""),
             )
-        console.print(table)
+        table_console.print(table)
     else:
         console.print("No transitions returned.")
 
@@ -236,7 +437,7 @@ def _print_users_table(users: list[dict[str, Any]]) -> None:
             str(user.get("accountId") or ""),
             str(user.get("active")),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 def _read_audit_records(path: str, limit: int) -> list[dict[str, Any]]:
@@ -260,10 +461,10 @@ def myself(
         try:
             data = client.myself()
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     console.print(f"{data.get('displayName')} <{data.get('emailAddress', 'email hidden')}>")
@@ -304,10 +505,10 @@ def user_search(
                 limit=limit,
             )
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(users)
+        _emit_json(users)
         return
     _print_users_table(users)
 
@@ -317,8 +518,15 @@ def issue(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     fields: Annotated[
         str | None,
-        typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+        typer.Option(
+            "--fields",
+            help=(
+                "Comma-separated Jira fields to fetch. Left at its default, this also asks for "
+                "the configured sprint field (config.sprint_field / JIRA_SPRINT_FIELD); an "
+                "explicit --fields is used exactly as given, with no field added to it."
+            ),
+        ),
+    ] = _DEFAULT_FIELDS_CSV,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
@@ -326,16 +534,30 @@ def issue(
 ) -> None:
     """Fetch one Jira issue."""
     with _client() as client:
+        sprint_field = client.config.sprint_field
+        if fields == _DEFAULT_FIELDS_CSV:
+            requested_fields: list[str] | None = [*DEFAULT_FIELDS, sprint_field]
+        else:
+            requested_fields = _field_list(fields)
         try:
-            data = client.get_issue(key, fields=_field_list(fields))
+            data = client.get_issue(key, fields=requested_fields)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
+
+    returned_fields = set((data.get("fields") or {}).keys())
+    _warn_missing_fields(requested_fields, returned_fields, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
-    _print_issues_table([data])
+    # Only render a Sprint column when the sprint field was actually part of what was requested:
+    # an explicit --fields that left it out must not render an always-blank column that looks
+    # like "checked, no sprint" rather than "not asked for".
+    render_sprint_field = (
+        sprint_field if requested_fields and sprint_field in requested_fields else None
+    )
+    _print_issues_table([data], sprint_field=render_sprint_field)
 
 
 @app.command()
@@ -343,32 +565,59 @@ def comments(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum comments to return."),
+        typer.Option("--limit", min=1, help="Maximum comments to return. Ignored with --all."),
     ] = 20,
     start_at: Annotated[
         int,
-        typer.Option("--start-at", min=0, help="Pagination start offset."),
+        typer.Option("--start-at", min=0, help="Pagination start offset. Ignored with --all."),
     ] = 0,
+    all_comments: Annotated[
+        bool,
+        typer.Option(
+            "--all", help="Page through every comment on the issue, ignoring --limit/--start-at."
+        ),
+    ] = False,
+    order: Annotated[
+        str,
+        typer.Option(
+            "--order",
+            help=(
+                "'newest' or 'oldest'. Default is 'newest', a deliberate change from Jira's "
+                "natural oldest-first order: the common case is verifying a comment just written."
+            ),
+        ),
+    ] = "newest",
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """List comments for one Jira issue."""
+    """List comments for one Jira issue, newest first by default."""
+    if order not in {"newest", "oldest"}:
+        error_console.print(
+            f"[red]Invalid --order value:[/red] {order!r} (use 'newest' or 'oldest')"
+        )
+        raise typer.Exit(2)
+    order_by = "-created" if order == "newest" else None
+
     with _client() as client:
         try:
-            data = client.list_comments(key, start_at=start_at, limit=limit)
+            if all_comments:
+                data = client.list_all_comments(key, order_by=order_by)
+            else:
+                data = client.list_comments(key, start_at=start_at, limit=limit, order_by=order_by)
         except JiraApiError as exc:
-            _exit_api_error(exc)
-
-    if json_output:
-        _print_json(data)
-        return
+            _exit_api_error(exc, json_mode=json_output)
 
     comments_data = data.get("comments") or []
     if not isinstance(comments_data, list):
         error_console.print("[red]Unexpected Jira response: comments is not a list[/red]")
         raise typer.Exit(1)
+    returned = len(comments_data)
+
+    if json_output:
+        _emit_json({**data, "returned": returned})
+        return
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", no_wrap=True)
@@ -383,7 +632,10 @@ def comments(
             str(comment.get("created") or ""),
             _adf_to_text(comment.get("body")).strip(),
         )
-    console.print(table)
+    table_console.print(table)
+    total = data.get("total")
+    if isinstance(total, int):
+        console.print(f"returned {returned} of {total} comments")
 
 
 @app.command()
@@ -401,33 +653,203 @@ def add_comment(
 ) -> None:
     """Add a comment to one Jira issue. Defaults to dry-run."""
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would add this comment")
-        console.print(f"issue: {key}")
-        console.print(body)
-        console.print("Pass --execute to write it to Jira.")
+        _say("[yellow]Dry run:[/yellow] would add this comment", json_mode=json_output)
+        _say(f"issue: {key}", json_mode=json_output)
+        _say(body, json_mode=json_output)
+        if json_output:
+            _emit_json({"issue": key, "body": body, "dry_run": True})
+        _say("Pass --execute to write it to Jira.", json_mode=json_output)
         return
 
     with _client() as client:
         try:
             ensure_issue_write_allowed(client.config, client, key)
             data = client.add_comment(key, body)
-            audit_write(
+            audit_warning = _audit_committed_write(
                 client.config,
                 action="add_comment",
                 issue_key=key,
                 payload={"body": body},
                 result={"id": data.get("id")},
             )
+            if audit_warning:
+                data.update(audit_warning=audit_warning, partial_success=True)
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Added comment {data.get('id')} to {key}.")
+
+
+@app.command("edit-comment")
+def edit_comment(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    comment_id: Annotated[str, typer.Argument(help="Jira comment id.")],
+    body: Annotated[
+        str | None,
+        typer.Option("--body", help="New comment text."),
+    ] = None,
+    body_file: Annotated[
+        Path | None,
+        typer.Option("--body-file", help="UTF-8 Markdown file with the new comment text."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually rewrite the comment in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Replace one comment's body on one Jira issue. Defaults to dry-run.
+
+    Shows the comment's current body next to the proposed replacement, both in the dry-run
+    prose and, under --json, in the JSON document, because a caller correcting a comment needs
+    to see exactly what they are about to overwrite before committing to it.
+    """
+    try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
+        new_body = read_text_source(body, body_file)
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+    except (OSError, ValueError) as exc:
+        _print_error("Edit error:", exc)
+        raise typer.Exit(2) from exc
+
+    with _client() as client:
+        try:
+            current = client.get_comment(key, comment_id)
+            require_matching_jira_numeric_id(current, comment_id, name="comment_id")
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        current_body = _adf_to_text(current.get("body")).strip()
+
+        if not execute:
+            _say("[yellow]Dry run:[/yellow] would replace this comment", json_mode=json_output)
+            _say(f"issue: {key}", json_mode=json_output)
+            _say(f"comment: {comment_id}", json_mode=json_output)
+            _say("current body:", json_mode=json_output)
+            _say(current_body, json_mode=json_output)
+            _say("proposed body:", json_mode=json_output)
+            _say(new_body, json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "issue": key,
+                        "comment": comment_id,
+                        "current_body": current_body,
+                        "proposed_body": new_body,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
+            return
+
+        try:
+            ensure_issue_write_allowed(client.config, client, key)
+            data = client.update_comment(key, comment_id, new_body)
+            _audit_committed_write(
+                client.config,
+                action="edit_comment",
+                issue_key=key,
+                payload={
+                    "comment_id": comment_id,
+                    "previous_body": current_body,
+                    "body": new_body,
+                },
+                result={"id": data.get("id")},
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    if json_output:
+        _emit_json({**data, "dry_run": False})
+        return
+
+    console.print(f"Edited comment {comment_id} on {key}.")
+
+
+@app.command("delete-comment")
+def delete_comment(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    comment_id: Annotated[str, typer.Argument(help="Jira comment id.")],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually delete the comment in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Delete one comment from one Jira issue. Defaults to dry-run.
+
+    Deleting a comment is irreversible, so the dry run prints the full current body: it is the
+    only chance the caller gets to notice a wrong comment id before the comment is gone for good.
+    """
+    try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
+    with _client() as client:
+        try:
+            current = client.get_comment(key, comment_id)
+            require_matching_jira_numeric_id(current, comment_id, name="comment_id")
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        current_body = _adf_to_text(current.get("body")).strip()
+
+        if not execute:
+            _say("[yellow]Dry run:[/yellow] would delete this comment", json_mode=json_output)
+            _say(f"issue: {key}", json_mode=json_output)
+            _say(f"comment: {comment_id}", json_mode=json_output)
+            _say("current body:", json_mode=json_output)
+            _say(current_body, json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "issue": key,
+                        "comment": comment_id,
+                        "current_body": current_body,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to delete it from Jira.", json_mode=json_output)
+            return
+
+        try:
+            ensure_issue_write_allowed(client.config, client, key)
+            data = client.delete_comment(key, comment_id)
+            _audit_committed_write(
+                client.config,
+                action="delete_comment",
+                issue_key=key,
+                payload={"comment_id": comment_id, "body": current_body},
+                result=data,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    if json_output:
+        _emit_json({"issue": key, "comment": comment_id, **data, "dry_run": False})
+        return
+
+    console.print(f"Deleted comment {comment_id} from {key}.")
 
 
 @app.command()
@@ -438,15 +860,18 @@ def recent(
     ] = 30,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     fields: Annotated[
         str | None,
         typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+    ] = _DEFAULT_FIELDS_CSV,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show recently updated Jira issues."""
@@ -468,11 +893,14 @@ def mine(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show unresolved issues assigned to the authenticated user."""
@@ -483,7 +911,7 @@ def mine(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -497,11 +925,14 @@ def assigned_to_me(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Alias for mine."""
@@ -512,11 +943,14 @@ def assigned_to_me(
 def fc_open(
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Show open FC issues."""
@@ -524,7 +958,7 @@ def fc_open(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -539,11 +973,14 @@ def by_status(
     ] = None,
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option("--limit", min=1, help="Maximum issues to return; pages past one page."),
     ] = 20,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
     """Search issues by status."""
@@ -555,7 +992,7 @@ def by_status(
     _run_search(
         jql,
         limit=limit,
-        fields=",".join(DEFAULT_FIELDS),
+        fields=_DEFAULT_FIELDS_CSV,
         next_page_token=None,
         json_output=json_output,
     )
@@ -566,28 +1003,65 @@ def search(
     jql: Annotated[str, typer.Argument(help="JQL query.")],
     limit: Annotated[
         int,
-        typer.Option("--limit", min=1, max=100, help="Maximum issues to return."),
+        typer.Option(
+            "--limit",
+            min=1,
+            help=(
+                "Maximum issues to return; pages automatically past one page. "
+                "Ignored when --all is set (--all wins over --limit)."
+            ),
+        ),
     ] = 20,
+    all_issues: Annotated[
+        bool,
+        typer.Option(
+            "--all", help="Page through every matching issue. Overrides --limit when both are set."
+        ),
+    ] = False,
+    count: Annotated[
+        bool,
+        typer.Option(
+            "--count",
+            help=(
+                "Also report Jira's approximate match count via one extra POST to "
+                "/search/approximate-count. Opt-in because of that extra request."
+            ),
+        ),
+    ] = False,
     fields: Annotated[
         str | None,
         typer.Option("--fields", help="Comma-separated Jira fields to fetch."),
-    ] = ",".join(DEFAULT_FIELDS),
+    ] = _DEFAULT_FIELDS_CSV,
     next_page_token: Annotated[
         str | None,
-        typer.Option("--next-page-token", help="Jira enhanced search nextPageToken."),
+        typer.Option(
+            "--next-page-token",
+            help="Jira enhanced search nextPageToken, for a caller paging one page at a time.",
+        ),
     ] = None,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
-    """Search Jira issues with JQL."""
+    """Search Jira issues with JQL.
+
+    Jira's enhanced search endpoint never reports a total match count, only the issues it
+    returned and whether that was the last page. This command reports exactly that (`returned`,
+    `is_last`) instead of inventing a number the API never gave it. Pass --count for Jira's
+    separate, explicitly approximate count.
+    """
     _run_search(
         jql,
         limit=limit,
         fields=fields,
         next_page_token=next_page_token,
         json_output=json_output,
+        all_pages=all_issues,
+        count=count,
     )
 
 
@@ -599,32 +1073,26 @@ def test_scope(
     ] = 5,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
+        typer.Option(
+            "--json",
+            help="Print the curated result document, not Jira's raw response.",
+        ),
     ] = False,
 ) -> None:
-    """Run a read-only smoke query against the configured Jira test scope."""
+    """Run a read-only smoke query against the configured Jira test scope.
+
+    Reports the same curated shape as every other search-backed command (`returned`, `is_last`,
+    never a fabricated `total`); see `_run_search`.
+    """
     config = _config()
-    console.print(f"test JQL: {config.test_jql}")
-    with JiraClient(config) as client:
-        try:
-            data = client.search_issues(
-                config.test_jql,
-                limit=limit,
-                fields=DEFAULT_FIELDS,
-            )
-        except JiraApiError as exc:
-            _exit_api_error(exc)
-
-    if json_output:
-        _print_json(data)
-        return
-
-    issues = data.get("issues") or []
-    if not isinstance(issues, list):
-        error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
-        raise typer.Exit(1)
-    _print_issues_table(issues)
-    console.print(f"scope issue count shown: {len(issues)}")
+    _say(f"test JQL: {config.test_jql}", json_mode=json_output)
+    _run_search(
+        config.test_jql,
+        limit=limit,
+        fields=_DEFAULT_FIELDS_CSV,
+        next_page_token=None,
+        json_output=json_output,
+    )
 
 
 @app.command("create-meta")
@@ -649,10 +1117,10 @@ def create_meta(
         try:
             data = client.create_metadata(project_key=project, issue_type_name=issue_type)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     _print_create_metadata(data)
@@ -683,12 +1151,20 @@ def create_test_issue(
         description=description,
     )
 
+    try:
+        ensure_project_write_allowed(config, config.test_project_key)
+    except JiraWriteSafetyError as exc:
+        _exit_safety_error(exc, json_mode=json_output)
+
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would create this Jira test issue")
-        console.print(f"project: {config.test_project_key}")
-        console.print(f"issue type: {config.test_issue_type}")
-        _print_json(payload)
-        console.print("Pass --execute to create it in Jira.")
+        _say("[yellow]Dry run:[/yellow] would create this Jira test issue", json_mode=json_output)
+        _say(f"project: {config.test_project_key}", json_mode=json_output)
+        _say(f"issue type: {config.test_issue_type}", json_mode=json_output)
+        if json_output:
+            _emit_json({**payload, "dry_run": True})
+        else:
+            _print_json(payload)
+        _say("Pass --execute to create it in Jira.", json_mode=json_output)
         return
 
     with JiraClient(config) as client:
@@ -700,23 +1176,32 @@ def create_test_issue(
                 summary=summary,
                 description=description,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=data.get("key"),
                 payload=payload,
                 result=data,
+                writer=audit_write,
             )
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        output = {**data, "dry_run": False}
+        if create_audit_warning:
+            output.update(
+                audit_warning=create_audit_warning,
+                partial_success=True,
+            )
+        _emit_json(output)
         return
 
     console.print(f"Created Jira test issue {data.get('key')} ({data.get('id')}).")
+    if create_audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {create_audit_warning['message']}")
 
 
 @app.command("create-issue")
@@ -752,7 +1237,10 @@ def create_issue(
     ] = None,
     parent: Annotated[
         str | None,
-        typer.Option("--parent", help="Optional parent issue key."),
+        typer.Option(
+            "--parent",
+            help="Optional existing parent; must share the child's Jira site and credentials.",
+        ),
     ] = None,
     priority: Annotated[
         str | None,
@@ -782,13 +1270,17 @@ def create_issue(
     config = _config()
     project = project_key or config.test_project_key
     try:
+        ensure_project_write_allowed(config, project)
+    except JiraWriteSafetyError as exc:
+        _exit_safety_error(exc, json_mode=json_output)
+    try:
         body = (
             read_text_source(description, description_file, section=description_section)
             if description or description_file
             else None
         )
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Description error:[/red] {exc}")
+        _print_error("Description error:", exc)
         raise typer.Exit(2) from exc
 
     try:
@@ -804,7 +1296,7 @@ def create_issue(
             story_points_field=config.story_points_field,
         )
     except ValueError as exc:
-        error_console.print(f"[red]Create error:[/red] {exc}")
+        _print_error("Create error:", exc)
         raise typer.Exit(2) from exc
     description_adf = payload["fields"].get("description")
     diagram_count = (
@@ -812,17 +1304,29 @@ def create_issue(
         if render_mermaid and isinstance(description_adf, dict)
         else 0
     )
+    if parent is not None:
+        try:
+            require_shared_write_scope(config, [project, parent])
+            with JiraClient(config) as parent_client:
+                parent_client.get_issue(parent, fields=["project"])
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
     if not execute:
-        console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
-        _print_json(payload)
+        _say("[yellow]Dry run:[/yellow] would create this Jira issue", json_mode=json_output)
+        if json_output:
+            _emit_json({**payload, "dry_run": True})
+        else:
+            _print_json(payload)
         if diagram_count:
-            console.print(f"Mermaid diagrams to render after creation: {diagram_count}")
-        console.print("Pass --execute to create it in Jira.")
+            _say(
+                f"Mermaid diagrams to render after creation: {diagram_count}",
+                json_mode=json_output,
+            )
+        _say("Pass --execute to create it in Jira.", json_mode=json_output)
         return
 
     with JiraClient(config) as client:
         try:
-            ensure_project_write_allowed(config, project)
             data = client.create_issue(
                 project_key=project,
                 issue_type_name=issue_type,
@@ -833,52 +1337,80 @@ def create_issue(
                 priority=priority,
                 story_points=story_points,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=data.get("key"),
                 payload=payload,
                 result=data,
+                writer=audit_write,
             )
             mermaid_result: dict[str, Any] | None = None
             if diagram_count and data.get("key") and isinstance(description_adf, dict):
                 try:
+                    created_key = str(data["key"])
+
+                    def _audit_mermaid_commit(commit: dict[str, Any]) -> dict[str, Any] | None:
+                        return audit_committed_write(
+                            config,
+                            action="render_mermaid_diagrams",
+                            issue_key=created_key,
+                            payload={
+                                "files": commit["files"],
+                                "attachment_ids": commit["attachment_ids"],
+                                "cleanup_pending_attachment_ids": commit[
+                                    "cleanup_pending_attachment_ids"
+                                ],
+                                "deleted_attachment_ids": [],
+                            },
+                            result=commit["result"],
+                            writer=audit_write,
+                        )
+
                     mermaid_result = embed_mermaid_diagrams(
                         client,
-                        issue_key=str(data["key"]),
+                        issue_key=created_key,
                         description=description_adf,
                         output_dir=Path(config.audit_log_path).parent
                         / "diagrams"
-                        / str(data["key"]),
-                    )
-                    audit_write(
-                        config,
-                        action="render_mermaid_diagrams",
-                        issue_key=str(data["key"]),
-                        payload={
-                            "files": mermaid_result["files"],
-                            "attachment_ids": mermaid_result["attachment_ids"],
-                            "deleted_attachment_ids": mermaid_result["deleted_attachment_ids"],
-                        },
-                        result=mermaid_result["result"],
+                        / created_key,
+                        on_description_committed=_audit_mermaid_commit,
                     )
                 except (JiraApiError, OSError, RuntimeError, ValueError) as exc:
                     mermaid_result = {"ok": False, "message": str(exc)}
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
         if mermaid_result is None:
-            _print_json(data)
+            output = {**data, "dry_run": False}
         else:
-            _print_json({"issue": data, "mermaid": mermaid_result})
+            output = {"issue": data, "mermaid": mermaid_result, "dry_run": False}
+        if create_audit_warning:
+            output.update(
+                audit_warning=create_audit_warning,
+                partial_success=True,
+            )
+        _emit_json(output)
         return
     console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
+    if create_audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {create_audit_warning['message']}")
     if mermaid_result is not None:
         if mermaid_result.get("ok"):
             console.print(f"Embedded {mermaid_result['diagram_count']} Mermaid diagram(s).")
+            if mermaid_result.get("cleanup_failures"):
+                error_console.print(
+                    f"[yellow]Warning:[/yellow] {len(mermaid_result['cleanup_failures'])} "
+                    "superseded attachment(s) could not be deleted; the new description and "
+                    "uploads remain committed."
+                )
+            if mermaid_result.get("audit_warning"):
+                error_console.print(
+                    f"[yellow]Warning:[/yellow] {mermaid_result['audit_warning']['message']}"
+                )
         else:
             error_console.print(
                 f"[yellow]Warning:[/yellow] issue was created, but Mermaid embedding failed: "
@@ -893,6 +1425,22 @@ def render_mermaid(
         Path | None,
         typer.Option("--output-dir", help="Directory for rendered PNG files."),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Uploading each rendered PNG is itself a write that moves this issue's own "
+                "`updated` on the Jira side, so the token cannot come from the read that finds "
+                "the Mermaid blocks to render. Instead, after every upload this re-reads the "
+                "description and `updated` together in one request, builds the write from THAT "
+                "read, and refuses the write (exit code 4) if `updated` no longer matches "
+                "immediately before it. This is a check-then-act narrowing of the race window, "
+                "not an atomic compare-and-swap: Jira Cloud has no conditional write here, so a "
+                "change landing in that narrower window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Render, upload, and embed the diagrams in Jira."),
@@ -902,7 +1450,19 @@ def render_mermaid(
         typer.Option("--json", help="Print the machine-readable result."),
     ] = False,
 ) -> None:
-    """Render and embed all Mermaid blocks in an existing issue. Defaults to dry-run."""
+    """Render and embed all Mermaid blocks in an existing issue. Defaults to dry-run.
+
+    This rewrites the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded, but like `embed-diagram`,
+    the token cannot come from the same read that finds the Mermaid blocks to render: uploading
+    each rendered PNG is itself a write that moves this issue's own `updated` on the Jira side.
+    The guard token is instead read together with a fresh description immediately after the last
+    upload, so the write is built from that same fresh document. This means a concurrent edit
+    landing before that post-upload read is incorporated into the write rather than lost; it is
+    not an atomic compare-and-swap, and a change landing between that read and the write is still
+    lost, since Jira Cloud offers no conditional write on this resource. Pass
+    --no-concurrency-guard for the old unguarded behaviour.
+    """
     config = _config()
     try:
         with JiraClient(config) as client:
@@ -915,7 +1475,9 @@ def render_mermaid(
             }
             sources = mermaid_sources_from_adf(description_adf)
             if not sources:
-                error_console.print(f"[yellow]No Mermaid code blocks found on {key}.[/yellow]")
+                error_console.print(
+                    f"[yellow]No Mermaid code blocks found on {escape(str(key))}.[/yellow]"
+                )
                 raise typer.Exit(1)
 
             runtime = discover_mermaid_runtime()
@@ -935,7 +1497,7 @@ def render_mermaid(
                     "safety": safety,
                 }
                 if json_output:
-                    _print_json(result)
+                    _emit_json(result)
                 else:
                     console.print("[yellow]Dry run:[/yellow] would render Mermaid diagrams")
                     console.print(f"issue: {key}")
@@ -944,6 +1506,24 @@ def render_mermaid(
                     console.print("Pass --execute to render, upload, and embed them.")
                 return
 
+            def _audit_mermaid_commit(commit: dict[str, Any]) -> dict[str, Any] | None:
+                return audit_committed_write(
+                    config,
+                    action="render_mermaid_diagrams",
+                    issue_key=key,
+                    payload={
+                        "files": commit["files"],
+                        "attachment_ids": commit["attachment_ids"],
+                        "cleanup_pending_attachment_ids": commit[
+                            "cleanup_pending_attachment_ids"
+                        ],
+                        "deleted_attachment_ids": [],
+                        "concurrency_guard": concurrency_guard,
+                    },
+                    result=commit["result"],
+                    writer=audit_write,
+                )
+
             result = embed_mermaid_diagrams(
                 client,
                 issue_key=key,
@@ -951,30 +1531,33 @@ def render_mermaid(
                 attachments=issue.get("fields", {}).get("attachment") or [],
                 output_dir=destination,
                 runtime=runtime,
+                guard_concurrent_edit=concurrency_guard,
+                on_description_committed=_audit_mermaid_commit,
             )
-            audit_write(
-                config,
-                action="render_mermaid_diagrams",
-                issue_key=key,
-                payload={
-                    "files": result["files"],
-                    "attachment_ids": result["attachment_ids"],
-                    "deleted_attachment_ids": result["deleted_attachment_ids"],
-                },
-                result=result["result"],
-            )
+    except JiraConcurrentEditError as exc:
+        _exit_concurrent_edit_error(exc, json_mode=json_output)
+    except JiraMissingConcurrencyTokenError as exc:
+        _exit_missing_concurrency_token_error(exc, json_mode=json_output)
     except JiraWriteSafetyError as exc:
-        _exit_safety_error(exc)
+        _exit_safety_error(exc, json_mode=json_output)
     except JiraApiError as exc:
-        _exit_api_error(exc)
+        _exit_api_error(exc, json_mode=json_output)
     except (OSError, RuntimeError, ValueError) as exc:
-        error_console.print(f"[red]Mermaid error:[/red] {exc}")
+        _print_error("Mermaid error:", exc)
         raise typer.Exit(1) from exc
 
     if json_output:
-        _print_json(result)
+        _emit_json({**result, "dry_run": False})
         return
     console.print(f"Embedded {result['diagram_count']} Mermaid diagram(s) in {key}.")
+    if result.get("cleanup_failures"):
+        error_console.print(
+            f"[yellow]Warning:[/yellow] {len(result['cleanup_failures'])} superseded "
+            "attachment(s) could not be deleted; the new description and uploads remain "
+            "committed."
+        )
+    if result.get("audit_warning"):
+        error_console.print(f"[yellow]Warning:[/yellow] {result['audit_warning']['message']}")
 
 
 @app.command("test-issue")
@@ -994,10 +1577,10 @@ def test_issue(
         try:
             data = client.get_issue(config.test_issue_key, fields=DEFAULT_FIELDS)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     _print_issues_table([data])
@@ -1010,9 +1593,16 @@ def agent_report(
         typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
     ] = None,
     comments_limit: Annotated[
-        int,
-        typer.Option("--comments", min=0, max=100, help="Maximum comments to include."),
-    ] = 5,
+        str,
+        typer.Option(
+            "--comments",
+            help=(
+                "Newest comments to include: a non-negative integer, or 'all' to page through "
+                "every comment. Both return comments newest first (report['comments_order'] "
+                "always reads 'newest-first')."
+            ),
+        ),
+    ] = "5",
     changelog_limit: Annotated[
         int,
         typer.Option("--changelog", min=0, max=100, help="Maximum changelog entries to include."),
@@ -1023,6 +1613,22 @@ def agent_report(
     ] = False,
 ) -> None:
     """Build a compact agent-friendly report for one Jira issue."""
+    comment_limit: int | str
+    if comments_limit == "all":
+        comment_limit = "all"
+    else:
+        try:
+            parsed_comments_limit = int(comments_limit)
+        except ValueError:
+            parsed_comments_limit = None
+        if parsed_comments_limit is None or parsed_comments_limit < 0:
+            error_console.print(
+                "[red]Invalid --comments value:[/red] "
+                f"{comments_limit!r} (use a non-negative integer or 'all')"
+            )
+            raise typer.Exit(2)
+        comment_limit = parsed_comments_limit
+
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1037,15 +1643,15 @@ def agent_report(
                 client,
                 issue_key=issue_key,
                 site_url=config.site_url,
-                comment_limit=comments_limit,
+                comment_limit=comment_limit,
                 changelog_limit=changelog_limit,
                 write_scope=config.test_issue_key,
             )
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(report)
+        _emit_json(report)
         return
 
     _print_agent_report(report)
@@ -1112,7 +1718,7 @@ def agent_plan_comment(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="agent_plan_comment",
                 issue_key=issue_key,
@@ -1141,12 +1747,34 @@ def human_brief(
         Path | None,
         typer.Option("--file", exists=True, dir_okay=False, readable=True, help="Brief file."),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Capture the issue's `updated` timestamp immediately before the write and "
+                "refuse the write (exit code 4) if it no longer matches. This is a check-then-"
+                "act narrowing of the race window, not an atomic compare-and-swap: Jira Cloud "
+                "has no conditional write here, so a change landing in that window is still "
+                "lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually update the Jira description."),
     ] = False,
 ) -> None:
-    """Write a Human Brief into the Jira description. Defaults to dry-run."""
+    """Write a Human Brief into the Jira description. Defaults to dry-run.
+
+    This replaces the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded the same way `edit-issue`
+    is: immediately before the write, it captures the issue's `updated` timestamp with
+    `issue_version`, which itself refuses (before any write is attempted) if Jira's response
+    does not carry a usable timestamp to guard with. The client then re-checks that same
+    timestamp again right before the PUT and refuses the write (exit code 4) if it no longer
+    matches. Pass --no-concurrency-guard for the old unguarded behaviour.
+    """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1158,7 +1786,7 @@ def human_brief(
         body = read_text_source(text, file_path)
         payload = edit_issue_payload(description=body)
     except ValueError as exc:
-        error_console.print(f"[red]Human brief error:[/red] {exc}")
+        _print_error("Human brief error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
@@ -1172,14 +1800,25 @@ def human_brief(
                 console.print("Pass --execute to write it to Jira.")
                 return
 
-            data = client.edit_issue(issue_key, description=body)
-            audit_write(
+            # Read as late as possible, immediately before the write, to keep the race window
+            # this narrows as small as this process can make it. issue_version raises
+            # JiraMissingConcurrencyTokenError when it cannot read a usable token — itself a
+            # JiraApiError only via subclassing, not a bare one — so a missing token refuses
+            # here rather than silently falling back to an unguarded write.
+            expect_updated = client.issue_version(issue_key) if concurrency_guard else None
+
+            data = client.edit_issue(issue_key, description=body, expect_updated=expect_updated)
+            _audit_committed_write(
                 config,
                 action="human_brief",
                 issue_key=issue_key,
-                payload=payload,
+                payload={**payload, "concurrency_guard": concurrency_guard},
                 result=data,
             )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=False)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=False)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -1237,15 +1876,21 @@ def factory_contract(
                     console.print(f"safety: {safety}")
                     console.print("Pass --execute to upload it to Jira.")
                     return
-                result = client.add_attachment(issue_key, file_path)
-                audit_write(
+                result = validate_attachment_upload_response(
+                    client.add_attachment(issue_key, file_path)
+                )
+                _audit_committed_write(
                     config,
                     action="factory_contract_attachment",
                     issue_key=issue_key,
                     payload={"file": str(file_path)},
                     result={"attachments": result},
                 )
-                console.print(f"Attached Factory Contract to {issue_key}.")
+                for attachment in result:
+                    console.print(
+                        f"Attached Factory Contract {attachment.get('filename')} "
+                        f"({attachment.get('id')}) to {issue_key}."
+                    )
                 return
 
             contract = read_text_source(text, file_path)
@@ -1261,7 +1906,7 @@ def factory_contract(
                 console.print("Pass --execute to write it to Jira.")
                 return
             result = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="factory_contract_comment",
                 issue_key=issue_key,
@@ -1273,10 +1918,10 @@ def factory_contract(
         except JiraApiError as exc:
             _exit_api_error(exc)
         except ValueError as exc:
-            error_console.print(f"[red]Factory Contract error:[/red] {exc}")
+            _print_error("Factory Contract error:", exc)
             raise typer.Exit(2) from exc
 
-    console.print(f"Added Factory Contract comment to {issue_key}.")
+    console.print(f"Added Factory Contract comment {result.get('id')} to {issue_key}.")
 
 
 @app.command("drift-reconcile-comment")
@@ -1322,7 +1967,7 @@ def drift_reconcile_comment(
                 console.print("Pass --execute to write it to Jira.")
                 return
             result = client.add_comment(issue_key, body)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="drift_reconcile_comment",
                 issue_key=issue_key,
@@ -1360,7 +2005,22 @@ def drift_labels(
         typer.Option("--execute", help="Actually update labels in Jira."),
     ] = False,
 ) -> None:
-    """Set or remove drift-* labels. Defaults to dry-run."""
+    """Add or remove drift-* labels atomically. Defaults to dry-run.
+
+    `--add` and `--remove` need no read of the issue at all: each named label becomes its own
+    Jira `add`/`remove` operation on `labels` (see `editmeta`'s advertised operations for that
+    field), applied server-side against whatever the array currently holds, so two agents adding
+    different drift labels at the same time cannot lose each other's work. This command carries
+    NO concurrency guard on any path -- there is no whole-array read-modify-write left for a
+    stale `updated` token to protect.
+
+    `--clear` is the one path that still reads the issue first, once, to find out which labels
+    currently start with `drift-`; only those become explicit `remove` operations. A drift label
+    added by someone else after that read is never named and survives, the same way `--add`/
+    `--remove` alone already leave everything they were not told about untouched. That read
+    still needs no guard: it only decides which `remove` operations to send, and each one is
+    itself safe against a concurrent edit once sent.
+    """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1371,28 +2031,42 @@ def drift_labels(
     with JiraClient(config) as client:
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["labels"])
-            existing = (issue.get("fields") or {}).get("labels") or []
-            labels = update_drift_labels(
-                existing,
+            existing: list[str] | None = None
+            if clear:
+                issue = client.get_issue(issue_key, fields=["labels"])
+                existing = (issue.get("fields") or {}).get("labels") or []
+            add_labels, remove_labels = drift_label_operations(
                 add=_csv_list(add),
                 remove=_csv_list(remove),
+                existing_labels=existing,
                 clear=clear,
             )
-            payload = edit_issue_payload(labels=labels)
+            if not add_labels and not remove_labels:
+                console.print("[yellow]Nothing to do:[/yellow] no labels to add or remove.")
+                return
+            payload = edit_issue_payload(
+                labels_add=add_labels or None, labels_remove=remove_labels or None
+            )
             if not execute:
                 console.print("[yellow]Dry run:[/yellow] would update drift labels")
                 console.print(f"issue: {issue_key}")
                 console.print(f"safety: {safety}")
-                _print_json({"before": existing, "after": labels, "payload": payload})
+                _print_json({"payload": payload})
                 console.print("Pass --execute to write it to Jira.")
                 return
-            result = client.edit_issue(issue_key, labels=labels)
-            audit_write(
+            # Atomic add/remove: never pass expect_updated. There is no whole-array rewrite here
+            # for a stale token to protect (see the docstring above and drift_label_operations).
+            result = client.edit_issue(
+                issue_key,
+                labels_add=add_labels or None,
+                labels_remove=remove_labels or None,
+                expect_updated=None,
+            )
+            _audit_committed_write(
                 config,
                 action="drift_labels",
                 issue_key=issue_key,
-                payload={"before": existing, "after": labels},
+                payload=payload,
                 result=result,
             )
         except JiraWriteSafetyError as exc:
@@ -1400,7 +2074,7 @@ def drift_labels(
         except JiraApiError as exc:
             _exit_api_error(exc)
         except ValueError as exc:
-            error_console.print(f"[red]Drift label error:[/red] {exc}")
+            _print_error("Drift label error:", exc)
             raise typer.Exit(2) from exc
 
     console.print(f"Updated drift labels on {issue_key}.")
@@ -1437,11 +2111,79 @@ def edit_issue(
     ] = None,
     labels: Annotated[
         str | None,
-        typer.Option("--labels", help="Comma-separated labels to set."),
+        typer.Option(
+            "--labels",
+            help=(
+                "Comma-separated labels to set, replacing the whole array. Whole-array form: "
+                "this one CAN silently drop a label a concurrent editor added, so it carries the "
+                "concurrency guard (see --concurrency-guard). Cannot be combined with "
+                "--add-label/--remove-label."
+            ),
+        ),
+    ] = None,
+    add_label: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--add-label",
+            help=(
+                "Add one label without touching the rest (repeatable). Atomic form: applied "
+                "against whatever labels the issue currently has, so it cannot lose a "
+                "concurrent editor's own change and carries NO concurrency guard. Cannot be "
+                "combined with --labels."
+            ),
+        ),
+    ] = None,
+    remove_label: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--remove-label",
+            help=(
+                "Remove one label without touching the rest (repeatable). Same atomic form as "
+                "--add-label, so it carries NO concurrency guard. Cannot be combined with "
+                "--labels."
+            ),
+        ),
+    ] = None,
+    fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--fix-version",
+            help=(
+                "Fix version name to set. Repeat to set several; pass none to leave unchanged. "
+                "Whole-array form: this one CAN silently drop a fix version a concurrent editor "
+                "added, so it carries the concurrency guard (see --concurrency-guard). Cannot be "
+                "combined with --add-fix-version/--remove-fix-version."
+            ),
+        ),
+    ] = None,
+    add_fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--add-fix-version",
+            help=(
+                "Add one fix version without touching the rest (repeatable). Atomic form: "
+                "applied against whatever fix versions the issue currently has, so it carries "
+                "NO concurrency guard. Cannot be combined with --fix-version."
+            ),
+        ),
+    ] = None,
+    remove_fix_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--remove-fix-version",
+            help=(
+                "Remove one fix version without touching the rest (repeatable). Same atomic "
+                "form as --add-fix-version, so it carries NO concurrency guard. Cannot be "
+                "combined with --fix-version."
+            ),
+        ),
     ] = None,
     parent: Annotated[
         str | None,
-        typer.Option("--parent", help="New parent issue key."),
+        typer.Option(
+            "--parent",
+            help="Existing new parent; must share the child's Jira site and credentials.",
+        ),
     ] = None,
     priority: Annotated[
         str | None,
@@ -1451,6 +2193,19 @@ def edit_issue(
         float | None,
         typer.Option("--story-points", help="New story-point estimate."),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Read the issue's `updated` timestamp immediately before the write and refuse "
+                "the write (exit code 4) if it no longer matches. This is a check-then-act "
+                "narrowing of the race window, not an atomic compare-and-swap: Jira Cloud has "
+                "no conditional write here, so a change landing in that window is still lost. "
+                "Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually edit the issue in Jira."),
@@ -1460,7 +2215,30 @@ def edit_issue(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
+    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
+
+    `--description` and friends, plus the whole-array `--labels`/`--fix-version`, each replace
+    the whole field, so a concurrent edit to that same field would otherwise be silently
+    overwritten. By default a call that sets one of those is guarded: this command has to add a
+    dedicated read, since edit-issue previously read nothing before writing, so immediately
+    before attempting the write it captures the issue's `updated` timestamp with `issue_version`,
+    as late as possible to keep the window small. The client then re-checks that same timestamp
+    again right before the PUT and refuses the write (exit code 4) if it no longer matches. This
+    narrows the race window to a check-then-act gap; it is not an atomic compare-and-swap, since
+    Jira Cloud offers no conditional write here, so a change landing inside that narrowed window
+    is still lost. Pass --no-concurrency-guard for the old unguarded behaviour.
+
+    `--add-label`/`--remove-label` and `--add-fix-version`/`--remove-fix-version` are atomic
+    instead: Jira applies them against whatever the array currently holds server-side (see
+    `editmeta`'s advertised `add`/`remove` operations for `labels` and `fixVersions`), so they
+    cannot lose a concurrent editor's own change and never need `expect_updated`. A call that
+    mixes one of these with an unrelated whole-field option (for example `--summary` together
+    with `--add-label`) still reads and checks `updated` for the whole-field part; only a call
+    with no whole-field option at all skips that read entirely. `--labels` cannot be combined
+    with `--add-label`/`--remove-label`, and `--fix-version` cannot be combined with
+    `--add-fix-version`/`--remove-fix-version`: Jira rejects a PUT that both sets and updates the
+    same field.
+    """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1468,6 +2246,39 @@ def edit_issue(
             "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
         )
         raise typer.Exit(2)
+
+    if labels is not None and (add_label or remove_label):
+        _print_error(
+            "Edit error:",
+            "Cannot combine --labels with --add-label/--remove-label: Jira rejects a PUT that "
+            "both sets and updates the same field. --labels replaces the whole array and "
+            "carries the concurrency guard; --add-label/--remove-label are atomic and carry "
+            "none. Use one form or the other.",
+        )
+        raise typer.Exit(2)
+    if fix_version and (add_fix_version or remove_fix_version):
+        _print_error(
+            "Edit error:",
+            "Cannot combine --fix-version with --add-fix-version/--remove-fix-version: Jira "
+            "rejects a PUT that both sets and updates the same field. --fix-version replaces "
+            "the whole array and carries the concurrency guard; --add-fix-version/"
+            "--remove-fix-version are atomic and carry none. Use one form or the other.",
+        )
+        raise typer.Exit(2)
+
+    for _option_name, _values in (
+        ("--add-label", add_label),
+        ("--remove-label", remove_label),
+        ("--add-fix-version", add_fix_version),
+        ("--remove-fix-version", remove_fix_version),
+    ):
+        if _values and any(not value.strip() for value in _values):
+            _print_error(
+                "Edit error:",
+                f"{_option_name} must not be empty or whitespace-only. Pass a real label or "
+                "fix version name, or omit the option entirely.",
+            )
+            raise typer.Exit(2)
 
     try:
         body = (
@@ -1479,52 +2290,190 @@ def edit_issue(
             summary=summary,
             description=body,
             labels=_csv_list(labels),
+            fix_versions=fix_version,
             parent_key=parent,
             priority=priority,
             story_points=story_points,
+            labels_add=add_label,
+            labels_remove=remove_label,
+            fix_versions_add=add_fix_version,
+            fix_versions_remove=remove_fix_version,
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Edit error:[/red] {exc}")
+        _print_error("Edit error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
         try:
+            if parent is not None:
+                require_shared_write_scope(config, [issue_key, parent])
+                client.get_issue(parent, fields=["project"])
             safety = ensure_issue_write_allowed(config, client, issue_key)
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would edit issue")
-                console.print(f"issue: {issue_key}")
-                console.print(f"safety: {safety}")
-                _print_json(payload)
-                console.print("Pass --execute to write it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would edit issue", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({**payload, "dry_run": True})
+                else:
+                    _print_json(payload)
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
+
+            # edit-issue previously read nothing before writing. issue_version is the dedicated,
+            # minimal read added for the guard: it fetches only `updated`, taken as late as
+            # possible (right before the write call below) so the window this narrows — between
+            # this read and the client's own immediate re-check before its PUT — stays as small
+            # as this process can make it. Skipped entirely when the request carries no
+            # whole-field write at all (`payload.get("fields")` empty or absent -- absent is how
+            # edit_issue_payload now represents "nothing to guard", the same way it already
+            # omitted an empty `update`): atomic-only add/remove operations need no token to
+            # guard with, so there is nothing here worth the read.
+            expect_updated = (
+                client.issue_version(issue_key)
+                if concurrency_guard and payload.get("fields")
+                else None
+            )
 
             data = client.edit_issue(
                 issue_key,
                 summary=summary,
                 description=body,
                 labels=_csv_list(labels),
+                fix_versions=fix_version,
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
+                labels_add=add_label,
+                labels_remove=remove_label,
+                fix_versions_add=add_fix_version,
+                fix_versions_remove=remove_fix_version,
+                expect_updated=expect_updated,
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="edit_issue",
                 issue_key=issue_key,
-                payload=payload,
+                payload={**payload, "concurrency_guard": concurrency_guard},
                 result=data,
             )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Edited {issue_key}.")
+
+
+@app.command("clear-parent")
+def clear_parent(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually clear the issue parent in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the verified Jira JSON response."),
+    ] = False,
+) -> None:
+    """Clear an issue parent explicitly. Defaults to dry-run and verifies the reread.
+
+    G2/G8 decision: this deliberately carries no concurrency guard, for the same reason as its
+    MCP equivalent, `jira_clear_issue_parent`: it sets one relationship field to a single,
+    specific, verified target state (null) rather than reading and rewriting a whole computed
+    field, and the reread below independently confirms that target state regardless of what a
+    concurrent editor did to `parent` in between.
+    """
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+
+    payload = edit_issue_payload(clear_parent=True, story_points_field=config.story_points_field)
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            current = client.get_issue(issue_key, fields=["parent"])
+            before = (current.get("fields") or {}).get("parent")
+            if not execute:
+                _say("[yellow]Dry run:[/yellow] would clear issue parent", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({"before": before, "payload": payload, "dry_run": True})
+                else:
+                    _print_json({"before": before, "payload": payload})
+                _say("Pass --execute to clear the parent in Jira.", json_mode=json_output)
+                return
+
+            result = client.edit_issue(issue_key, clear_parent=True)
+            audit_warning = _audit_committed_write(
+                config,
+                action="clear_parent",
+                issue_key=issue_key,
+                payload={"before": before, "payload": payload},
+                result=result,
+            )
+            try:
+                verified = client.get_issue(issue_key, fields=["parent"])
+            except JiraApiError as exc:
+                verification_warning = committed_verification_warning(
+                    action="clear_parent", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "edit": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                else:
+                    error_console.print(
+                        f"[yellow]Warning:[/yellow] {verification_warning['message']}"
+                    )
+                    console.print(f"Parent clear for {issue_key} is committed but unverified.")
+                return
+            after = (verified.get("fields") or {}).get("parent")
+            if after is not None:
+                raise ValueError(f"Parent clear was not verified for {issue_key}: {after!r}")
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+        except ValueError as exc:
+            error_console.print(f"[red]Parent clear error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    if json_output:
+        response = {**verified, "ok": True, "committed": True, "dry_run": False}
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+        return
+    console.print(f"Cleared parent of {issue_key}.")
 
 
 @app.command("patch-description-section")
@@ -1570,6 +2519,19 @@ def patch_description_section(
             help="Permit a slice that is the whole description. It grants nothing else.",
         ),
     ] = False,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Capture the issue's `updated` timestamp in the same read as the description, "
+                "then refuse the write (exit code 4) if it no longer matches immediately before "
+                "the write. This is a check-then-act narrowing of the race window, not an "
+                "atomic compare-and-swap: Jira Cloud has no conditional write here, so a change "
+                "landing in that window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually patch the section in Jira."),
@@ -1588,9 +2550,15 @@ def patch_description_section(
     whole content list needs `--allow-wide-rewrite`. Every heading inside the slice below the
     one you named has to be named too, with a repeated `--expect-swallowed-heading` in document
     order; the refusal prints the exact list. `--allow-wide-rewrite` does not satisfy the naming
-    duty. There is no optimistic concurrency: the description is
-    read and written back whole, so an edit that lands in between is silently reverted. Use this
-    instead of `edit-issue --description-section`, which always replaces the whole field.
+    duty. The description is read and written back whole, so a naive read-then-write still risks
+    silently reverting a concurrent edit. By default this command guards against exactly that:
+    the read that fetches the description also fetches `updated` in the same request, so the
+    guard token belongs to the same read as the content rather than to a second read that could
+    itself straddle a change; the write then fails with exit code 4 if `updated` no longer
+    matches immediately beforehand. This narrows the race window but does not close it — Jira
+    Cloud offers no conditional write on this resource, so an edit landing inside that narrowed
+    window is still lost. Pass --no-concurrency-guard for the old unguarded behaviour. Use this
+    command instead of `edit-issue --description-section`, which always replaces the whole field.
     """
     config = _config()
     try:
@@ -1604,15 +2572,23 @@ def patch_description_section(
         else:
             body = read_text_source(content, content_file)
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Patch error:[/red] {exc}")
+        _print_error("Patch error:", exc)
         raise typer.Exit(2) from exc
 
     with JiraClient(config) as client:
         try:
             safety = ensure_issue_write_allowed(config, client, key)
-            issue = client.get_issue(key, fields=["description"])
+            # Fetch "updated" in the SAME request as "description" so the guard token belongs
+            # to the read that produced the content being patched, rather than to a second,
+            # independent read that could itself straddle a concurrent change.
+            issue = client.get_issue(key, fields=["description", "updated"])
+            issue_fields = issue.get("fields") or {}
+            read_updated = issue_fields.get("updated")
+            expect_updated = require_concurrency_token(
+                key, read_updated, guard_enabled=concurrency_guard
+            )
             patch = patch_adf_description_section(
-                (issue.get("fields") or {}).get("description"),
+                issue_fields.get("description"),
                 section=section,
                 mode=mode,
                 content=body,
@@ -1621,26 +2597,30 @@ def patch_description_section(
                 allow_wide_rewrite=allow_wide_rewrite,
             )
         except AdfSectionPatchRefused as exc:
-            error_console.print(f"[red]Patch refused:[/red] {exc}")
-            _print_json(
-                {
-                    "error_type": "section_patch_refused",
-                    "swallowed_headings": exc.swallowed_headings,
-                    "expect_swallowed_headings": exc.named_headings,
-                    "whole_document": exc.whole_document,
-                }
-            )
+            _print_error("Patch refused:", exc)
+            if json_output:
+                _emit_json(
+                    {
+                        "error_type": "section_patch_refused",
+                        "swallowed_headings": exc.swallowed_headings,
+                        "expect_swallowed_headings": exc.named_headings,
+                        "whole_document": exc.whole_document,
+                        "dry_run": True,
+                    }
+                )
             raise typer.Exit(2) from exc
         except (OSError, ValueError) as exc:
-            error_console.print(f"[red]Patch error:[/red] {exc}")
+            _print_error("Patch error:", exc)
             raise typer.Exit(2) from exc
         except AdfPatchInvariantError as exc:
-            error_console.print(f"[red]Patch invariant error:[/red] {exc}")
+            _print_error("Patch invariant error:", exc)
             raise typer.Exit(2) from exc
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
         summary = {
             "issue": key,
@@ -1660,16 +2640,24 @@ def patch_description_section(
         }
 
         if not execute:
-            console.print("[yellow]Dry run:[/yellow] would patch one description section")
-            console.print(f"safety: {safety}")
-            _print_json(summary)
-            _print_json(patch["new_nodes"])
-            console.print("Pass --execute to write it to Jira.")
+            _say(
+                "[yellow]Dry run:[/yellow] would patch one description section",
+                json_mode=json_output,
+            )
+            _say(f"safety: {safety}", json_mode=json_output)
+            if json_output:
+                _emit_json({**summary, "new_nodes": patch["new_nodes"], "dry_run": True})
+            else:
+                _print_json(summary)
+                _print_json(patch["new_nodes"])
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
             return
 
         try:
-            data = client.edit_issue_adf_description(key, patch["document"])
-            audit_write(
+            data = client.edit_issue_adf_description(
+                key, patch["document"], expect_updated=expect_updated
+            )
+            _audit_committed_write(
                 config,
                 action="patch_description_section",
                 issue_key=key,
@@ -1678,15 +2666,20 @@ def patch_description_section(
                     "include_heading": include_heading,
                     "expect_swallowed_headings": expect_swallowed_heading,
                     "allow_wide_rewrite": allow_wide_rewrite,
+                    "concurrency_guard": concurrency_guard,
                     **summary,
                 },
                 result=data,
             )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Patched section {patch['heading']!r} of {key}.")
@@ -1695,7 +2688,42 @@ def patch_description_section(
 @app.command("mcp-config")
 def mcp_config() -> None:
     """Print the local MCP client configuration block."""
-    _print_json(_mcp_config_payload())
+    _emit_json(_mcp_config_payload())
+
+
+@app.command("config-fields")
+def config_fields(
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the resolved field ids as JSON."),
+    ] = False,
+) -> None:
+    """Show the custom field ids this tool has resolved from config. Read-only, no Jira call.
+
+    `story_points_field` and `sprint_field` are both instance-specific Jira custom field ids --
+    a story-points id that is right on one Jira site can be someone else's sprint field on
+    another -- resolved the same way in one place, `config.py`: a `JIRA_STORY_POINTS_FIELD` /
+    `JIRA_SPRINT_FIELD` env var, or this site's probed default (`customfield_10028` /
+    `customfield_10020`). Two incorrect readings came from guessing a custom field id instead of
+    checking it; this command exists so a caller can check instead of guess, before running
+    anything that writes.
+
+    On this site: `customfield_10028` is "Story Points", populated and editable for project FC,
+    and is the correct `story_points_field` default. `customfield_10016` is "Story point
+    estimate" -- it exists, but is unused and not editable for FC, and must never be the
+    configured `story_points_field` on this site.
+    """
+    config = _config()
+    if json_output:
+        _emit_json(
+            {
+                "story_points_field": config.story_points_field,
+                "sprint_field": config.sprint_field,
+            }
+        )
+        return
+    console.print(f"story_points_field: {config.story_points_field}")
+    console.print(f"sprint_field: {config.sprint_field}")
 
 
 @app.command("smoke-write")
@@ -1711,6 +2739,10 @@ def smoke_write(
         str | None,
         typer.Option("--transition", help="Optional transition name or ID to test."),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable step result."),
+    ] = False,
 ) -> None:
     """Run a write-capability smoke check against the configured test issue."""
     config = _config()
@@ -1729,49 +2761,139 @@ def smoke_write(
                 select_transition(transitions_data, transition_name) if transition_name else None
             )
 
-            console.print(f"issue: {issue_key}")
-            _print_issues_table([issue_data])
-            console.print(f"comment: {comment}")
-            console.print(f"assignee target: {me.get('displayName')} ({me.get('accountId')})")
+            if not json_output:
+                console.print(f"issue: {issue_key}")
+                _print_issues_table([issue_data])
+                console.print(f"comment: {comment}")
+                console.print(
+                    f"assignee target: {me.get('displayName')} ({me.get('accountId')})"
+                )
             if transition_name:
                 if selected:
                     target = selected.get("to") or {}
-                    console.print(
-                        f"transition target: {selected.get('name')} "
-                        f"({selected.get('id')}) -> {target.get('name')}"
-                    )
+                    if not json_output:
+                        console.print(
+                            f"transition target: {selected.get('name')} "
+                            f"({selected.get('id')}) -> {target.get('name')}"
+                        )
                 else:
-                    error_console.print(f"[red]No transition found for:[/red] {transition_name}")
+                    _print_error("No transition found for:", transition_name)
                     raise typer.Exit(1)
 
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] no Jira writes were performed.")
-                console.print("Pass --execute to add the comment and assign the issue.")
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "issue": issue_key,
+                            "transition": selected,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] no Jira writes were performed.")
+                    console.print("Pass --execute to add the comment and assign the issue.")
                 return
 
             ensure_issue_write_allowed(config, client, issue_key)
+            steps: list[dict[str, Any]] = []
             added_comment = client.add_comment(issue_key, comment)
-            client.assign_issue(issue_key, str(me["accountId"]))
-            audit_write(
+            comment_audit_warning = _audit_committed_write(
                 config,
-                action="smoke_write",
+                action="smoke_write_comment",
                 issue_key=issue_key,
-                payload={
-                    "comment": comment,
-                    "accountId": str(me["accountId"]),
-                    "transition": selected,
-                },
+                payload={"comment": comment},
                 result={"comment_id": added_comment.get("id")},
             )
-            console.print(f"added comment: {added_comment.get('id')}")
-            console.print("assigned issue to authenticated user")
+            comment_step = {
+                "step": "comment",
+                "committed": True,
+                "comment_id": added_comment.get("id"),
+            }
+            if comment_audit_warning:
+                comment_step.update(
+                    partial_success=True, audit_warning=comment_audit_warning
+                )
+            steps.append(comment_step)
+
+            try:
+                assign_result = client.assign_issue(issue_key, str(me["accountId"]))
+            except JiraApiError as exc:
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "steps": steps,
+                    "failed_step": "assign",
+                    "step_warning": committed_sequence_warning(failed_step="assign", exc=exc),
+                }
+                _emit_json(response) if json_output else _print_json(response)
+                return
+            assign_audit_warning = _audit_committed_write(
+                config,
+                action="smoke_write_assign",
+                issue_key=issue_key,
+                payload={"accountId": str(me["accountId"])},
+                result=assign_result,
+            )
+            assign_step = {
+                "step": "assign",
+                "committed": True,
+                "account_id": str(me["accountId"]),
+            }
+            if assign_audit_warning:
+                assign_step.update(partial_success=True, audit_warning=assign_audit_warning)
+            steps.append(assign_step)
+
             if selected:
-                client.transition_issue(issue_key, str(selected["id"]))
-                console.print(f"transitioned issue with {selected.get('name')}")
+                try:
+                    transition_result = client.transition_issue(issue_key, str(selected["id"]))
+                except JiraApiError as exc:
+                    response = {
+                        "ok": True,
+                        "committed": True,
+                        "partial_success": True,
+                        "issue": issue_key,
+                        "steps": steps,
+                        "failed_step": "transition",
+                        "step_warning": committed_sequence_warning(
+                            failed_step="transition", exc=exc
+                        ),
+                    }
+                    _emit_json(response) if json_output else _print_json(response)
+                    return
+                transition_audit_warning = _audit_committed_write(
+                    config,
+                    action="smoke_write_transition",
+                    issue_key=issue_key,
+                    payload={"transition": selected},
+                    result=transition_result,
+                )
+                transition_step = {
+                    "step": "transition",
+                    "committed": True,
+                    "transition_id": str(selected["id"]),
+                    "transition_name": selected.get("name"),
+                }
+                if transition_audit_warning:
+                    transition_step.update(
+                        partial_success=True, audit_warning=transition_audit_warning
+                    )
+                steps.append(transition_step)
+
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": any(step.get("partial_success") for step in steps),
+                "issue": issue_key,
+                "steps": steps,
+            }
+            _emit_json(response) if json_output else _print_json(response)
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
 
 @app.command()
@@ -1814,17 +2936,28 @@ def assign(
             me = client.myself()
             target_account_id = None if unassigned else account_id or str(me["accountId"])
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would assign issue")
-                console.print(f"issue: {issue_key}")
-                console.print(f"target accountId: {target_account_id or 'Unassigned'}")
+                _say("[yellow]Dry run:[/yellow] would assign issue", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(
+                    f"target accountId: {target_account_id or 'Unassigned'}",
+                    json_mode=json_output,
+                )
                 if not unassigned and not account_id:
-                    console.print(f"target user: {me.get('displayName')}")
-                console.print("Pass --execute to write it to Jira.")
+                    _say(f"target user: {me.get('displayName')}", json_mode=json_output)
+                if json_output:
+                    _emit_json(
+                        {
+                            "issue": issue_key,
+                            "accountId": target_account_id,
+                            "dry_run": True,
+                        }
+                    )
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.assign_issue(issue_key, target_account_id)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="assign_issue",
                 issue_key=issue_key,
@@ -1832,12 +2965,12 @@ def assign(
                 result=data,
             )
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Assigned {issue_key} to {target_account_id or 'Unassigned'}.")
@@ -1885,7 +3018,7 @@ def assign_user(
 
             ensure_issue_write_allowed(config, client, issue_key)
             data = client.assign_issue(issue_key, str(user["accountId"]))
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="assign_user",
                 issue_key=issue_key,
@@ -1902,22 +3035,43 @@ def assign_user(
 
 @app.command("link-issue")
 def link_issue(
-    outward_key: Annotated[str, typer.Argument(help="Outward issue key.")],
-    inward_key: Annotated[str, typer.Argument(help="Inward issue key.")],
+    outward_key: Annotated[
+        str,
+        typer.Argument(
+            help="Issue displaying the link type's outward label, for example 'blocks'."
+        ),
+    ],
+    inward_key: Annotated[
+        str,
+        typer.Argument(
+            help="Issue displaying the link type's inward label, for example 'is blocked by'."
+        ),
+    ],
     link_type: Annotated[
         str,
         typer.Option("--type", help="Jira issue link type name."),
     ] = "Relates",
     comment: Annotated[
         str | None,
-        typer.Option("--comment", help="Optional comment on the outward issue."),
+        typer.Option(
+            "--comment",
+            help=(
+                "Optional comment written to INWARD_KEY (the second argument), because Jira "
+                "attaches an issue-link comment to its inverse REST outwardIssue."
+            ),
+        ),
     ] = None,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually create the issue link in Jira."),
     ] = False,
 ) -> None:
-    """Link two Jira issues. Defaults to dry-run."""
+    """Link two Jira issues by business direction. Defaults to dry-run.
+
+    Jira's REST endpoint inverts the business endpoint names used by this command. Its optional
+    inline comment lands on REST ``outwardIssue``, which is this command's ``INWARD_KEY`` (the
+    second argument). The dry run prints that target explicitly.
+    """
     config = _config()
     payload = issue_link_payload(
         outward_issue_key=outward_key,
@@ -1927,12 +3081,16 @@ def link_issue(
     )
     with JiraClient(config) as client:
         try:
+            require_shared_write_scope(config, [outward_key, inward_key])
             outward_safety = ensure_issue_write_allowed(config, client, outward_key)
             inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            comment_issue_key = inward_key if comment else None
             if not execute:
                 console.print("[yellow]Dry run:[/yellow] would create issue link")
                 console.print(f"outward safety: {outward_safety}")
                 console.print(f"inward safety: {inward_safety}")
+                if comment_issue_key:
+                    console.print(f"comment issue: {comment_issue_key}")
                 _print_json(payload)
                 console.print("Pass --execute to write it to Jira.")
                 return
@@ -1943,11 +3101,11 @@ def link_issue(
                 link_type=link_type,
                 comment=comment,
             )
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="link_issue",
-                issue_key=outward_key,
-                payload=payload,
+                issue_key=comment_issue_key or outward_key,
+                payload={**payload, "comment_issue_key": comment_issue_key},
                 result=data,
             )
         except JiraWriteSafetyError as exc:
@@ -1956,6 +3114,144 @@ def link_issue(
             _exit_api_error(exc)
 
     console.print(f"Linked {outward_key} to {inward_key} with {link_type}.")
+
+
+@app.command("delete-issue-link")
+def delete_issue_link(
+    outward_key: Annotated[str, typer.Argument(help="Expected outward issue key.")],
+    inward_key: Annotated[str, typer.Argument(help="Expected inward issue key.")],
+    link_type: Annotated[
+        str,
+        typer.Option("--type", help="Exact Jira issue link type name."),
+    ] = "Relates",
+    link_id: Annotated[
+        str | None,
+        typer.Option(
+            "--link-id",
+            help="Optional exact Jira link id. Omit only when the fresh reads identify one link.",
+        ),
+    ] = None,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually delete the validated issue link in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable deletion result."),
+    ] = False,
+) -> None:
+    """Delete one validated directed issue link. Defaults to dry-run."""
+    try:
+        outward_key = normalize_jira_issue_key(outward_key, name="outward_key")
+        inward_key = normalize_jira_issue_key(inward_key, name="inward_key")
+        if link_id is not None:
+            link_id = str(normalize_jira_numeric_id(link_id, name="link_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+    config = _config()
+    with JiraClient(config) as client:
+        try:
+            require_shared_write_scope(config, [outward_key, inward_key])
+            outward_safety = ensure_issue_write_allowed(config, client, outward_key)
+            inward_safety = ensure_issue_write_allowed(config, client, inward_key)
+            outward_issue = client.get_issue(outward_key, fields=["issuelinks"])
+            inward_issue = client.get_issue(inward_key, fields=["issuelinks"])
+            resolved = resolve_directed_issue_link(
+                outward_issue=outward_issue,
+                inward_issue=inward_issue,
+                outward_key=outward_key,
+                inward_key=inward_key,
+                link_type=link_type,
+                link_id=link_id,
+            )
+            resolved["id"] = str(normalize_jira_numeric_id(resolved["id"], name="link_id"))
+            if not execute:
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "resolved_link": resolved,
+                            "outward_safety": outward_safety,
+                            "inward_safety": inward_safety,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] would delete issue link")
+                    console.print(f"outward safety: {outward_safety}")
+                    console.print(f"inward safety: {inward_safety}")
+                    _print_json({"resolved_link": resolved})
+                    console.print("Pass --execute to delete this exact link in Jira.")
+                return
+
+            result = client.delete_issue_link(resolved["id"], issue_key=outward_key)
+            audit_warning = _audit_committed_write(
+                config,
+                action="delete_issue_link",
+                issue_key=outward_key,
+                payload={"resolved_link": resolved},
+                result=result,
+            )
+            try:
+                verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
+                verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
+            except JiraApiError as exc:
+                verification_warning = committed_verification_warning(
+                    action="delete_issue_link", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "resolved_link": resolved,
+                    "result": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                    return
+                error_console.print(f"[yellow]Warning:[/yellow] {verification_warning['message']}")
+                console.print(
+                    f"Deleted {link_type} link {resolved['id']} from {outward_key} to "
+                    f"{inward_key}; verification unavailable."
+                )
+                return
+            still_present = {
+                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
+                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
+            }
+            if any(still_present.values()):
+                raise ValueError(
+                    f"Issue-link deletion was not verified for {resolved['id']}: {still_present}"
+                )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+        except ValueError as exc:
+            error_console.print(f"[red]Issue-link deletion error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    if json_output:
+        response = {
+            "ok": True,
+            "committed": True,
+            "resolved_link": resolved,
+            "result": result,
+            "verified_absent": True,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+    else:
+        console.print(
+            f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}."
+        )
 
 
 @app.command("attach")
@@ -1993,15 +3289,19 @@ def attach(
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would attach file")
-                console.print(f"issue: {issue_key}")
-                console.print(f"file: {file_path}")
-                console.print(f"safety: {safety}")
-                console.print("Pass --execute to upload it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would attach file", json_mode=json_output)
+                _say(f"issue: {issue_key}", json_mode=json_output)
+                _say(f"file: {file_path}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json({"issue": issue_key, "file": str(file_path), "dry_run": True})
+                _say("Pass --execute to upload it to Jira.", json_mode=json_output)
                 return
 
-            data = client.add_attachment(issue_key, file_path)
-            audit_write(
+            data = validate_attachment_upload_response(
+                client.add_attachment(issue_key, file_path)
+            )
+            audit_warning = _audit_committed_write(
                 config,
                 action="attach",
                 issue_key=issue_key,
@@ -2009,12 +3309,15 @@ def attach(
                 result={"attachments": data},
             )
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        output: dict[str, Any] = {"attachments": data, "dry_run": False}
+        if audit_warning:
+            output.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(output)
         return
     for attachment in data:
         console.print(f"Attached {attachment.get('filename')} ({attachment.get('id')}).")
@@ -2046,6 +3349,11 @@ def delete_attachment(
     if not attachment_id:
         error_console.print("[red]--attachment-id is required.[/red]")
         raise typer.Exit(2)
+    try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc)
 
     with JiraClient(config) as client:
         try:
@@ -2070,7 +3378,7 @@ def delete_attachment(
                 return
 
             data = client.delete_attachment(attachment_id, issue_key=issue_key)
-            audit_write(
+            _audit_committed_write(
                 config,
                 action="delete_attachment",
                 issue_key=issue_key,
@@ -2113,12 +3421,47 @@ def embed_diagram(
             help="Comma-separated existing attachment ids to remove.",
         ),
     ] = None,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Uploading the file is itself a write that moves this issue's own `updated`, so "
+                "the token cannot come from the FIRST read (the one that only resolves "
+                "--delete-filename and feeds the dry-run display). Instead, after the upload, "
+                "this re-reads the description and `updated` together in one request and builds "
+                "the write from THAT read, then refuses the write (exit code 4) if `updated` no "
+                "longer matches immediately before it. This is a check-then-act narrowing of the "
+                "race window, not an atomic compare-and-swap: Jira Cloud has no conditional write "
+                "here, so a change landing in that narrower window is still lost. "
+                "Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Upload, embed, and clean up in Jira."),
     ] = False,
 ) -> None:
-    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run."""
+    """Upload a PNG diagram and embed it in the Jira description. Defaults to dry-run.
+
+    This rewrites the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded, but unlike
+    `embed-existing-png` and `upsert-image-gallery`, the token cannot come from the FIRST read
+    (the one that fetches attachments to resolve `--delete-filename` and populate the dry-run
+    display): uploading the file is itself a write that moves this issue's own `updated` on the
+    Jira side, so a token read before the upload is stale by construction, and a description
+    built from that same first read would already be out of date by the time of the write.
+
+    Instead, after the upload this re-reads the description and `updated` together in one
+    request, and builds the write from THAT read. The guard therefore covers only the span from
+    this post-upload read to the write: a concurrent edit landing before that read is
+    incorporated into the write rather than lost, because the description being rewritten is the
+    fresh one, not the first-read one. This is still check-then-act, not an atomic
+    compare-and-swap — Jira Cloud has no conditional write on this resource, so a change landing
+    between the post-upload read and the write is still lost. Pass --no-concurrency-guard for the
+    old unguarded behaviour.
+    """
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -2132,17 +3475,40 @@ def embed_diagram(
     try:
         width, height = png_dimensions(file_path)
     except ValueError as exc:
-        error_console.print(f"[red]Diagram error:[/red] {exc}")
+        _print_error("Diagram error:", exc)
         raise typer.Exit(2) from exc
 
     delete_names = set(_csv_list(delete_filename) or [])
-    delete_ids = set(_csv_list(delete_attachment_id) or [])
+    try:
+        delete_ids = {
+            str(normalize_jira_numeric_id(value, name="delete_attachment_id"))
+            for value in (_csv_list(delete_attachment_id) or [])
+        }
+    except JiraApiError as exc:
+        _exit_api_error(exc)
 
     with JiraClient(config) as client:
+        uploaded_ids: list[str] = []
         try:
             safety = ensure_issue_write_allowed(config, client, issue_key)
+            # First read: legitimately only for resolving --delete-filename to attachment ids
+            # and for the dry-run display. Its `description` is never written; see the write
+            # below, which reads a fresh copy after the upload.
             issue = client.get_issue(issue_key, fields=["description", "attachment"])
             attachments = issue.get("fields", {}).get("attachment") or []
+            current_attachment_ids = {
+                str(attachment.get("id"))
+                for attachment in attachments
+                if isinstance(attachment, dict) and attachment.get("id") is not None
+            }
+            unknown_delete_ids = delete_ids - current_attachment_ids
+            if unknown_delete_ids:
+                _print_error(
+                    "Attachment delete refused:",
+                    "every --delete-attachment-id must belong to the target issue; not present "
+                    f"on {issue_key}: {', '.join(sorted(unknown_delete_ids))}.",
+                )
+                raise typer.Exit(2)
             for attachment in attachments:
                 if attachment.get("filename") in delete_names:
                     delete_ids.add(str(attachment.get("id")))
@@ -2157,10 +3523,22 @@ def embed_diagram(
                 return
 
             uploaded = client.add_attachment(issue_key, file_path)
+            if not uploaded:
+                raise JiraApiError(
+                    f"Jira returned no attachment metadata for {Path(file_path).name}."
+                )
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
+            uploaded_ids.append(attachment_id)
             media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
-            existing_description = issue.get("fields", {}).get("description") or {
+            # The upload above already changed this issue's `updated` on the Jira side, so
+            # content and guard token are read together HERE, after the last mutation this
+            # command makes before its write, rather than built from the first (now possibly
+            # stale) read above. This is what makes the guard meaningful: the token and the
+            # document it is meant to protect come from the same request.
+            fresh_issue = client.get_issue(issue_key, fields=["description", "updated"])
+            fresh_fields = fresh_issue.get("fields") or {}
+            existing_description = fresh_fields.get("description") or {
                 "type": "doc",
                 "version": 1,
                 "content": [],
@@ -2172,33 +3550,304 @@ def embed_diagram(
                 width=width,
                 height=height,
             )
-            result = client.edit_issue_adf_description(issue_key, description)
-            deleted: list[str] = []
-            for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id, issue_key=issue_key)
-                deleted.append(item_id)
-            audit_write(
-                config,
-                action="embed_diagram",
-                issue_key=issue_key,
-                payload={
-                    "file": str(file_path),
-                    "attachment_id": attachment_id,
-                    "media_id": media_id,
-                    "deleted_attachment_ids": deleted,
-                    "dimensions": {"width": width, "height": height},
-                },
-                result=result,
+            expect_updated = require_concurrency_token(
+                issue_key, fresh_fields.get("updated"), guard_enabled=concurrency_guard
             )
+            result = client.edit_issue_adf_description(
+                issue_key, description, expect_updated=expect_updated
+            )
+        except JiraConcurrentEditError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
+            _exit_concurrent_edit_error(exc, json_mode=False)
+        except JiraMissingConcurrencyTokenError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
+            _exit_missing_concurrency_token_error(exc, json_mode=False)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
+            _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
             _exit_api_error(exc)
+
+        # The description write is already committed. Record it before best-effort cleanup so a
+        # cleanup failure cannot hide the accepted mutation and provoke a duplicate retry.
+        cleanup_pending_ids = sorted(delete_ids - {attachment_id})
+        audit_warning = audit_committed_write(
+            config,
+            action="embed_diagram",
+            issue_key=issue_key,
+            payload={
+                "file": str(file_path),
+                "attachment_id": attachment_id,
+                "media_id": media_id,
+                "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                "deleted_attachment_ids": [],
+                "dimensions": {"width": width, "height": height},
+                "concurrency_guard": concurrency_guard,
+            },
+            result=result,
+            writer=audit_write,
+        )
+        deleted, cleanup_failures = _delete_attachments_best_effort(
+            client, issue_key, cleanup_pending_ids
+        )
 
     console.print(
         f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
         f"deleted {len(deleted)} old attachment(s)."
     )
+    if cleanup_failures:
+        error_console.print(
+            f"[yellow]Warning:[/yellow] {len(cleanup_failures)} superseded attachment(s) "
+            "could not be deleted; the new description and upload remain committed."
+        )
+    if audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {audit_warning['message']}")
+
+
+@app.command("embed-existing-png")
+def embed_existing_png(
+    key: Annotated[
+        str | None,
+        typer.Argument(help="Jira issue key. Defaults to JIRA_TEST_ISSUE_KEY."),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        typer.Option("--filename", help="Exact existing PNG attachment filename."),
+    ] = None,
+    attachment_id: Annotated[
+        str | None,
+        typer.Option("--attachment-id", help="Pin an exact attachment id when filenames repeat."),
+    ] = None,
+    width: Annotated[
+        int | None,
+        typer.Option("--width", min=1, help="Verified PNG display width in pixels."),
+    ] = None,
+    height: Annotated[
+        int | None,
+        typer.Option("--height", min=1, help="Verified PNG display height in pixels."),
+    ] = None,
+    alt: Annotated[
+        str,
+        typer.Option("--alt", help="Alt text for the embedded diagram."),
+    ] = "Architecture diagram",
+    replace_existing: Annotated[
+        bool,
+        typer.Option(
+            "--replace-existing",
+            help=(
+                "Replace exactly one currently embedded media item from an attachment of this "
+                "filename."
+            ),
+        ),
+    ] = False,
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Capture the issue's `updated` timestamp in the same read as the description, "
+                "then refuse the write (exit code 4) if it no longer matches immediately before "
+                "the write. This is a check-then-act narrowing of the race window, not an "
+                "atomic compare-and-swap: Jira Cloud has no conditional write here, so a change "
+                "landing in that window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually embed the existing attachment in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable embed result."),
+    ] = False,
+) -> None:
+    """Embed one existing PNG attachment without uploading a duplicate. Defaults to dry-run.
+
+    This rewrites the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded: the same read that
+    fetches the description and attachments also fetches `updated`, so the guard token belongs
+    to that read rather than to a second one that could itself straddle a change; the write then
+    refuses (exit code 4) if `updated` no longer matches immediately beforehand. Pass
+    --no-concurrency-guard for the old unguarded behaviour.
+    """
+    config = _config()
+    issue_key = key or config.test_issue_key
+    if not issue_key:
+        error_console.print(
+            "[red]No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.[/red]"
+        )
+        raise typer.Exit(2)
+    if not filename:
+        error_console.print("[red]--filename is required.[/red]")
+        raise typer.Exit(2)
+    if width is None or height is None:
+        error_console.print(
+            "[red]--width and --height are required; dimensions are never guessed.[/red]"
+        )
+        raise typer.Exit(2)
+    try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        if attachment_id is not None:
+            attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
+    with JiraClient(config) as client:
+        try:
+            safety = ensure_issue_write_allowed(config, client, issue_key)
+            issue = client.get_issue(issue_key, fields=["description", "attachment", "updated"])
+            expect_updated = require_concurrency_token(
+                issue_key,
+                (issue.get("fields") or {}).get("updated"),
+                guard_enabled=concurrency_guard,
+            )
+            attachment = resolve_png_attachment(
+                issue, filename=filename, attachment_id=attachment_id
+            )
+            resolved_id = str(normalize_jira_numeric_id(attachment["id"], name="attachment_id"))
+            media_id = client.attachment_media_id(resolved_id, issue_key=issue_key)
+            existing_description = issue.get("fields", {}).get("description") or {
+                "type": "doc",
+                "version": 1,
+                "content": [],
+            }
+            replace_media_id: str | None = None
+            if replace_existing:
+                same_filename = [
+                    item
+                    for item in issue.get("fields", {}).get("attachment") or []
+                    if isinstance(item, dict) and item.get("filename") == filename
+                ]
+                embedded_ids = [
+                    client.attachment_media_id(str(item["id"]), issue_key=issue_key)
+                    for item in same_filename
+                    if item.get("id") is not None
+                ]
+                matches = [
+                    item_id
+                    for item_id in embedded_ids
+                    if adf_contains_media_id(existing_description, item_id)
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "Expected exactly one embedded media item from attachments named "
+                        f"{filename!r}; "
+                        f"found {len(matches)}."
+                    )
+                replace_media_id = matches[0]
+
+            payload = {
+                "attachment_id": resolved_id,
+                "filename": filename,
+                "media_id": media_id,
+                "dimensions": {"width": width, "height": height},
+                "replace_media_id": replace_media_id,
+            }
+            if not execute:
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "issue": issue_key,
+                            "safety": safety,
+                            "payload": payload,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] would embed existing PNG attachment")
+                    console.print(f"issue: {issue_key}")
+                    console.print(f"safety: {safety}")
+                    _print_json(payload)
+                    console.print("Pass --execute to embed this existing attachment in Jira.")
+                return
+
+            description = replace_diagram_with_media(
+                existing_description,
+                media_id=media_id,
+                alt=alt,
+                width=width,
+                height=height,
+                replace_media_id=replace_media_id,
+            )
+            result = client.edit_issue_adf_description(
+                issue_key, description, expect_updated=expect_updated
+            )
+            audit_warning = _audit_committed_write(
+                config,
+                action="embed_existing_png",
+                issue_key=issue_key,
+                payload={**payload, "concurrency_guard": concurrency_guard},
+                result=result,
+            )
+            try:
+                verified = client.get_issue(issue_key, fields=["description", "attachment"])
+                resolve_png_attachment(
+                    verified, filename=filename, attachment_id=resolved_id
+                )
+            except (JiraApiError, ValueError) as exc:
+                verification_warning = committed_verification_warning(
+                    action="embed_existing_png", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "attachment_id": resolved_id,
+                    "media_id": media_id,
+                    "result": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                    return
+                error_console.print(f"[yellow]Warning:[/yellow] {verification_warning['message']}")
+                console.print(
+                    f"Embedded existing {filename} ({resolved_id}) into {issue_key}; "
+                    "verification unavailable."
+                )
+                return
+            verified_description = (verified.get("fields") or {}).get("description") or {}
+            embedded = adf_contains_media_id(verified_description, media_id)
+            if not embedded:
+                raise ValueError(
+                    f"Existing attachment {resolved_id} was not found inline after rereading "
+                    f"{issue_key}."
+                )
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+        except ValueError as exc:
+            error_console.print(f"[red]Existing PNG embed error:[/red] {exc}")
+            raise typer.Exit(1) from exc
+
+    if json_output:
+        response = {
+            "ok": True,
+            "committed": True,
+            "issue": issue_key,
+            "attachment_id": resolved_id,
+            "media_id": media_id,
+            "result": result,
+            "verified_embedded": True,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+    else:
+        console.print(f"Embedded existing {filename} ({resolved_id}) into {issue_key}.")
 
 
 @app.command("upsert-image-gallery")
@@ -2216,24 +3865,50 @@ def upsert_image_gallery(
         str,
         typer.Option("--before-heading"),
     ] = "Child Issues",
+    concurrency_guard: Annotated[
+        bool,
+        typer.Option(
+            "--concurrency-guard/--no-concurrency-guard",
+            help=(
+                "Capture the issue's `updated` timestamp in the same read as the description, "
+                "then refuse the write (exit code 4) if it no longer matches immediately before "
+                "the write. This is a check-then-act narrowing of the race window, not an "
+                "atomic compare-and-swap: Jira Cloud has no conditional write here, so a change "
+                "landing in that window is still lost. Default: guarded."
+            ),
+        ),
+    ] = True,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually update the Jira description."),
     ] = False,
 ) -> None:
-    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
+    """Insert or replace a linked screenshot gallery using existing Jira attachments.
+
+    This rewrites the whole description field, so a concurrent edit to that field would
+    otherwise be silently overwritten. By default the write is guarded: the same read that
+    fetches the description and attachments also fetches `updated`, so the guard token belongs
+    to that read rather than to a second one that could itself straddle a change; the write then
+    refuses (exit code 4) if `updated` no longer matches immediately beforehand. Pass
+    --no-concurrency-guard for the old unguarded behaviour.
+    """
     config = _config()
     try:
         manifest = load_image_gallery_manifest(manifest_path)
     except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Gallery manifest error:[/red] {exc}")
+        _print_error("Gallery manifest error:", exc)
         raise typer.Exit(2) from exc
 
     filenames = {str(row["file"]) for section in manifest["sections"] for row in section["rows"]}
     with JiraClient(config) as client:
         try:
             safety = ensure_issue_write_allowed(config, client, key)
-            issue = client.get_issue(key, fields=["description", "attachment"])
+            issue = client.get_issue(key, fields=["description", "attachment", "updated"])
+            expect_updated = require_concurrency_token(
+                key,
+                (issue.get("fields") or {}).get("updated"),
+                guard_enabled=concurrency_guard,
+            )
             attachments = issue.get("fields", {}).get("attachment") or []
             by_name = newest_attachments_by_filename(attachments)
             missing = sorted(filenames - set(by_name))
@@ -2271,8 +3946,10 @@ def upsert_image_gallery(
                 console.print("Pass --execute to update the Jira description.")
                 return
 
-            result = client.edit_issue_adf_description(key, description)
-            audit_write(
+            result = client.edit_issue_adf_description(
+                key, description, expect_updated=expect_updated
+            )
+            _audit_committed_write(
                 config,
                 action="upsert_image_gallery",
                 issue_key=key,
@@ -2281,12 +3958,17 @@ def upsert_image_gallery(
                     "filenames": sorted(filenames),
                     "documentation_filename": documentation_filename,
                     "before_heading": before_heading,
+                    "concurrency_guard": concurrency_guard,
                 },
                 result=result,
             )
         except ValueError as exc:
-            error_console.print(f"[red]Gallery error:[/red] {exc}")
+            _print_error("Gallery error:", exc)
             raise typer.Exit(2) from exc
+        except JiraConcurrentEditError as exc:
+            _exit_concurrent_edit_error(exc, json_mode=False)
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=False)
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc)
         except JiraApiError as exc:
@@ -2322,10 +4004,10 @@ def changelog(
         try:
             data = client.get_changelog(issue_key, limit=limit)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
     for entry in data.get("values") or []:
         author = entry.get("author") or {}
@@ -2351,7 +4033,7 @@ def audit_log(
     config = _config()
     records = _read_audit_records(config.audit_log_path, limit)
     if json_output:
-        _print_json(records)
+        _emit_json(records)
         return
     if not records:
         console.print("No audit records.")
@@ -2366,7 +4048,7 @@ def audit_log(
             str(record.get("action")),
             str(record.get("issue_key")),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 @app.command()
@@ -2377,15 +4059,21 @@ def transitions(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """List available transitions for one Jira issue."""
+    """List available transitions for one Jira issue.
+
+    An EMPTY result is not necessarily the end of the workflow: it means Jira offered none of
+    its own applicable transitions to the authenticated account right now, which can mean no
+    permission just as easily as no applicable transition (probed against the real instance:
+    two of three FC issues checked hit exactly this).
+    """
     with _client() as client:
         try:
             data = client.get_transitions(key)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json(data)
         return
 
     transitions_data = data.get("transitions") or []
@@ -2393,18 +4081,28 @@ def transitions(
         error_console.print("[red]Unexpected Jira response: transitions is not a list[/red]")
         raise typer.Exit(1)
 
+    if not transitions_data:
+        console.print(
+            "No transitions available for this account on this issue right now "
+            "(no permission or no applicable transition -- not necessarily the end of the "
+            "workflow)."
+        )
+        return
+
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID", no_wrap=True)
     table.add_column("Name", no_wrap=True)
     table.add_column("To")
+    table.add_column("Category")
     for transition in transitions_data:
         target = transition.get("to") or {}
         table.add_row(
             str(transition.get("id") or ""),
             str(transition.get("name") or ""),
             str(target.get("name") or ""),
+            str((target.get("statusCategory") or {}).get("name") or ""),
         )
-    console.print(table)
+    table_console.print(table)
 
 
 @app.command()
@@ -2414,6 +4112,34 @@ def transition(
         str,
         typer.Argument(help="Transition name or transition ID."),
     ],
+    field: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--field",
+            help=(
+                "Supply one required transition field as NAME=VALUE (repeatable), for example "
+                "--field resolution=\"Won't Do\". NAME is the field id Jira's transition metadata "
+                "names (see `transitions --json` for a given issue); the value is sent as Jira's "
+                "plain string or {\"name\": ...} shape, decided from that field's own schema, not "
+                "hardcoded to any one field id."
+            ),
+        ),
+    ] = None,
+    allow_backwards_transition: Annotated[
+        bool,
+        typer.Option(
+            "--allow-backwards-transition",
+            help=(
+                "Allow a transition whose target status category is EARLIER than the issue's "
+                "current one on the fixed To Do < In Progress < Done order, or whose direction "
+                "could not be determined because a category was missing from Jira's response -- "
+                "both refused by default. This checks the category information Jira's response "
+                "happens to carry, not a safety guarantee about the site's actual workflow: a "
+                "differently configured workflow can make a forward-looking category a real "
+                "regression anyway."
+            ),
+        ),
+    ] = False,
     execute: Annotated[
         bool,
         typer.Option("--execute", help="Actually transition the issue in Jira."),
@@ -2423,43 +4149,870 @@ def transition(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Transition one Jira issue. Defaults to dry-run."""
+    """Transition one Jira issue. Defaults to dry-run.
+
+    Refuses by default when the chosen transition would move the issue backwards (see
+    --allow-backwards-transition) or when it requires a field --field did not supply (naming the
+    field and, when Jira provided them, its allowed values). Both checks run identically in the
+    dry run and under --execute, so a clean dry run predicts the real one.
+    """
+    supplied_fields = _parse_transition_fields(field)
+
     with _client() as client:
         try:
             transition_data = client.get_transitions(key)
             selected = select_transition(transition_data, transition_name_or_id)
             if selected is None:
-                error_console.print(f"[red]No transition found for:[/red] {transition_name_or_id}")
-                raise typer.Exit(1)
+                _exit_transition_not_found(
+                    key, transition_name_or_id, transition_data, json_mode=json_output
+                )
+
+            issue = client.get_issue(key, fields=["status"])
+            current_category = issue_status_category(issue)
+
+            try:
+                check_transition_direction(
+                    issue_key=key,
+                    transition=selected,
+                    current_category=current_category,
+                    allow_backwards=allow_backwards_transition,
+                )
+            except TransitionDirectionRefusedError as exc:
+                _exit_transition_direction_refused(exc, json_mode=json_output)
+
+            missing = transition_required_fields_missing(selected, supplied_fields)
+            if missing:
+                fields_exc = TransitionFieldsMissingError(
+                    transition_name=str(selected.get("name") or ""), missing=missing
+                )
+                _exit_transition_fields_missing(fields_exc, json_mode=json_output)
+
+            fields_payload = transition_fields_payload(selected, supplied_fields)
 
             if not execute:
                 target = selected.get("to") or {}
-                console.print("[yellow]Dry run:[/yellow] would transition issue")
-                console.print(f"issue: {key}")
-                console.print(f"transition: {selected.get('name')} ({selected.get('id')})")
-                console.print(f"target status: {target.get('name')}")
-                console.print("Pass --execute to write it to Jira.")
+                _say("[yellow]Dry run:[/yellow] would transition issue", json_mode=json_output)
+                _say(f"issue: {key}", json_mode=json_output)
+                _say(
+                    f"transition: {selected.get('name')} ({selected.get('id')})",
+                    json_mode=json_output,
+                )
+                _say(f"target status: {target.get('name')}", json_mode=json_output)
+                _say(
+                    f"category: {current_category!r} -> "
+                    f"{transition_target_category(selected)!r}",
+                    json_mode=json_output,
+                )
+                if fields_payload:
+                    _say(f"fields: {fields_payload}", json_mode=json_output)
+                if json_output:
+                    _emit_json(
+                        {
+                            "issue": key,
+                            "transition": selected,
+                            "current_category": current_category,
+                            "fields": fields_payload,
+                            "dry_run": True,
+                        }
+                    )
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
                 return
 
             ensure_issue_write_allowed(client.config, client, key)
-            data = client.transition_issue(key, str(selected["id"]))
-            audit_write(
+            data = client.transition_issue(
+                key, str(selected["id"]), fields=fields_payload or None
+            )
+            _audit_committed_write(
                 client.config,
                 action="transition_issue",
                 issue_key=key,
-                payload={"transition": selected},
+                payload={"transition": selected, "fields": fields_payload},
                 result=data,
             )
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _print_json(data)
+        _emit_json({**data, "dry_run": False})
         return
 
     console.print(f"Transitioned {key} with {selected.get('name')} ({selected.get('id')}).")
+
+
+# --- Sprint and board commands (Agile API) ------------------------------------------------
+
+
+@app.command()
+def boards(
+    board_type: Annotated[
+        str | None,
+        typer.Option("--type", help="Filter by board type, for example scrum or kanban."),
+    ] = None,
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="Filter by board name."),
+    ] = None,
+    max_results: Annotated[
+        int,
+        typer.Option("--max-results", min=1, max=100, help="Maximum boards to return."),
+    ] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """List Jira Agile boards, so a caller can find a board id without the UI.
+
+    `--max-results` defaults to 50 and this command never fetches a second page, so a site with
+    more boards than that has more than this command shows. Both output modes say so instead of
+    staying silent about it: the human table is followed by a `returned N; more remain` or
+    `returned N; complete` line taken from the response's own `isLast`, and the `--json` document
+    carries the same fact as `returned`/`is_last` alongside the raw response. No total is
+    fabricated; Jira's own `total`, when present, is reported and labelled as coming from Jira.
+    """
+    with _client() as client:
+        try:
+            data = client.list_boards(board_type=board_type, name=name, max_results=max_results)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    values = data.get("values") or []
+    returned = len(values)
+    is_last = data.get("isLast")
+    raw_total = data.get("total")
+    total = raw_total if isinstance(raw_total, int) else None
+
+    if json_output:
+        _emit_json({**data, "returned": returned, "is_last": is_last})
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("Type", no_wrap=True)
+    for board in values:
+        table.add_row(
+            str(board.get("id") or ""),
+            str(board.get("name") or ""),
+            str(board.get("type") or ""),
+        )
+    table_console.print(table)
+    if is_last is True:
+        console.print(f"returned {returned} board(s); complete")
+    elif is_last is False:
+        console.print(f"returned {returned} board(s); more remain")
+    else:
+        console.print(f"returned {returned} board(s)")
+    if total is not None:
+        console.print(f"total: {total} (from Jira's response)")
+
+
+@app.command()
+def sprints(
+    board_id: Annotated[
+        int,
+        typer.Option("--board", help="Board id. Use `boards` to find it."),
+    ],
+    state: Annotated[
+        str | None,
+        typer.Option("--state", help="Filter by sprint state: active, future, or closed."),
+    ] = None,
+    max_results: Annotated[
+        int,
+        typer.Option("--max-results", min=1, max=100, help="Maximum sprints to return."),
+    ] = 50,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """List one board's sprints.
+
+    `--max-results` defaults to 50 and this command never fetches a second page, so a board with
+    more sprints than that has more than this command shows. Both output modes say so instead of
+    staying silent about it: the human table is followed by a `returned N; more remain` or
+    `returned N; complete` line taken from the response's own `isLast`, and the `--json` document
+    carries the same fact as `returned`/`is_last` alongside the raw response. No total is
+    fabricated; Jira's own `total`, when present, is reported and labelled as coming from Jira.
+    """
+    with _client() as client:
+        try:
+            data = client.list_board_sprints(board_id, state=state, max_results=max_results)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    values = data.get("values") or []
+    returned = len(values)
+    is_last = data.get("isLast")
+    raw_total = data.get("total")
+    total = raw_total if isinstance(raw_total, int) else None
+
+    if json_output:
+        _emit_json({**data, "returned": returned, "is_last": is_last})
+        return
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("ID", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("State", no_wrap=True)
+    table.add_column("Start", no_wrap=True)
+    table.add_column("End", no_wrap=True)
+    for sprint in values:
+        # The table is a glance view, so dates are trimmed to their day; --json still carries
+        # the full Jira timestamp. A full-width Name column matters more here: an operator moving
+        # 13 issues at once reads sprint names, not sprint timestamps, to pick the right one.
+        table.add_row(
+            str(sprint.get("id") or ""),
+            str(sprint.get("name") or ""),
+            str(sprint.get("state") or ""),
+            str(sprint.get("startDate") or "")[:10],
+            str(sprint.get("endDate") or "")[:10],
+        )
+    table_console.print(table)
+    if is_last is True:
+        console.print(f"returned {returned} sprint(s); complete")
+    elif is_last is False:
+        console.print(f"returned {returned} sprint(s); more remain")
+    else:
+        console.print(f"returned {returned} sprint(s)")
+    if total is not None:
+        console.print(f"total: {total} (from Jira's response)")
+
+
+@app.command("issue-sprint")
+def issue_sprint(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    sprint_field: Annotated[
+        str | None,
+        typer.Option(
+            "--sprint-field",
+            help=(
+                "Sprint custom field id. Defaults to config.sprint_field "
+                "(JIRA_SPRINT_FIELD), resolved from config at call time rather than a fixed "
+                "literal, so a site override takes effect without passing this every time."
+            ),
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help=(
+                "Print the curated result document (issue, sprint_field, "
+                "sprint_field_present, sprints), not Jira's raw response."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Show which sprint(s) one issue is in. Read-only, no --execute.
+
+    Renders three distinct states instead of collapsing any two of them: the sprint field
+    absent from the Jira response entirely, the field present with the value `null` or an empty
+    list (the issue is in no sprint -- this Jira site returns `null`, not `[]`, verified via
+    `Sprint IS EMPTY` JQL, and both render identically here), and the field present with one or
+    more sprints.
+    """
+    with _client() as client:
+        field = sprint_field or client.config.sprint_field
+        try:
+            issue = client.get_issue(key, fields=[field])
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    fields = issue.get("fields") or {}
+    raw = fields.get(field, _SPRINT_FIELD_MISSING)
+    field_present = raw is not _SPRINT_FIELD_MISSING
+    sprint_list = raw if isinstance(raw, list) else []
+
+    if not field_present:
+        _say(
+            f"{key}: the Jira response did not include the sprint field ({field}).",
+            json_mode=json_output,
+        )
+    elif not sprint_list:
+        _say(f"{key} is in no sprint.", json_mode=json_output)
+    else:
+        _say(f"{key} is in {len(sprint_list)} sprint(s):", json_mode=json_output)
+        for sprint in sprint_list:
+            _say(
+                f"- {sprint.get('id')} {sprint.get('name')} ({sprint.get('state')})",
+                json_mode=json_output,
+            )
+
+    if json_output:
+        _emit_json(
+            {
+                "issue": key,
+                "sprint_field": field,
+                "sprint_field_present": field_present,
+                "sprints": sprint_list,
+            }
+        )
+
+
+@app.command("sprint-add")
+def sprint_add(
+    sprint_id: Annotated[int, typer.Argument(help="Target Jira sprint id.")],
+    keys: Annotated[
+        list[str],
+        typer.Argument(help="One or more Jira issue keys to add to the sprint."),
+    ],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually move the issues to the sprint."),
+    ] = False,
+    allow_sprint_reassignment: Annotated[
+        bool,
+        typer.Option(
+            "--allow-sprint-reassignment",
+            help=(
+                "Proceed when Jira will move a key out of its current active/future sprint. "
+                "Without this flag, the whole batch is refused before any write."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Move one or more issues to a sprint. Defaults to dry-run.
+
+    Jira's endpoint replaces a different current active/future sprint; it is not an additive
+    membership operation. Every invocation reads membership first, reports the replaced sprint,
+    and requires ``--allow-sprint-reassignment`` before that destructive move. Closed historical
+    sprint entries remain. Jira accepts at most 50 issues per request.
+
+    This is a single batched POST (`add_issues_to_sprint` sends every key in one request), not a
+    per-issue loop, so there is no "key 7 of 13 failed" partial state to report on the Jira side.
+    The safety gate is checked for every key before the dry run reports success, not only before
+    `--execute` writes: a clean dry run must predict what `--execute` does, and a dry run that
+    never checked the gate could report success for a batch `--execute` goes on to refuse.
+
+    The Agile add endpoint returns 204 with no body, so a 200 from Jira proves only that the
+    request was accepted, not that each issue actually ended up in the sprint. The write is
+    audited as soon as Jira accepts it -- before the post-write reread runs -- so a write that
+    landed is never left with no audit record just because that reread afterwards failed. After
+    `--execute`, every key's sprint field is re-read and `results` (per key, under `--json`; one
+    line each otherwise) reports whether it is now confirmed in `sprint_id` -- a key that is not
+    exits non-zero even though the write itself returned success. If the reread itself fails
+    (a transient Jira error, for instance), the write is reported as accepted but unverified
+    (`verified: null`) as committed partial success rather than as a failed write, and the
+    command exits successfully so an automation is not encouraged to retry the accepted move.
+    """
+    if not keys:
+        _print_error("No issue keys given:", "pass at least one issue key.")
+        raise typer.Exit(2)
+    try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
+    with _client() as client:
+        try:
+            validate_agile_issue_batch(list(keys))
+            require_shared_write_scope(client.config, keys)
+            # Check every key's write permission before writing any of them, on both the dry run
+            # and the real write. The write itself is one batched call, so this loop is what keeps
+            # a rejection on key N from following a write that already happened for keys 1..N-1:
+            # nothing is written until every key in the batch has cleared the gate.
+            safety = [
+                ensure_issue_write_allowed(client.config, client, issue_key) for issue_key in keys
+            ]
+            sprint_field = client.config.sprint_field
+            precondition = sprint_add_blast_radius(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                sprint_id,
+            )
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        if any(entry["sprints_replaced"] for entry in precondition) and not (
+            allow_sprint_reassignment
+        ):
+            _exit_sprint_reassignment_error(
+                SprintReassignmentError(sprint_id, precondition), json_mode=json_output
+            )
+
+        if not execute:
+            _say(
+                f"[yellow]Dry run:[/yellow] would add {len(keys)} issue(s) to sprint {sprint_id}",
+                json_mode=json_output,
+            )
+            for issue_key in keys:
+                entry = next(row for row in precondition if row["key"] == issue_key)
+                replaced = entry["sprints_replaced"]
+                suffix = (
+                    f", replacing {_sprint_locations(replaced)}"
+                    if replaced
+                    else ", no current sprint replaced"
+                )
+                _say(f"- {issue_key} -> sprint {sprint_id}{suffix}", json_mode=json_output)
+            _say(f"safety: {safety}", json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "sprint_id": sprint_id,
+                        "issue_keys": list(keys),
+                        "safety": safety,
+                        "precondition": precondition,
+                        "allow_sprint_reassignment": allow_sprint_reassignment,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
+            return
+
+        try:
+            data = client.add_issues_to_sprint(sprint_id, list(keys))
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        audit_warning = _audit_committed_write(
+            client.config,
+            action="sprint_add",
+            issue_key=keys[0],
+            payload={
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "precondition": precondition,
+                "allow_sprint_reassignment": allow_sprint_reassignment,
+            },
+            result=data,
+        )
+
+        verification_error: JiraApiError | None = None
+        results: list[dict[str, Any]] | None = None
+        try:
+            results = sprint_add_verification_results(
+                precondition,
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+            )
+        except JiraApiError as exc:
+            verification_error = exc
+
+    if verification_error is not None:
+        _print_error(
+            "Verification unavailable:",
+            "the write was accepted by Jira but the post-write reread failed, so it could not "
+            f"be confirmed: {verification_error}",
+        )
+        if json_output:
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": True,
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "verified": None,
+                "verification_unavailable": True,
+                "verification_warning": committed_verification_warning(
+                    action="sprint_add", exc=verification_error
+                ),
+                "result": data,
+                "dry_run": False,
+            }
+            if audit_warning:
+                response["audit_warning"] = audit_warning
+            _emit_json(response)
+        return
+
+    assert results is not None
+    failures = [entry for entry in results if not entry["verified"]]
+    for entry in results:
+        if entry["verified"]:
+            _say(f"- {entry['key']}: verified in sprint {sprint_id}", json_mode=json_output)
+        else:
+            if not entry["in_sprint"]:
+                detail = (
+                    f"target sprint {sprint_id} is missing; currently in "
+                    f"{_sprint_locations(entry['sprints'])}"
+                )
+            elif entry["still_in_replaced_sprints"]:
+                detail = (
+                    "target sprint is present, but the issue is still in replaced sprint(s) "
+                    f"{_sprint_locations(entry['still_in_replaced_sprints'])}"
+                )
+            else:
+                detail = "post-write sprint state did not match the requested move"
+            _say(
+                f"- {entry['key']}: [red]FAILURE[/red] -- {detail}",
+                json_mode=json_output,
+            )
+
+    if json_output:
+        response = {
+            "sprint_id": sprint_id,
+            "issue_keys": list(keys),
+            "result": data,
+            "results": results,
+            "ok": not failures,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+        if failures:
+            raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+        return
+
+    if failures:
+        console.print(
+            f"[red]{len(failures)} of {len(keys)} issue(s) did not verify in sprint "
+            f"{sprint_id} after the write.[/red]"
+        )
+        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+
+    console.print(f"Added {len(keys)} issue(s) to sprint {sprint_id}, verified by reread.")
+
+
+@app.command("sprint-remove")
+def sprint_remove(
+    sprint_id: Annotated[
+        int,
+        typer.Argument(help="Sprint id every key must currently be in, checked before any write."),
+    ],
+    keys: Annotated[
+        list[str],
+        typer.Argument(help="One or more Jira issue keys to move to the backlog."),
+    ],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually move the issues to the backlog."),
+    ] = False,
+    allow_multi_sprint_removal: Annotated[
+        bool,
+        typer.Option(
+            "--allow-multi-sprint-removal",
+            help=(
+                "Proceed even when a key also sits in a non-closed sprint besides SPRINT_ID. "
+                "The backlog endpoint clears that sprint too; without this flag, such a key "
+                "refuses the whole batch before any write."
+            ),
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Remove one or more issues from SPRINT_ID, moving them to the backlog. Defaults to dry-run.
+
+    BREAKING CHANGE: this command used to take only issue keys (`sprint-remove KEY...`) and post
+    them straight to the backlog endpoint. `SPRINT_ID` is now a required first argument, and it
+    is a PRECONDITION THIS COMMAND ENFORCES, NOT A FILTER JIRA APPLIES: the underlying endpoint
+    (`POST /rest/agile/1.0/backlog/issue`) takes no sprint id at all. It is documented as
+    equivalent to removing the FUTURE and ACTIVE sprints from the given issues -- ALL of them,
+    on every key in the batch, not only the one this command was told to check. Closed sprints
+    are unaffected. Jira normally permits only one current active/future sprint per issue; this
+    command nevertheless evaluates every non-closed entry Jira returns so anomalous data cannot
+    hide destructive scope.
+
+    Before any write, every key's current sprint field is re-read, and the WHOLE batch is
+    refused -- nothing written for any key -- if even one key is not currently in `SPRINT_ID`,
+    listing exactly which sprint each mismatched key is actually in. Separately, and also by
+    default, the whole batch is refused if any key sits in another non-closed sprint besides
+    `SPRINT_ID`: without `--allow-multi-sprint-removal`, that key would silently lose a sprint
+    membership nobody named. This is a check immediately before the write, the same
+    check-then-act race the write-scope gate already has, not an atomic guarantee that nothing
+    changes in between.
+
+    Like sprint-add, the write itself is one batched POST, and every key clears the write-scope
+    safety gate before the dry run reports success, not only before `--execute` writes. The dry
+    run lists, per key, every sprint it will actually leave, not only `SPRINT_ID`: a dry run that
+    under-reports the blast radius is worse than none. The write is audited as soon as Jira
+    accepts it -- before the post-write reread runs -- so a write that landed is never left with
+    no audit record just because that reread afterwards failed. The Agile endpoint returns 204
+    with no body, so after `--execute` every key's sprint field is re-read again, and `results`
+    reports, per key, whether it left every sprint the dry run said it would -- not merely
+    `SPRINT_ID` -- naming any of them it is still in. A key that still verifies as present in one
+    of them after the write is reported as a FAILURE and the command exits non-zero, even though
+    the POST itself returned success. If the reread itself fails, the write is reported as
+    accepted but unverified (`verified: null`) as committed partial success rather than as a
+    failed write, and the command exits successfully so an automation is not encouraged to
+    retry the accepted move.
+    """
+    if not keys:
+        _print_error("No issue keys given:", "pass at least one issue key.")
+        raise typer.Exit(2)
+    try:
+        sprint_id = normalize_jira_numeric_id(sprint_id, name="sprint_id")
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
+    with _client() as client:
+        try:
+            validate_agile_issue_batch(list(keys))
+            require_shared_write_scope(client.config, keys)
+            safety = [
+                ensure_issue_write_allowed(client.config, client, issue_key) for issue_key in keys
+            ]
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        sprint_field = client.config.sprint_field
+        try:
+            precondition = sprint_removal_blast_radius(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                sprint_id,
+            )
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        if any(not entry["in_sprint"] for entry in precondition):
+            _exit_sprint_precondition_error(
+                SprintPreconditionError(sprint_id, precondition), json_mode=json_output
+            )
+
+        at_risk = [entry for entry in precondition if entry["other_sprints"]]
+        if at_risk and not allow_multi_sprint_removal:
+            _exit_sprint_multi_removal_error(
+                SprintMultiRemovalError(sprint_id, precondition), json_mode=json_output
+            )
+
+        if not execute:
+            _say(
+                f"[yellow]Dry run:[/yellow] would move {len(keys)} issue(s) from sprint "
+                f"{sprint_id} to the backlog",
+                json_mode=json_output,
+            )
+            for entry in precondition:
+                _say(
+                    f"- {entry['key']} -> backlog, leaving "
+                    f"{_sprint_locations(entry['sprints_removed'])}",
+                    json_mode=json_output,
+                )
+            _say(f"safety: {safety}", json_mode=json_output)
+            if json_output:
+                _emit_json(
+                    {
+                        "sprint_id": sprint_id,
+                        "issue_keys": list(keys),
+                        "safety": safety,
+                        "precondition": precondition,
+                        "dry_run": True,
+                    }
+                )
+            _say("Pass --execute to write it to Jira.", json_mode=json_output)
+            return
+
+        try:
+            data = client.move_issues_to_backlog(list(keys))
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+        audit_warning = _audit_committed_write(
+            client.config,
+            action="sprint_remove",
+            issue_key=keys[0],
+            payload={
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
+            },
+            result=data,
+        )
+
+        verification_error: JiraApiError | None = None
+        results: list[dict[str, Any]] | None = None
+        try:
+            post_write = sprint_removal_blast_radius(
+                sprint_membership_report(client, keys, sprint_id, sprint_field=sprint_field),
+                sprint_id,
+            )
+            results = sprint_removal_verification_results(precondition, post_write)
+        except JiraApiError as exc:
+            verification_error = exc
+
+    if verification_error is not None:
+        _print_error(
+            "Verification unavailable:",
+            "the write was accepted by Jira but the post-write reread failed, so it could not "
+            f"be confirmed: {verification_error}",
+        )
+        if json_output:
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": True,
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "verified": None,
+                "verification_unavailable": True,
+                "verification_warning": committed_verification_warning(
+                    action="sprint_remove", exc=verification_error
+                ),
+                "result": data,
+                "dry_run": False,
+            }
+            if audit_warning:
+                response["audit_warning"] = audit_warning
+            _emit_json(response)
+        return
+
+    assert results is not None
+    failures = [entry for entry in results if not entry["verified"]]
+    for entry in results:
+        if entry["verified"]:
+            _say(f"- {entry['key']}: verified out of sprint {sprint_id}", json_mode=json_output)
+        else:
+            _say(
+                f"- {entry['key']}: [red]FAILURE[/red] -- still in "
+                f"{_sprint_locations(entry['still_in'])} after the write",
+                json_mode=json_output,
+            )
+
+    if json_output:
+        response = {
+            "sprint_id": sprint_id,
+            "issue_keys": list(keys),
+            "result": data,
+            "results": results,
+            "ok": not failures,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+        if failures:
+            raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+        return
+
+    if failures:
+        console.print(
+            f"[red]{len(failures)} of {len(keys)} issue(s) did not verify out of sprint "
+            f"{sprint_id} after the write.[/red]"
+        )
+        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+
+    console.print(f"Moved {len(keys)} issue(s) from sprint {sprint_id} to the backlog, verified.")
+
+
+# --- Issue type change ---------------------------------------------------------------------
+
+
+@app.command("issue-type-options")
+def issue_type_options(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help=(
+                "Print the curated result document (issue, allowed_values), not Jira's raw "
+                "editmeta response."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """List the issue types one issue may become. Read-only, no --execute."""
+    with _client() as client:
+        try:
+            metadata = client.get_edit_metadata(key)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    allowed_values = issue_type_allowed_values(metadata)
+
+    if json_output:
+        _emit_json({"issue": key, "allowed_values": allowed_values})
+        return
+
+    if allowed_values:
+        console.print(f"{key} may become: {', '.join(allowed_values)}")
+    else:
+        console.print(f"{key}: editmeta returned no allowed issue types.")
+
+
+@app.command("issue-type")
+def issue_type(
+    key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
+    new_type: Annotated[str, typer.Argument(help="Target issue type name, for example Bug.")],
+    execute: Annotated[
+        bool,
+        typer.Option("--execute", help="Actually change the issue type in Jira."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the raw Jira JSON response."),
+    ] = False,
+) -> None:
+    """Change one issue's issue type. Defaults to dry-run.
+
+    Refuses locally, before any write, when `new_type` is not among editmeta's allowed values for
+    this issue: a doomed PUT with a Jira error is worse than a local refusal that shows the
+    options. When executing, this captures `issue_version` immediately before the write and
+    passes it as `expect_updated`, so a change landing between that read and the PUT surfaces as
+    `JiraConcurrentEditError` here rather than silently overwriting it. That refusal goes through
+    the same `_exit_concurrent_edit_error` helper, and therefore the same exit code 4 and the same
+    machine-readable JSON document, as every other guarded whole-field rewrite in this file. When
+    Jira's response to that same read carries no usable `updated` timestamp, `issue_version`
+    raises `JiraMissingConcurrencyTokenError`, caught here the same way `human-brief` and
+    `edit-issue` catch it, so the same condition produces the same
+    `concurrent_edit_guard_unavailable` refusal on every guarded command rather than a generic
+    exit-1 "Jira API error" on this one.
+    """
+    with _client() as client:
+        try:
+            if not client.is_issue_type_allowed(key, new_type):
+                metadata = client.get_edit_metadata(key)
+                allowed_values = issue_type_allowed_values(metadata)
+                _print_error(
+                    "Refused:",
+                    f"{new_type!r} is not an allowed issue type for {key}. Allowed values: "
+                    f"{', '.join(allowed_values) or 'none returned by editmeta'}.",
+                )
+                raise typer.Exit(2)
+
+            safety = ensure_issue_write_allowed(client.config, client, key)
+
+            if not execute:
+                _say("[yellow]Dry run:[/yellow] would change issue type", json_mode=json_output)
+                _say(f"issue: {key}", json_mode=json_output)
+                _say(f"new type: {new_type}", json_mode=json_output)
+                _say(f"safety: {safety}", json_mode=json_output)
+                if json_output:
+                    _emit_json(
+                        {
+                            "issue": key,
+                            "requested_type": new_type,
+                            "dry_run": True,
+                        }
+                    )
+                _say("Pass --execute to write it to Jira.", json_mode=json_output)
+                return
+
+            expected_updated = client.issue_version(key)
+            try:
+                data = client.set_issue_type(key, new_type, expect_updated=expected_updated)
+            except JiraConcurrentEditError as exc:
+                _exit_concurrent_edit_error(exc, json_mode=json_output)
+
+            _audit_committed_write(
+                client.config,
+                action="issue_type",
+                issue_key=key,
+                payload={"new_type": new_type, "expect_updated": expected_updated},
+                result=data,
+            )
+        except JiraMissingConcurrencyTokenError as exc:
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
+        except JiraWriteSafetyError as exc:
+            _exit_safety_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    if json_output:
+        _emit_json({**data, "dry_run": False})
+        return
+
+    console.print(f"Changed {key} to issue type {new_type}.")
 
 
 def _run_search(
@@ -2469,41 +5022,467 @@ def _run_search(
     fields: str | None,
     next_page_token: str | None,
     json_output: bool,
+    all_pages: bool = False,
+    count: bool = False,
 ) -> None:
-    with _client() as client:
-        try:
-            data = client.search_issues(
-                jql,
-                limit=limit,
-                fields=_field_list(fields),
-                next_page_token=next_page_token,
-            )
-        except JiraApiError as exc:
-            _exit_api_error(exc)
+    """Run a JQL search and print or emit the one curated result shape every search-backed
+    command shares: ``recent``, ``mine``, ``fc-open``, ``by-status``, ``test-scope``, and
+    ``search`` itself. There is no separate raw-passthrough path any more, and no ``curated``
+    flag to pick between them — a caller that trusts one page's raw ``issues`` as the whole
+    answer is exactly the false-completeness defect this shape exists to rule out, and it does
+    not matter which command produced that page.
 
-    if json_output:
-        _print_json(data)
-        return
+    It honours ``limit`` beyond one page and ``all_pages`` via ``search_all_issues``, adds
+    ``count``'s explicitly-approximate total, and always reports ``returned``/``is_last``
+    instead of a total the API never gave it. This never emits a ``total`` key: none of these
+    commands report a match count `/search/jql` never had in the first place.
+    """
+    approximate_total: int | None = None
+    with _client() as client:
+        sprint_field = client.config.sprint_field
+        # A caller who left --fields at its shared default also gets the sprint field appended
+        # to what is actually requested (see `issue`'s identical rule); an explicit --fields is
+        # used exactly as given, matching the existing "explicit fields are not augmented" rule.
+        if fields == _DEFAULT_FIELDS_CSV:
+            requested_fields: list[str] | None = [*DEFAULT_FIELDS, sprint_field]
+        else:
+            requested_fields = _field_list(fields)
+        try:
+            if count:
+                approximate_total = client.approximate_issue_count(jql)
+            if next_page_token is None:
+                data = client.search_all_issues(
+                    jql,
+                    limit=None if all_pages else limit,
+                    fields=requested_fields,
+                )
+            else:
+                data = client.search_issues(
+                    jql,
+                    limit=limit,
+                    fields=requested_fields,
+                    next_page_token=next_page_token,
+                )
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
 
     issues = data.get("issues") or []
+    # `data` is `search_all_issues`'s own result (spelled `is_last`, snake_case like this tool's
+    # other result documents) when this is the first curated page, but Jira's raw `/search/jql`
+    # response (spelled `isLast`, Jira's own casing) when continuing a curated search from an
+    # explicit --next-page-token. Try this method's spelling first, then Jira's raw one.
+    is_last = data.get("is_last", data.get("isLast"))
+    returned = len(issues) if isinstance(issues, list) else 0
+    next_token = data.get("nextPageToken")
+
+    # Same "Jira did not return requested field(s)" banner `issue` prints, reused rather than
+    # rewritten: a wrong sprint field id (or any other field this site does not recognize) comes
+    # back as a silent HTTP 200 with the field just missing, on every row, not only on `issue`.
+    # Union across every returned row rather than just the first: Jira returns a consistent field
+    # set per query in practice, but there is no reason to trust only one row's shape when the
+    # whole page is in hand.
+    if isinstance(issues, list) and issues:
+        returned_fields: set[str] = set()
+        for issue_row in issues:
+            if isinstance(issue_row, dict):
+                returned_fields.update((issue_row.get("fields") or {}).keys())
+        _warn_missing_fields(requested_fields, returned_fields, json_mode=json_output)
+
+    if json_output:
+        payload: dict[str, Any] = {"issues": issues, "returned": returned, "is_last": is_last}
+        if next_token:
+            payload["nextPageToken"] = next_token
+        if count:
+            # Always carry the key when --count was requested, even when Jira's response left
+            # `count` out and `approximate_total` is None: a caller must be able to tell "the
+            # count was never asked for" (key absent) apart from "it was asked for and Jira did
+            # not answer" (key present, value null), rather than reading a dropped key as the
+            # latter.
+            payload["approximate_total"] = approximate_total
+        _emit_json(payload)
+        return
+
     if not isinstance(issues, list):
         error_console.print("[red]Unexpected Jira response: issues is not a list[/red]")
         raise typer.Exit(1)
-    _print_issues_table(issues)
-    if data.get("nextPageToken"):
-        console.print(f"nextPageToken: {data['nextPageToken']}")
+    # Only render a Sprint column when the sprint field was actually part of what was requested
+    # -- see `issue`'s identical rule.
+    render_sprint_field = (
+        sprint_field if requested_fields and sprint_field in requested_fields else None
+    )
+    _print_issues_table(issues, sprint_field=render_sprint_field)
+    if is_last is True:
+        console.print(f"returned {returned} issues; complete")
+    elif is_last is False:
+        console.print(f"returned {returned} issues; more remain")
+    else:
+        console.print(f"returned {returned} issues")
+    if next_token:
+        console.print(f"nextPageToken: {next_token}")
+    if count:
+        if approximate_total is not None:
+            console.print(
+                f"approximate match count: ~{approximate_total} "
+                "(Jira's approximate count, not exact)"
+            )
+        else:
+            console.print(
+                "approximate match count: unavailable (Jira's response did not include a count)"
+            )
 
 
-def _exit_api_error(exc: JiraApiError) -> None:
-    error_console.print(f"[red]Jira API error:[/red] {exc}")
+def _cleanup_uploaded_attachments(
+    client: JiraClient, issue_key: str, attachment_ids: list[str]
+) -> None:
+    """Best-effort delete of attachments this command uploaded when the write that would have
+    referenced them never happened — a refused concurrency guard or any other failure between
+    the upload and the write. Mirrors `mcp_server._cleanup_uploaded_attachments`. Deliberately
+    swallows its own `JiraApiError` so a failed cleanup attempt can never mask the original error
+    that is about to be reported and cause the exit.
+    """
+    for attachment_id in attachment_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+        except JiraApiError:
+            pass
+
+
+def _delete_attachments_best_effort(
+    client: JiraClient, issue_key: str, attachment_ids: list[str]
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Delete superseded attachments without turning a committed description write into failure."""
+    deleted: list[str] = []
+    failures: list[dict[str, str]] = []
+    for attachment_id in attachment_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+            deleted.append(attachment_id)
+        except JiraApiError as exc:
+            failures.append({"attachment_id": attachment_id, "message": str(exc)})
+    return deleted, failures
+
+
+def _exit_api_error(exc: JiraApiError, *, json_mode: bool = False) -> None:
+    """Report a Jira API failure and exit 1, on both output channels when `json_mode` is set.
+
+    Prose always goes to stderr, exactly as before `json_mode` existed. When the caller passed
+    `--json`, stdout also gets exactly one machine-readable document instead of staying empty:
+    an empty stdout on a non-zero exit is indistinguishable from a hang to a `--json` caller
+    piping into `jq` or `json.load`, and was read as such this week. `json_mode` defaults to
+    False so a call site that genuinely has no `--json` concept (a command with no such option)
+    is unaffected.
+    """
+    _print_error("Jira API error:", exc)
     if exc.details:
         error_console.print(json.dumps(exc.details, indent=2, ensure_ascii=False))
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "jira_api_error",
+                "status_code": exc.status_code,
+                "message": str(exc),
+            }
+        )
     raise typer.Exit(1) from exc
 
 
-def _exit_safety_error(exc: JiraWriteSafetyError) -> None:
-    error_console.print(f"[red]Write safety error:[/red] {exc}")
+def _exit_safety_error(exc: JiraWriteSafetyError, *, json_mode: bool = False) -> None:
+    """Report a write-safety refusal and exit 3, on both output channels when `json_mode` is set.
+
+    See `_exit_api_error` for why an empty stdout on a `--json` invocation is itself a defect.
+    """
+    _print_error("Write safety error:", exc)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "write_safety_error",
+                "message": str(exc),
+            }
+        )
     raise typer.Exit(3) from exc
+
+
+# Distinct from _exit_api_error's 1 and _exit_safety_error's 3, so a script can tell a lost-update
+# refusal apart from a transport failure or a write-scope refusal.
+CONCURRENT_EDIT_EXIT_CODE = 4
+
+
+def _exit_concurrent_edit_error(exc: JiraConcurrentEditError, *, json_mode: bool) -> None:
+    """Refuse a whole-field rewrite that lost the check-then-act race, on both output channels.
+
+    This is reached only when the guard itself found a mismatch immediately before the write, so
+    the write never happened. The caller must re-read the issue and retry with the fresh
+    `updated` value; retrying blindly with the same expectation will refuse again.
+    """
+    _print_error(
+        "Concurrent edit refused:",
+        f"{exc.issue_key} changed since it was read (expected updated={exc.expected_updated!r}, "
+        f"found updated={exc.found_updated!r}). Re-read the issue and retry.",
+    )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "concurrent_edit",
+                "issue": exc.issue_key,
+                "expected_updated": exc.expected_updated,
+                "found_updated": exc.found_updated,
+                "dry_run": False,
+            }
+        )
+    raise typer.Exit(CONCURRENT_EDIT_EXIT_CODE) from exc
+
+
+# Distinct from every exit code above: these are specific to the sprint commands' own
+# read-then-decide checks, not a Jira API failure, a write-scope refusal, or a lost-update race.
+# 5 fires before any write is attempted (sprint-remove's precondition: a key not in SPRINT_ID at
+# all); 6 fires after a write that Jira accepted but a post-write reread did not confirm, OR when
+# that reread itself failed and the write's outcome is therefore unknown rather than failed; 7
+# fires before any write, like 5, but for a different reason -- a key IS in SPRINT_ID but ALSO in
+# another non-closed sprint the write would silently clear too. A script can tell "refused, wrong
+# sprint" (5) apart from "refused, would also hit an unnamed sprint" (7) apart from "wrote, but
+# did not verify or could not check" (6) without parsing prose. 9 is the sprint-add counterpart:
+# the target write would replace a different current active/future sprint and the caller did not
+# explicitly opt in.
+SPRINT_PRECONDITION_EXIT_CODE = 5
+SPRINT_VERIFICATION_EXIT_CODE = 6
+SPRINT_MULTI_REMOVAL_EXIT_CODE = 7
+SPRINT_REASSIGNMENT_EXIT_CODE = 9
+
+# Distinct from every exit code above (1 API, 2 usage, 3 write-safety, 4 concurrent-edit/guard
+# unavailable, 5-7 sprint): `transition` refuses by default when the chosen transition's target
+# status category is earlier than the issue's current one, or when a category needed to tell
+# could not be read from Jira's response at all (see check_transition_direction /
+# TransitionDirectionRefusedError). A script can tell this refusal apart from every other one
+# above without parsing prose -- in particular from a plain "no transition matched" (exit 1) or a
+# missing-required-field refusal (also exit 1, the same family as an unmatched name: both are
+# "this request could not be resolved against what Jira just returned", not this direction check).
+TRANSITION_DIRECTION_REFUSED_EXIT_CODE = 8
+
+
+def _sprint_locations(sprints: list[dict[str, Any]]) -> str:
+    """Human-readable "where a key currently is", for sprint precondition and verification
+    reporting: every sprint id and name it is in, or "no sprint" when the list is empty.
+
+    Filters non-dict entries the same way `_sprint_cell` and `client.is_in_sprint` already do:
+    a legacy greenhopper sprint field can carry a plain string entry instead of an object, and
+    without this guard `sprint.get(...)` on that entry raises `AttributeError` instead of just
+    being skipped like everywhere else that reads this list.
+    """
+    sprints = [sprint for sprint in sprints if isinstance(sprint, dict)]
+    if not sprints:
+        return "no sprint"
+    return ", ".join(f"{sprint.get('id')} {sprint.get('name')!r}" for sprint in sprints)
+
+
+def _exit_sprint_precondition_error(exc: SprintPreconditionError, *, json_mode: bool) -> None:
+    """Refuse the whole `sprint-remove` batch before any write, when a key is not currently in
+    the named sprint. Lists every key's actual current sprint(s), not only which keys mismatched,
+    because the point of this refusal is to make the caller's wrong assumption visible rather
+    than just recorded.
+    """
+    _print_error("Refusing sprint-remove:", str(exc))
+    for entry in exc.report:
+        marker = (
+            "in target sprint"
+            if entry["in_sprint"]
+            else f"NOT in target sprint (in {_sprint_locations(entry['sprints'])})"
+        )
+        _say(f"- {entry['key']}: {marker}", json_mode=json_mode)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "sprint_precondition_failed",
+                "sprint_id": exc.sprint_id,
+                "report": exc.report,
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(SPRINT_PRECONDITION_EXIT_CODE) from exc
+
+
+def _exit_sprint_multi_removal_error(exc: SprintMultiRemovalError, *, json_mode: bool) -> None:
+    """Refuse the whole `sprint-remove` batch before any write, when a key is currently in
+    `SPRINT_ID` (the precondition above already passed) but ALSO in another non-closed sprint.
+
+    `POST /rest/agile/1.0/backlog/issue` removes every FUTURE and ACTIVE sprint an issue is in,
+    not only the one this command was told to check, so writing without this refusal would take
+    that key out of a sprint nobody named -- and report success, since the old code only checked
+    the named sprint both before and after the write. Names every additional sprint each at-risk
+    key would leave, not only that one exists, and points at the opt-in flag rather than just
+    refusing silently.
+    """
+    _print_error("Refusing sprint-remove:", str(exc))
+    for entry in exc.report:
+        if entry["other_sprints"]:
+            _say(
+                f"- {entry['key']}: would ALSO leave "
+                f"{_sprint_locations(entry['other_sprints'])}",
+                json_mode=json_mode,
+            )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "sprint_multi_removal_refused",
+                "sprint_id": exc.sprint_id,
+                "report": exc.report,
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(SPRINT_MULTI_REMOVAL_EXIT_CODE) from exc
+
+
+def _exit_sprint_reassignment_error(exc: SprintReassignmentError, *, json_mode: bool) -> None:
+    """Refuse sprint-add when Jira would replace another current active/future sprint."""
+    _print_error("Refusing sprint-add:", str(exc))
+    for entry in exc.at_risk:
+        _say(
+            f"- {entry['key']}: would leave {_sprint_locations(entry['sprints_replaced'])}",
+            json_mode=json_mode,
+        )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "sprint_reassignment_refused",
+                "sprint_id": exc.sprint_id,
+                "report": exc.report,
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(SPRINT_REASSIGNMENT_EXIT_CODE) from exc
+
+
+def _exit_missing_concurrency_token_error(
+    exc: JiraMissingConcurrencyTokenError, *, json_mode: bool
+) -> None:
+    """Refuse a guarded whole-field rewrite when Jira returned no token to guard it with.
+
+    Reached only when the guard is on (the default) and the same read that fetched the content
+    did not carry a usable `updated` timestamp. Writing anyway would silently perform the
+    unguarded write the caller did not ask for and report it as a guarded success — the exact
+    bug this refusal exists to prevent. Shares `CONCURRENT_EDIT_EXIT_CODE` with
+    `_exit_concurrent_edit_error`: both are the same family of "refused to write without the
+    requested guard", distinguished by `error_type` rather than by exit code.
+    """
+    _print_error(
+        "Concurrency guard unavailable:",
+        f"{exc.issue_key}: Jira returned no usable 'updated' timestamp to guard the write with. "
+        "Re-read the issue and retry, or pass the command's guard opt-out flag to proceed "
+        "without the guard.",
+    )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "concurrent_edit_guard_unavailable",
+                "issue": exc.issue_key,
+                "dry_run": False,
+            }
+        )
+    raise typer.Exit(CONCURRENT_EDIT_EXIT_CODE) from exc
+
+
+def _exit_transition_not_found(
+    issue_key: str,
+    requested: str,
+    transitions_data: dict[str, Any],
+    *,
+    json_mode: bool,
+) -> None:
+    """Refuse an unmatched transition name/id by listing what IS available, per issue.
+
+    `select_transition` already matches by id or case-insensitive name; this is reached only
+    when neither matched. An EMPTY list gets its own sentence, not silence: two of three FC
+    issues probed against the live instance returned an empty transitions list here, meaning no
+    permission or no applicable transition for the authenticated account right now, not the end
+    of the workflow -- and that is the COMMON case this hits, not the edge one.
+    """
+    options = describe_transition_options(transitions_data)
+    if options:
+        _print_error("No transition found for:", requested)
+        _say(f"Available transitions for {issue_key}:", json_mode=json_mode)
+        for option in options:
+            _say(
+                f"- {option['name']} ({option['id']}) -> {option['to']} "
+                f"[{option['to_category'] or 'unknown category'}]",
+                json_mode=json_mode,
+            )
+        message = f"No transition found for: {requested}"
+    else:
+        message = (
+            f"Jira returned no transitions for {issue_key} for the authenticated account. This "
+            "means no permission or no applicable transition right now, not the end of the "
+            "workflow."
+        )
+        _print_error("No transitions available:", message)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_not_found",
+                "issue": issue_key,
+                "requested": requested,
+                "available_transitions": options,
+                "message": message,
+            }
+        )
+    raise typer.Exit(1)
+
+
+def _exit_transition_direction_refused(
+    exc: TransitionDirectionRefusedError, *, json_mode: bool
+) -> None:
+    """Refuse a backwards, or undeterminable-direction, transition. See
+    TRANSITION_DIRECTION_REFUSED_EXIT_CODE for why this has its own exit code.
+    """
+    _print_error("Transition refused:", exc)
+    _say(
+        "Pass --allow-backwards-transition to do this deliberately.",
+        json_mode=json_mode,
+    )
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_direction_refused",
+                "issue": exc.issue_key,
+                "transition": {"id": exc.transition_id, "name": exc.transition_name},
+                "current_category": exc.current_category,
+                "target_category": exc.target_category,
+                "direction": exc.direction,
+                "message": str(exc),
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(TRANSITION_DIRECTION_REFUSED_EXIT_CODE) from exc
+
+
+def _exit_transition_fields_missing(
+    exc: TransitionFieldsMissingError, *, json_mode: bool
+) -> None:
+    """Refuse a transition that requires a field `--field` did not supply. Shares exit code 1
+    with `_exit_transition_not_found`: both are "this request could not be resolved against what
+    Jira just returned", distinguished by `error_type`, not by exit code.
+    """
+    _print_error("Transition refused:", exc)
+    _say("Pass --field NAME=VALUE for each missing field.", json_mode=json_mode)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "transition_fields_missing",
+                "transition": exc.transition_name,
+                "missing_fields": exc.missing,
+                "message": str(exc),
+                "dry_run": None,
+            }
+        )
+    raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":
