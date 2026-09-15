@@ -807,6 +807,116 @@ def test_create_test_issue_cli_dry_run_enforces_project_write_scope(
     assert json.loads(result.stdout)["error_type"] == "write_safety_error"
 
 
+def test_create_issue_cli_audit_oserror_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    creates: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **kwargs):
+            creates.append(kwargs)
+            return {"id": "10001", "key": "FC-123"}
+
+    def fail_create_audit(_config, **kwargs):
+        assert kwargs["action"] == "create_issue"
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "audit_write", fail_create_audit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "create-issue",
+            "Committed issue",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["key"] == "FC-123"
+    assert payload["partial_success"] is True
+    assert payload["audit_warning"]["committed"] is True
+    assert payload["audit_warning"]["action"] == "create_issue"
+    assert len(creates) == 1
+
+
+def test_create_test_issue_cli_audit_oserror_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_PROJECT_KEY": "FC",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    creates: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **kwargs):
+            creates.append(kwargs)
+            return {"id": "10002", "key": "FC-124"}
+
+    def fail_create_audit(_config, **kwargs):
+        assert kwargs["action"] == "create_issue"
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "audit_write", fail_create_audit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["create-test-issue", "Committed test issue", "--execute", "--json"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["key"] == "FC-124"
+    assert payload["partial_success"] is True
+    assert payload["audit_warning"]["committed"] is True
+    assert payload["audit_warning"]["action"] == "create_issue"
+    assert len(creates) == 1
+
+
 def test_edit_issue_cli_rejects_cross_scope_parent_before_reads_or_write(
     tmp_path, monkeypatch
 ) -> None:

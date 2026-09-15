@@ -383,6 +383,9 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   duplicate retry. If the local audit sink itself fails after Jira accepted the description,
   the command likewise returns committed partial success with an `audit_warning`, then still
   attempts the old-attachment cleanup.
+- `create-issue` and `create-test-issue` use the same committed partial-success contract: a local
+  audit failure after Jira returns the new issue never converts that successful creation into a
+  retryable failure or hides the created issue key.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,

@@ -164,6 +164,85 @@ def test_jira_create_test_issue_dry_run_enforces_project_write_scope(
     assert result["error_type"] == "write_safety"
 
 
+def test_jira_create_issue_audit_oserror_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    creates: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **kwargs):
+            creates.append(kwargs)
+            return {"id": "10001", "key": "FC-123"}
+
+    def fail_create_audit(_config, **kwargs):
+        assert kwargs["action"] == "create_issue"
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "audit_write", fail_create_audit)
+
+    result = mcp_server.jira_create_issue(
+        project_key="FC",
+        issue_type_name="Task",
+        summary="Committed issue",
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert result["audit_warning"]["action"] == "create_issue"
+    assert len(creates) == 1
+
+
+def test_jira_create_test_issue_audit_oserror_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    creates: list[dict[str, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **kwargs):
+            creates.append(kwargs)
+            return {"id": "10002", "key": "FC-124"}
+
+    def fail_create_audit(_config, **kwargs):
+        assert kwargs["action"] == "create_issue"
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "audit_write", fail_create_audit)
+
+    result = mcp_server.jira_create_test_issue("Committed test issue", execute=True)
+
+    assert result["ok"] is True
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert result["audit_warning"]["action"] == "create_issue"
+    assert len(creates) == 1
+
+
 def test_jira_edit_issue_rejects_cross_scope_parent_before_read_or_write(
     tmp_path, monkeypatch
 ) -> None:

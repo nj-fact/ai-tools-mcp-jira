@@ -558,14 +558,20 @@ def jira_create_issue(
                 priority=priority,
                 story_points=story_points,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=issue_result.get("key"),
                 payload=payload,
                 result=issue_result,
+                writer=audit_write,
             )
             result: dict[str, Any] = {"ok": True, "issue": issue_result}
+            if create_audit_warning:
+                result.update(
+                    audit_warning=create_audit_warning,
+                    partial_success=True,
+                )
             if diagram_count and issue_result.get("key") and isinstance(description_adf, dict):
                 try:
                     created_key = str(issue_result["key"])
@@ -640,17 +646,24 @@ def jira_create_test_issue(
                 summary=summary,
                 description=description,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=issue_result.get("key"),
                 payload=payload,
                 result=issue_result,
+                writer=audit_write,
             )
-            return {
+            result: dict[str, Any] = {
                 "ok": True,
                 "issue": issue_result,
             }
+            if create_audit_warning:
+                result.update(
+                    audit_warning=create_audit_warning,
+                    partial_success=True,
+                )
+            return result
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

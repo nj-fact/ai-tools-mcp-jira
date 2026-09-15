@@ -1161,12 +1161,13 @@ def create_test_issue(
                 summary=summary,
                 description=description,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=data.get("key"),
                 payload=payload,
                 result=data,
+                writer=audit_write,
             )
         except JiraWriteSafetyError as exc:
             _exit_safety_error(exc, json_mode=json_output)
@@ -1174,10 +1175,18 @@ def create_test_issue(
             _exit_api_error(exc, json_mode=json_output)
 
     if json_output:
-        _emit_json({**data, "dry_run": False})
+        output = {**data, "dry_run": False}
+        if create_audit_warning:
+            output.update(
+                audit_warning=create_audit_warning,
+                partial_success=True,
+            )
+        _emit_json(output)
         return
 
     console.print(f"Created Jira test issue {data.get('key')} ({data.get('id')}).")
+    if create_audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {create_audit_warning['message']}")
 
 
 @app.command("create-issue")
@@ -1313,12 +1322,13 @@ def create_issue(
                 priority=priority,
                 story_points=story_points,
             )
-            audit_write(
+            create_audit_warning = audit_committed_write(
                 config,
                 action="create_issue",
                 issue_key=data.get("key"),
                 payload=payload,
                 result=data,
+                writer=audit_write,
             )
             mermaid_result: dict[str, Any] | None = None
             if diagram_count and data.get("key") and isinstance(description_adf, dict):
@@ -1360,11 +1370,19 @@ def create_issue(
 
     if json_output:
         if mermaid_result is None:
-            _emit_json({**data, "dry_run": False})
+            output = {**data, "dry_run": False}
         else:
-            _emit_json({"issue": data, "mermaid": mermaid_result, "dry_run": False})
+            output = {"issue": data, "mermaid": mermaid_result, "dry_run": False}
+        if create_audit_warning:
+            output.update(
+                audit_warning=create_audit_warning,
+                partial_success=True,
+            )
+        _emit_json(output)
         return
     console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
+    if create_audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {create_audit_warning['message']}")
     if mermaid_result is not None:
         if mermaid_result.get("ok"):
             console.print(f"Embedded {mermaid_result['diagram_count']} Mermaid diagram(s).")
