@@ -10,7 +10,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from jira_agent.audit import audit_write
+from jira_agent.audit import audit_committed_write, audit_write
 from jira_agent.client import (
     DEFAULT_FIELDS,
     AdfPatchInvariantError,
@@ -1325,8 +1325,8 @@ def create_issue(
                 try:
                     created_key = str(data["key"])
 
-                    def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
-                        audit_write(
+                    def _audit_mermaid_commit(commit: dict[str, Any]) -> dict[str, Any] | None:
+                        return audit_committed_write(
                             config,
                             action="render_mermaid_diagrams",
                             issue_key=created_key,
@@ -1339,6 +1339,7 @@ def create_issue(
                                 "deleted_attachment_ids": [],
                             },
                             result=commit["result"],
+                            writer=audit_write,
                         )
 
                     mermaid_result = embed_mermaid_diagrams(
@@ -1372,6 +1373,10 @@ def create_issue(
                     f"[yellow]Warning:[/yellow] {len(mermaid_result['cleanup_failures'])} "
                     "superseded attachment(s) could not be deleted; the new description and "
                     "uploads remain committed."
+                )
+            if mermaid_result.get("audit_warning"):
+                error_console.print(
+                    f"[yellow]Warning:[/yellow] {mermaid_result['audit_warning']['message']}"
                 )
         else:
             error_console.print(
@@ -1468,8 +1473,8 @@ def render_mermaid(
                     console.print("Pass --execute to render, upload, and embed them.")
                 return
 
-            def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
-                audit_write(
+            def _audit_mermaid_commit(commit: dict[str, Any]) -> dict[str, Any] | None:
+                return audit_committed_write(
                     config,
                     action="render_mermaid_diagrams",
                     issue_key=key,
@@ -1483,6 +1488,7 @@ def render_mermaid(
                         "concurrency_guard": concurrency_guard,
                     },
                     result=commit["result"],
+                    writer=audit_write,
                 )
 
             result = embed_mermaid_diagrams(
@@ -1517,6 +1523,8 @@ def render_mermaid(
             "attachment(s) could not be deleted; the new description and uploads remain "
             "committed."
         )
+    if result.get("audit_warning"):
+        error_console.print(f"[yellow]Warning:[/yellow] {result['audit_warning']['message']}")
 
 
 @app.command("test-issue")
@@ -3345,24 +3353,22 @@ def embed_diagram(
         # The description write is already committed. Record it before best-effort cleanup so a
         # cleanup failure cannot hide the accepted mutation and provoke a duplicate retry.
         cleanup_pending_ids = sorted(delete_ids - {attachment_id})
-        try:
-            audit_write(
-                config,
-                action="embed_diagram",
-                issue_key=issue_key,
-                payload={
-                    "file": str(file_path),
-                    "attachment_id": attachment_id,
-                    "media_id": media_id,
-                    "cleanup_pending_attachment_ids": cleanup_pending_ids,
-                    "deleted_attachment_ids": [],
-                    "dimensions": {"width": width, "height": height},
-                    "concurrency_guard": concurrency_guard,
-                },
-                result=result,
-            )
-        except JiraApiError as exc:
-            _exit_api_error(exc)
+        audit_warning = audit_committed_write(
+            config,
+            action="embed_diagram",
+            issue_key=issue_key,
+            payload={
+                "file": str(file_path),
+                "attachment_id": attachment_id,
+                "media_id": media_id,
+                "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                "deleted_attachment_ids": [],
+                "dimensions": {"width": width, "height": height},
+                "concurrency_guard": concurrency_guard,
+            },
+            result=result,
+            writer=audit_write,
+        )
         deleted, cleanup_failures = _delete_attachments_best_effort(
             client, issue_key, cleanup_pending_ids
         )
@@ -3376,6 +3382,8 @@ def embed_diagram(
             f"[yellow]Warning:[/yellow] {len(cleanup_failures)} superseded attachment(s) "
             "could not be deleted; the new description and upload remain committed."
         )
+    if audit_warning:
+        error_console.print(f"[yellow]Warning:[/yellow] {audit_warning['message']}")
 
 
 @app.command("embed-existing-png")

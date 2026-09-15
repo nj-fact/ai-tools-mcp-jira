@@ -593,6 +593,78 @@ def test_create_issue_cli_embeds_mermaid_after_creation(tmp_path, monkeypatch) -
     assert calls["embed"]["issue_key"] == "FC-123"
 
 
+def test_create_issue_cli_reports_committed_mermaid_when_audit_write_fails(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **_kwargs):
+            return {"id": "10001", "key": "FC-123"}
+
+    def audit_writer(_config, **kwargs):
+        if kwargs["action"] == "render_mermaid_diagrams":
+            raise OSError("audit disk unavailable")
+
+    def fake_embed(_client, **kwargs):
+        warning = kwargs["on_description_committed"](
+            {
+                "files": [str(tmp_path / "fc-123-mermaid-1.png")],
+                "attachment_ids": ["42"],
+                "cleanup_pending_attachment_ids": [],
+                "result": {"updated": True},
+            }
+        )
+        return {
+            "ok": True,
+            "diagram_count": 1,
+            "cleanup_failures": [],
+            "audit_warning": warning,
+            "partial_success": True,
+        }
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+    monkeypatch.setattr(cli, "embed_mermaid_diagrams", fake_embed)
+    monkeypatch.setattr(cli, "audit_write", audit_writer)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "create-issue",
+            "Diagram",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--description",
+            "```mermaid\nflowchart LR\nA --> B\n```",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Embedded 1 Mermaid diagram(s)." in result.output
+    assert "Jira accepted the mutation" in result.stderr
+
+
 class ParentValidationCliFakeClient:
     def __init__(self, _config, *, missing_parent: str | None = None) -> None:
         self.config = _config

@@ -248,6 +248,63 @@ def test_jira_create_issue_embeds_mermaid_after_creation(tmp_path, monkeypatch) 
     assert calls["embed"]["description"] == text_to_adf("```mermaid\nflowchart LR\nA --> B\n```")
 
 
+def test_jira_create_issue_reports_committed_mermaid_when_audit_write_fails(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def create_issue(self, **_kwargs):
+            return {"id": "10001", "key": "FC-123"}
+
+    def audit_writer(_config, **kwargs):
+        if kwargs["action"] == "render_mermaid_diagrams":
+            raise OSError("audit disk unavailable")
+
+    def fake_embed(_client, **kwargs):
+        warning = kwargs["on_description_committed"](
+            {
+                "files": [str(tmp_path / "fc-123-mermaid-1.png")],
+                "attachment_ids": ["42"],
+                "cleanup_pending_attachment_ids": [],
+                "result": {"updated": True},
+            }
+        )
+        return {
+            "ok": True,
+            "diagram_count": 1,
+            "cleanup_failures": [],
+            "audit_warning": warning,
+            "partial_success": True,
+        }
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "embed_mermaid_diagrams", fake_embed)
+    monkeypatch.setattr(mcp_server, "audit_write", audit_writer)
+
+    result = mcp_server.jira_create_issue(
+        project_key="FC",
+        issue_type_name="Task",
+        summary="Diagram",
+        description="```mermaid\nflowchart LR\nA --> B\n```",
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert result["mermaid"]["partial_success"] is True
+    assert result["mermaid"]["audit_warning"]["committed"] is True
+
+
 def test_jira_create_issue_can_disable_mermaid_embedding(tmp_path, monkeypatch) -> None:
     config = make_config(tmp_path)
 
@@ -3331,6 +3388,35 @@ def test_jira_embed_diagram_cleanup_failure_preserves_committed_write_and_audit(
     ]
 
 
+def test_jira_embed_diagram_audit_oserror_keeps_success_and_runs_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        initial_attachments=[{"id": "8000", "filename": "old.png"}],
+    )
+
+    def fail_audit(*_args, **_kwargs):
+        client.events.append("audit")
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(mcp_server, "audit_write", fail_audit)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(
+        str(png), key="FC-1", delete_attachment_ids=["8000"], execute=True
+    )
+
+    assert result["ok"] is True
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert client.events == ["description_write", "audit", "cleanup_delete"]
+    assert client.deleted == ["8000"]
+
+
 def test_jira_embed_diagram_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:
     client = _install_embed_diagram_mcp_client(
         monkeypatch,
@@ -3645,6 +3731,33 @@ def test_jira_render_mermaid_cleanup_failure_preserves_committed_write_and_audit
     assert result["cleanup_failures"] == [
         {"attachment_id": "8000", "message": "cleanup failed"}
     ]
+
+
+def test_jira_render_mermaid_audit_oserror_keeps_success_and_runs_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        existing_attachments=[{"id": "8000", "filename": "fc-1-mermaid-1.png"}],
+    )
+
+    def fail_audit(*_args, **_kwargs):
+        client.events.append("audit")
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(mcp_server, "audit_write", fail_audit)
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is True
+    assert result["partial_success"] is True
+    assert result["audit_warning"]["committed"] is True
+    assert client.events == ["description_write", "audit", "cleanup_delete"]
+    assert client.deleted == ["8000"]
 
 
 def test_jira_render_mermaid_empty_later_upload_cleans_up_prior_upload(

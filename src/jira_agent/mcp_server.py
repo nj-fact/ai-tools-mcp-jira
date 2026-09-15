@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from fastmcp import FastMCP
 
-from jira_agent.audit import audit_write
+from jira_agent.audit import audit_committed_write, audit_write
 from jira_agent.client import (
     DEFAULT_FIELDS,
     DEFAULT_SPRINT_FIELD,
@@ -570,8 +570,8 @@ def jira_create_issue(
                 try:
                     created_key = str(issue_result["key"])
 
-                    def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
-                        audit_write(
+                    def _audit_mermaid_commit(commit: dict[str, Any]) -> dict[str, Any] | None:
+                        return audit_committed_write(
                             config,
                             action="render_mermaid_diagrams",
                             issue_key=created_key,
@@ -584,6 +584,7 @@ def jira_create_issue(
                                 "deleted_attachment_ids": [],
                             },
                             result=commit["result"],
+                            writer=audit_write,
                         )
 
                     mermaid_result = embed_mermaid_diagrams(
@@ -2158,7 +2159,7 @@ def jira_render_mermaid_diagrams(
             # them) so a failure in the OLD-attachment cleanup below cannot trigger this call's
             # own except clauses into deleting the attachment(s) the write just committed.
             uploaded_ids.clear()
-            audit_write(
+            audit_warning = audit_committed_write(
                 config,
                 action="render_mermaid_diagrams",
                 issue_key=issue_key,
@@ -2170,6 +2171,7 @@ def jira_render_mermaid_diagrams(
                     "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
+                writer=audit_write,
             )
             deleted, cleanup_failures = _delete_attachments_best_effort(
                 client, issue_key, to_delete
@@ -2180,6 +2182,8 @@ def jira_render_mermaid_diagrams(
                 "attachments": new_attachments,
                 "deleted_attachment_ids": deleted,
                 "cleanup_failures": cleanup_failures,
+                "audit_warning": audit_warning,
+                "partial_success": bool(audit_warning or cleanup_failures),
             }
     # JiraApiError (and its subclasses JiraConcurrentEditError and JiraMissingConcurrencyTokenError)
     # is itself a RuntimeError, and JiraWriteSafetyError is *also* a RuntimeError — directly
@@ -2320,7 +2324,7 @@ def jira_embed_diagram(
             # attachment the write just committed.
             uploaded_ids.clear()
             cleanup_pending_ids = sorted(delete_ids - {attachment_id})
-            audit_write(
+            audit_warning = audit_committed_write(
                 config,
                 action="embed_diagram",
                 issue_key=issue_key,
@@ -2334,6 +2338,7 @@ def jira_embed_diagram(
                     "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
+                writer=audit_write,
             )
             deleted, cleanup_failures = _delete_attachments_best_effort(
                 client, issue_key, cleanup_pending_ids
@@ -2345,6 +2350,8 @@ def jira_embed_diagram(
                 "media_id": media_id,
                 "deleted_attachment_ids": deleted,
                 "cleanup_failures": cleanup_failures,
+                "audit_warning": audit_warning,
+                "partial_success": bool(audit_warning or cleanup_failures),
             }
     except JiraConcurrentEditError as exc:
         _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)

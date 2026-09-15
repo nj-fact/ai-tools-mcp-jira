@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from jira_agent.audit import committed_audit_warning
 from jira_agent.client import (
     JiraApiError,
     png_dimensions,
@@ -140,7 +141,7 @@ def embed_mermaid_diagrams(
     alt_texts: list[str] | None = None,
     runtime: MermaidRuntime | None = None,
     guard_concurrent_edit: bool = True,
-    on_description_committed: Callable[[dict[str, Any]], None] | None = None,
+    on_description_committed: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Render, upload, and embed every top-level Mermaid block. Guarded by default.
 
@@ -242,15 +243,23 @@ def embed_mermaid_diagrams(
         raise
 
     cleanup_pending_ids = sorted(previous_ids - set(uploaded_ids))
+    audit_warning: dict[str, Any] | None = None
     if on_description_committed is not None:
-        on_description_committed(
-            {
-                "files": [str(path) for path in paths],
-                "attachment_ids": list(uploaded_ids),
-                "cleanup_pending_attachment_ids": cleanup_pending_ids,
-                "result": result,
-            }
-        )
+        try:
+            audit_warning = on_description_committed(
+                {
+                    "files": [str(path) for path in paths],
+                    "attachment_ids": list(uploaded_ids),
+                    "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                    "result": result,
+                }
+            )
+        except Exception as exc:
+            # The Jira description already references the uploaded attachments. An audit sink
+            # failure must therefore be surfaced as committed partial success, never as an
+            # ordinary failure that invites a duplicate retry. Old-attachment cleanup remains
+            # best effort and must still run below.
+            audit_warning = committed_audit_warning(action="render_mermaid_diagrams", exc=exc)
 
     deleted_ids: list[str] = []
     cleanup_failures: list[dict[str, str]] = []
@@ -269,6 +278,8 @@ def embed_mermaid_diagrams(
         "attachment_ids": uploaded_ids,
         "deleted_attachment_ids": deleted_ids,
         "cleanup_failures": cleanup_failures,
+        "audit_warning": audit_warning,
+        "partial_success": bool(audit_warning or cleanup_failures),
         "files": [str(path) for path in paths],
         "result": result,
     }

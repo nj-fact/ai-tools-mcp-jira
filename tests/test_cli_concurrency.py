@@ -1586,6 +1586,42 @@ def test_embed_diagram_cleanup_failure_preserves_committed_write_and_audit(
     assert "remain committed" in result.stderr
 
 
+def test_embed_diagram_audit_oserror_keeps_success_and_runs_old_attachment_cleanup(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED,
+        initial_attachments=[{"id": "8000", "filename": "old.png"}],
+    )
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    def fail_audit(*_args, **_kwargs):
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(cli, "audit_write", fail_audit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "embed-diagram",
+            ISSUE_KEY,
+            "--file",
+            str(png),
+            "--delete-attachment-id",
+            "8000",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert deleted == ["8000"]
+    assert "Jira accepted the mutation" in result.stderr
+
+
 def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
     """F2's lesson carried to embed-diagram: a missing `updated` with the guard on must refuse,
     not silently write unguarded."""
@@ -1838,6 +1874,29 @@ def test_render_mermaid_execute_succeeds_despite_upload_moving_updated(
     assert len(writes) == 1
     assert writes[0]["expect_updated"] == READ_UPDATED
     assert adf_contains_media_id(writes[0]["description"], "media-mermaid-1")
+
+
+def test_render_mermaid_audit_oserror_is_reported_as_committed_success(
+    tmp_path, monkeypatch
+) -> None:
+    _patch_mermaid_rendering(monkeypatch, tmp_path)
+    FakeClient, writes = _make_render_mermaid_fake_client(after_upload_updated=READ_UPDATED)
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(cli, "JiraClient", FakeClient)
+
+    def fail_audit(*_args, **_kwargs):
+        raise OSError("audit disk unavailable")
+
+    monkeypatch.setattr(cli, "audit_write", fail_audit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["render-mermaid", ISSUE_KEY, "--output-dir", str(tmp_path / "out"), "--execute"],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert "Jira accepted the mutation" in result.stderr
 
 
 def test_render_mermaid_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:

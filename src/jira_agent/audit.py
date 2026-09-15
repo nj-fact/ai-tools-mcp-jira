@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,3 +29,46 @@ def audit_write(
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def audit_committed_write(
+    config: JiraConfig,
+    *,
+    action: str,
+    issue_key: str | None,
+    payload: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    writer: Callable[..., None] | None = None,
+) -> dict[str, Any] | None:
+    """Audit a Jira mutation that is already committed without converting it into failure.
+
+    Once Jira accepted a non-idempotent mutation, an audit-file or JSON-serialization failure
+    cannot safely be raised as an ordinary command failure: a caller may retry and duplicate the
+    remote write. Return an explicit committed-warning document instead. Callers must surface it
+    while retaining a success/partial-success state and continue any best-effort cleanup.
+    """
+    selected_writer = writer or audit_write
+    try:
+        selected_writer(
+            config,
+            action=action,
+            issue_key=issue_key,
+            payload=payload,
+            result=result,
+        )
+    except Exception as exc:
+        return committed_audit_warning(action=action, exc=exc)
+    return None
+
+
+def committed_audit_warning(*, action: str, exc: Exception) -> dict[str, Any]:
+    """Describe an audit failure that happened after Jira accepted the mutation."""
+    return {
+        "error_type": "audit_write_failed_after_commit",
+        "committed": True,
+        "action": action,
+        "message": (
+            "Jira accepted the mutation, but writing the local audit record failed: "
+            f"{type(exc).__name__}: {exc}"
+        ),
+    }

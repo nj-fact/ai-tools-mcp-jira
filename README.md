@@ -380,7 +380,9 @@ item that belongs to an attachment of the same filename; zero or multiple candid
 - `embed-diagram` and `render-mermaid` audit the accepted upload/description mutation before
   attempting to delete superseded attachments. That cleanup is best-effort: failures are
   reported without turning the already-committed write into a failed command that invites a
-  duplicate retry.
+  duplicate retry. If the local audit sink itself fails after Jira accepted the description,
+  the command likewise returns committed partial success with an `audit_warning`, then still
+  attempts the old-attachment cleanup.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
