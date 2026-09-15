@@ -1178,6 +1178,47 @@ def test_jira_embed_existing_png_attachment_guard_false_ignores_missing_updated(
     assert client.expect_updated_calls == [None]
 
 
+def test_jira_embed_existing_png_post_commit_429_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(config)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.edits:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(mcp_server, "audit_write", failing_audit)
+
+    result = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png",
+        key="FC-349",
+        width=1600,
+        height=900,
+        execute=True,
+    )
+
+    assert result["ok"] is True
+    assert result["committed"] is True
+    assert result["partial_success"] is True
+    assert result["attachment_id"] == "170501"
+    assert result["verification_warning"]["status_code"] == 429
+    assert result["audit_warning"]["committed"] is True
+    assert len(client.edits) == 1
+
+
 def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
     tmp_path, monkeypatch
 ) -> None:
@@ -1195,6 +1236,37 @@ def test_jira_delete_issue_link_execute_deletes_and_verifies_both_endpoints(
         },
         "still_present": {"FC-354": False, "FC-356": False},
     }
+    assert client.deleted_link_ids == ["10001"]
+
+
+def test_jira_delete_issue_link_post_commit_429_and_audit_failure_are_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.deleted_link_ids:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(mcp_server, "audit_write", failing_audit)
+
+    result = mcp_server.jira_delete_issue_link("FC-354", "FC-356", execute=True)
+
+    assert result["ok"] is True
+    assert result["committed"] is True
+    assert result["partial_success"] is True
+    assert result["verification_warning"]["status_code"] == 429
+    assert result["audit_warning"]["committed"] is True
     assert client.deleted_link_ids == ["10001"]
 
 
@@ -1238,6 +1310,38 @@ def test_jira_clear_issue_parent_is_explicit_dry_run_then_verified_execute(
     assert dry_run["payload"] == {"fields": {"parent": None}}
     assert client.clear_parent_calls == 1
     assert executed == {"ok": True, "issue": "FC-359", "verified_parent": None}
+
+
+def test_jira_clear_parent_post_commit_429_is_committed_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.clear_parent_calls:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(mcp_server, "audit_write", failing_audit)
+
+    result = mcp_server.jira_clear_issue_parent("FC-359", execute=True)
+
+    assert result["ok"] is True
+    assert result["committed"] is True
+    assert result["partial_success"] is True
+    assert result["verification_unavailable"] is True
+    assert result["verification_warning"]["status_code"] == 429
+    assert result["audit_warning"]["committed"] is True
+    assert client.clear_parent_calls == 1
 
 
 def test_jira_patch_description_section_refuses_an_unnamed_swallowed_section(
@@ -2755,6 +2859,40 @@ def test_jira_add_issues_to_sprint_execute_reports_failure_when_reread_does_not_
     assert client.added == [(42, ["FC-405"])]
 
 
+def test_jira_add_issues_to_sprint_post_commit_429_and_audit_failure_are_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_sprint_client(monkeypatch, tmp_path)
+    real_get_issue_sprints = client.get_issue_sprints
+    events: list[str] = []
+    calls = {"n": 0}
+
+    def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("Jira API returned HTTP 429", status_code=429)
+        return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
+
+    def _failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue_sprints = _flaky_get_issue_sprints
+    monkeypatch.setattr(mcp_server, "audit_write", _failing_audit)
+
+    result = mcp_server.jira_add_issues_to_sprint(42, ["FC-405"], execute=True)
+
+    assert result["ok"] is True
+    assert result["committed"] is True
+    assert result["partial_success"] is True
+    assert result["verification_unavailable"] is True
+    assert result["verification_warning"]["status_code"] == 429
+    assert result["audit_warning"]["committed"] is True
+    assert client.added == [(42, ["FC-405"])]
+
+
 def test_jira_add_issues_to_sprint_refuses_an_empty_list(tmp_path, monkeypatch) -> None:
     _install_sprint_client(monkeypatch, tmp_path)
 
@@ -2953,38 +3091,44 @@ def test_jira_move_issues_to_backlog_unverifiable_write_is_audited_and_reported_
     tmp_path, monkeypatch
 ) -> None:
     """J2: the write itself succeeds, but the post-write reread that verifies it fails. This
-    must not read as a failed write with no audit trail: the audit record for the write must
-    still exist, `verified` must be `null`, not `False`, and `error_type` must say verification
-    was unavailable rather than reuse the generic API-error shape a real write failure gets.
+    must not read as a failed write with no audit trail. Even when that immediate audit attempt
+    also fails locally, the result must remain committed partial success, retain both warnings,
+    and prove that audit was attempted before the verification read.
     """
     client = _install_sprint_client(
         monkeypatch,
         tmp_path,
         initial_sprints={"FC-405": [{"id": 42, "name": "Sprint 42", "state": "active"}]},
     )
-    audited: list[dict[str, object]] = []
-    monkeypatch.setattr(mcp_server, "audit_write", lambda config, **kwargs: audited.append(kwargs))
     real_get_issue_sprints = client.get_issue_sprints
+    events: list[str] = []
     calls = {"n": 0}
 
     def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
         calls["n"] += 1
         if calls["n"] > 1:  # first call is the precondition read
+            events.append("verify")
+            assert events == ["audit", "verify"]
             raise JiraApiError("Jira API returned HTTP 429", status_code=429)
         return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
 
+    def _failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
     client.get_issue_sprints = _flaky_get_issue_sprints
+    monkeypatch.setattr(mcp_server, "audit_write", _failing_audit)
 
     result = mcp_server.jira_move_issues_to_backlog(42, ["FC-405"], execute=True)
 
-    assert result["ok"] is False
-    assert result["error_type"] == "sprint_verification_unavailable"
+    assert result["ok"] is True
+    assert result["committed"] is True
+    assert result["partial_success"] is True
+    assert result["verification_unavailable"] is True
     assert result["verified"] is None
+    assert result["verification_warning"]["status_code"] == 429
+    assert result["audit_warning"]["committed"] is True
     assert client.moved == [["FC-405"]]  # the write itself went through
-    assert len(audited) == 1
-    assert audited[0]["action"] == "move_issues_to_backlog"
-    assert audited[0]["result"]["verified"] is None
-    assert "verification_error" in audited[0]["result"]
 
 
 def test_jira_move_issues_to_backlog_refuses_an_empty_list(tmp_path, monkeypatch) -> None:

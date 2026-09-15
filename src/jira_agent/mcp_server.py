@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from fastmcp import FastMCP
 
-from jira_agent.audit import audit_committed_write, audit_write
+from jira_agent.audit import audit_committed_write, audit_write, committed_verification_warning
 from jira_agent.client import (
     DEFAULT_FIELDS,
     DEFAULT_SPRINT_FIELD,
@@ -92,6 +92,19 @@ def _with_audit_warning(
     if warning:
         response.update(audit_warning=warning, partial_success=True)
     return response
+
+
+def _with_verification_warning(
+    response: dict[str, Any], *, action: str, exc: Exception, audit_warning: dict[str, Any] | None
+) -> dict[str, Any]:
+    response.update(
+        ok=True,
+        committed=True,
+        partial_success=True,
+        verification_unavailable=True,
+        verification_warning=committed_verification_warning(action=action, exc=exc),
+    )
+    return _with_audit_warning(response, audit_warning)
 
 
 def _client() -> JiraClient:
@@ -1011,15 +1024,23 @@ def jira_clear_issue_parent(
                 }
 
             result = client.edit_issue(issue_key, clear_parent=True)
-            verified = client.get_issue(issue_key, fields=["parent"])
-            after = (verified.get("fields") or {}).get("parent")
             audit_warning = _audit_committed_write(
                 config,
                 action="clear_parent",
                 issue_key=issue_key,
                 payload={"before": before, "payload": payload},
-                result={"edit": result, "verified_parent": after},
+                result=result,
             )
+            try:
+                verified = client.get_issue(issue_key, fields=["parent"])
+            except (JiraApiError, ValueError) as exc:
+                return _with_verification_warning(
+                    {"issue": issue_key, "edit": result},
+                    action="clear_parent",
+                    exc=exc,
+                    audit_warning=audit_warning,
+                )
+            after = (verified.get("fields") or {}).get("parent")
             if after is not None:
                 return _with_audit_warning(
                     {
@@ -1929,19 +1950,27 @@ def jira_delete_issue_link(
                 }
 
             result = client.delete_issue_link(resolved["id"], issue_key=outward_key)
-            verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
-            verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
-            still_present = {
-                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
-                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
-            }
             audit_warning = _audit_committed_write(
                 config,
                 action="delete_issue_link",
                 issue_key=outward_key,
                 payload={"resolved_link": resolved},
-                result={"delete": result, "still_present": still_present},
+                result=result,
             )
+            try:
+                verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
+                verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
+            except JiraApiError as exc:
+                return _with_verification_warning(
+                    {"resolved_link": resolved, "delete": result},
+                    action="delete_issue_link",
+                    exc=exc,
+                    audit_warning=audit_warning,
+                )
+            still_present = {
+                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
+                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
+            }
             if any(still_present.values()):
                 return _with_audit_warning(
                     {
@@ -2535,23 +2564,32 @@ def jira_embed_existing_png_attachment(
             result = client.edit_issue_adf_description(
                 issue_key, description, expect_updated=expect_updated
             )
-            verified = client.get_issue(issue_key, fields=["description", "attachment"])
-            verified_attachment = resolve_png_attachment(
-                verified, filename=filename, attachment_id=resolved_id
-            )
-            verified_description = (verified.get("fields") or {}).get("description") or {}
-            embedded = adf_contains_media_id(verified_description, media_id)
             audit_warning = _audit_committed_write(
                 config,
                 action="embed_existing_png",
                 issue_key=issue_key,
                 payload={**payload, "guard_concurrent_edit": guard_concurrent_edit},
-                result={
-                    "edit": result,
-                    "verified_attachment_id": verified_attachment["id"],
-                    "embedded": embedded,
-                },
+                result=result,
             )
+            try:
+                verified = client.get_issue(issue_key, fields=["description", "attachment"])
+                verified_attachment = resolve_png_attachment(
+                    verified, filename=filename, attachment_id=resolved_id
+                )
+            except (JiraApiError, ValueError) as exc:
+                return _with_verification_warning(
+                    {
+                        "issue": issue_key,
+                        "attachment_id": resolved_id,
+                        "media_id": media_id,
+                        "edit": result,
+                    },
+                    action="embed_existing_png",
+                    exc=exc,
+                    audit_warning=audit_warning,
+                )
+            verified_description = (verified.get("fields") or {}).get("description") or {}
+            embedded = adf_contains_media_id(verified_description, media_id)
             if not embedded:
                 return _with_audit_warning(
                     {
@@ -3057,11 +3095,10 @@ def jira_add_issues_to_sprint(
     re-read and `results` reports, per key, whether it is now confirmed in `sprint_id`
     (`verified`). `ok` is false and a key can show `verified: false` even though the write itself
     succeeded, if the reread does not confirm it -- that reread, not the 204, is what this tool
-    treats as proof. If the reread itself fails, this returns `ok: false`,
-    `error_type: "sprint_verification_unavailable"`, and `verified: null` (there is no
-    `results` without a successful reread), saying the write was accepted but could not be
-    confirmed, rather than reporting the same shape as a genuine write failure that never wrote
-    anything.
+    treats as proof. If the reread itself fails, this returns committed partial success with
+    `verification_unavailable: true` and a structured `verification_warning` (there is no
+    `results` without a successful reread), rather than reporting the same shape as a genuine
+    write failure that never wrote anything.
     """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
@@ -3102,7 +3139,19 @@ def jira_add_issues_to_sprint(
                     "message": "Pass execute=true to move these issues to the sprint in Jira.",
                 }
 
-            client.add_issues_to_sprint(sprint_id, issue_keys)
+            write_result = client.add_issues_to_sprint(sprint_id, issue_keys)
+            audit_warning = _audit_committed_write(
+                client.config,
+                action="add_issues_to_sprint",
+                issue_key=issue_keys[0],
+                payload={
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "precondition": precondition,
+                    "allow_sprint_reassignment": allow_sprint_reassignment,
+                },
+                result=write_result,
+            )
 
             verification_error: JiraApiError | None = None
             results: list[dict[str, Any]] | None = None
@@ -3116,38 +3165,17 @@ def jira_add_issues_to_sprint(
             except JiraApiError as exc:
                 verification_error = exc
 
-            audit_warning = _audit_committed_write(
-                client.config,
-                action="add_issues_to_sprint",
-                issue_key=issue_keys[0],
-                payload={
-                    "sprint_id": sprint_id,
-                    "issue_keys": issue_keys,
-                    "precondition": precondition,
-                    "allow_sprint_reassignment": allow_sprint_reassignment,
-                },
-                result=(
-                    {"verification": results}
-                    if verification_error is None
-                    else {"verified": None, "verification_error": str(verification_error)}
-                ),
-            )
-
             if verification_error is not None:
-                return _with_audit_warning(
+                return _with_verification_warning(
                     {
-                        "ok": False,
-                        "error_type": "sprint_verification_unavailable",
                         "sprint_id": sprint_id,
                         "issue_keys": issue_keys,
+                        "write_result": write_result,
                         "verified": None,
-                        "message": (
-                            "The sprint-add write was accepted by Jira, but the post-write "
-                            f"verification reread failed, so it could not be confirmed: "
-                            f"{verification_error}"
-                        ),
                     },
-                    audit_warning,
+                    action="add_issues_to_sprint",
+                    exc=verification_error,
+                    audit_warning=audit_warning,
                 )
 
             ok = all(entry["verified"] for entry in results)
@@ -3202,8 +3230,8 @@ def jira_move_issues_to_backlog(
     run said it would (not merely `sprint_id`), naming any of those it is still in (`still_in`).
     `ok` is false and a key can show `verified: false` even though the write itself succeeded, if
     it still verifies as present in one of them afterwards. If the reread itself fails, this
-    returns `ok: false`, `error_type: "sprint_verification_unavailable"`, and `verified: null`,
-    saying the write was accepted but could not be confirmed.
+    returns committed partial success with `verification_unavailable: true` and a structured
+    `verification_warning`, saying the write was accepted but could not be confirmed.
     """
     if not issue_keys:
         return {"ok": False, "message": "issue_keys must not be empty."}
@@ -3254,7 +3282,18 @@ def jira_move_issues_to_backlog(
                     "message": "Pass execute=true to move these issues to the backlog in Jira.",
                 }
 
-            client.move_issues_to_backlog(issue_keys)
+            write_result = client.move_issues_to_backlog(issue_keys)
+            audit_warning = _audit_committed_write(
+                client.config,
+                action="move_issues_to_backlog",
+                issue_key=issue_keys[0],
+                payload={
+                    "sprint_id": sprint_id,
+                    "issue_keys": issue_keys,
+                    "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
+                },
+                result=write_result,
+            )
 
             verification_error: JiraApiError | None = None
             results: list[dict[str, Any]] | None = None
@@ -3269,37 +3308,17 @@ def jira_move_issues_to_backlog(
             except JiraApiError as exc:
                 verification_error = exc
 
-            audit_warning = _audit_committed_write(
-                client.config,
-                action="move_issues_to_backlog",
-                issue_key=issue_keys[0],
-                payload={
-                    "sprint_id": sprint_id,
-                    "issue_keys": issue_keys,
-                    "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
-                },
-                result=(
-                    {"verification": results}
-                    if verification_error is None
-                    else {"verified": None, "verification_error": str(verification_error)}
-                ),
-            )
-
             if verification_error is not None:
-                return _with_audit_warning(
+                return _with_verification_warning(
                     {
-                        "ok": False,
-                        "error_type": "sprint_verification_unavailable",
                         "sprint_id": sprint_id,
                         "issue_keys": issue_keys,
+                        "write_result": write_result,
                         "verified": None,
-                        "message": (
-                            "The sprint-remove write was accepted by Jira, but the post-write "
-                            f"verification reread failed, so it could not be confirmed: "
-                            f"{verification_error}"
-                        ),
                     },
-                    audit_warning,
+                    action="move_issues_to_backlog",
+                    exc=verification_error,
+                    audit_warning=audit_warning,
                 )
 
             ok = all(entry["verified"] for entry in results)

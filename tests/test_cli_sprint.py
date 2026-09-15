@@ -577,7 +577,8 @@ def test_sprint_add_cli_execute_verifies_membership_by_reread_and_reports_per_ke
         ],
         "allow_sprint_reassignment": False,
     }
-    assert audited[0]["result"]["verification"] == payload["results"]
+    # The accepted move is audited immediately, before the fallible verification reread.
+    assert audited[0]["result"] == payload["result"]
 
 
 def test_sprint_add_cli_execute_reports_failure_and_exits_nonzero_when_reread_does_not_confirm(
@@ -601,6 +602,45 @@ def test_sprint_add_cli_execute_reports_failure_and_exits_nonzero_when_reread_do
     assert payload["ok"] is False
     assert all(entry["verified"] is False for entry in payload["results"])
     assert all(entry["in_sprint"] is False for entry in payload["results"])
+
+
+def test_sprint_add_cli_post_commit_429_and_audit_failure_are_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    client = _SprintStateFakeClient()
+    _install(monkeypatch, _config(tmp_path), client)
+    real_get_issue_sprints = client.get_issue_sprints
+    events: list[str] = []
+    calls = {"n": 0}
+
+    def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("Jira API returned HTTP 429", status_code=429)
+        return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
+
+    def _failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue_sprints = _flaky_get_issue_sprints
+    monkeypatch.setattr(cli, "audit_write", _failing_audit)
+
+    result = CliRunner().invoke(
+        cli.app, ["sprint-add", "7340", "FC-1", "--execute", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["verification_unavailable"] is True
+    assert payload["verification_warning"]["status_code"] == 429
+    assert payload["audit_warning"]["committed"] is True
+    assert client.add_calls == [(7340, ["FC-1"])]
 
 
 def test_sprint_add_cli_safety_gate_rejects_one_key_no_write_for_any(tmp_path, monkeypatch) -> None:
@@ -987,40 +1027,45 @@ def test_sprint_remove_cli_unverifiable_write_is_audited_and_reported_as_unknown
     verifies it fails (modelled here with a 429-style `JiraApiError`, matching the reviewer's
     repro). This must NOT read as a failed write with no audit trail: the audit record for the
     write must exist (this is what the ordering fix guarantees), `verified` must be `null`, not
-    `False`, and the exit code must be the verification-failure one, not the generic API-error
-    one -- a `--json` caller must be able to tell "confirmed absent" apart from "we don't know"
-    apart from "confirmed still present".
+    `False`, and the command must report committed partial success rather than a retry-shaped
+    nonzero result -- a `--json` caller must be able to tell "confirmed absent" apart from "we
+    don't know" apart from "confirmed still present".
     """
     sprint = {"id": 7340, "name": "Sprint 7340", "state": "active"}
     client = _SprintStateFakeClient(initial_sprints={"FC-1": [sprint]})
-    audited: list[dict[str, object]] = []
     _install(monkeypatch, _config(tmp_path), client)
-    monkeypatch.setattr(cli, "audit_write", lambda config, **kwargs: audited.append(kwargs))
 
     real_get_issue_sprints = client.get_issue_sprints
+    events: list[str] = []
     calls = {"n": 0}
 
     def _flaky_get_issue_sprints(issue_key, *, sprint_field=None):
         calls["n"] += 1
         if calls["n"] > 1:  # first call is the precondition read; fail the post-write reread
+            events.append("verify")
+            assert events == ["audit", "verify"]
             raise JiraApiError("Jira API returned HTTP 429", status_code=429)
         return real_get_issue_sprints(issue_key, sprint_field=sprint_field)
 
+    def _failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
     client.get_issue_sprints = _flaky_get_issue_sprints
+    monkeypatch.setattr(cli, "audit_write", _failing_audit)
 
     result = CliRunner().invoke(cli.app, ["sprint-remove", "7340", "FC-1", "--execute", "--json"])
 
-    assert result.exit_code == cli.SPRINT_VERIFICATION_EXIT_CODE, result.stdout + result.stderr
+    assert result.exit_code == 0, result.stdout + result.stderr
     assert client.remove_calls == [["FC-1"]]  # the write itself went through
     payload = json.loads(result.stdout)
-    assert payload["ok"] is False
+    assert payload["ok"] is True
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["verification_unavailable"] is True
     assert payload["verified"] is None
-    assert "accepted" in payload["message"]
-    # The write is audited even though verification could not run afterwards.
-    assert len(audited) == 1
-    assert audited[0]["action"] == "sprint_remove"
-    assert audited[0]["result"]["verified"] is None
-    assert "verification_error" in audited[0]["result"]
+    assert payload["verification_warning"]["status_code"] == 429
+    assert payload["audit_warning"]["committed"] is True
 
 
 def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_key(
@@ -1068,7 +1113,7 @@ def test_sprint_remove_cli_execute_verifies_removal_by_reread_and_reports_per_ke
                 "issue_keys": ["FC-1", "FC-2"],
                 "pre_write_sprints": {"FC-1": [sprint], "FC-2": [sprint]},
             },
-            "result": {"verification": payload["results"]},
+            "result": {},
         }
     ]
 

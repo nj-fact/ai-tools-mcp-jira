@@ -10,7 +10,12 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from jira_agent.audit import audit_committed_write, audit_write
+from jira_agent.audit import (
+    audit_committed_write,
+    audit_write,
+    committed_sequence_warning,
+    committed_verification_warning,
+)
 from jira_agent.client import (
     DEFAULT_FIELDS,
     AdfPatchInvariantError,
@@ -2418,15 +2423,40 @@ def clear_parent(
                 return
 
             result = client.edit_issue(issue_key, clear_parent=True)
-            verified = client.get_issue(issue_key, fields=["parent"])
-            after = (verified.get("fields") or {}).get("parent")
-            _audit_committed_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="clear_parent",
                 issue_key=issue_key,
                 payload={"before": before, "payload": payload},
-                result={"edit": result, "verified_parent": after},
+                result=result,
             )
+            try:
+                verified = client.get_issue(issue_key, fields=["parent"])
+            except JiraApiError as exc:
+                verification_warning = committed_verification_warning(
+                    action="clear_parent", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "edit": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                else:
+                    error_console.print(
+                        f"[yellow]Warning:[/yellow] {verification_warning['message']}"
+                    )
+                    console.print(f"Parent clear for {issue_key} is committed but unverified.")
+                return
+            after = (verified.get("fields") or {}).get("parent")
             if after is not None:
                 raise ValueError(f"Parent clear was not verified for {issue_key}: {after!r}")
         except JiraWriteSafetyError as exc:
@@ -2438,7 +2468,10 @@ def clear_parent(
             raise typer.Exit(1) from exc
 
     if json_output:
-        _emit_json({**verified, "dry_run": False})
+        response = {**verified, "ok": True, "committed": True, "dry_run": False}
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
         return
     console.print(f"Cleared parent of {issue_key}.")
 
@@ -2706,6 +2739,10 @@ def smoke_write(
         str | None,
         typer.Option("--transition", help="Optional transition name or ID to test."),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable step result."),
+    ] = False,
 ) -> None:
     """Run a write-capability smoke check against the configured test issue."""
     config = _config()
@@ -2724,49 +2761,139 @@ def smoke_write(
                 select_transition(transitions_data, transition_name) if transition_name else None
             )
 
-            console.print(f"issue: {issue_key}")
-            _print_issues_table([issue_data])
-            console.print(f"comment: {comment}")
-            console.print(f"assignee target: {me.get('displayName')} ({me.get('accountId')})")
+            if not json_output:
+                console.print(f"issue: {issue_key}")
+                _print_issues_table([issue_data])
+                console.print(f"comment: {comment}")
+                console.print(
+                    f"assignee target: {me.get('displayName')} ({me.get('accountId')})"
+                )
             if transition_name:
                 if selected:
                     target = selected.get("to") or {}
-                    console.print(
-                        f"transition target: {selected.get('name')} "
-                        f"({selected.get('id')}) -> {target.get('name')}"
-                    )
+                    if not json_output:
+                        console.print(
+                            f"transition target: {selected.get('name')} "
+                            f"({selected.get('id')}) -> {target.get('name')}"
+                        )
                 else:
                     _print_error("No transition found for:", transition_name)
                     raise typer.Exit(1)
 
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] no Jira writes were performed.")
-                console.print("Pass --execute to add the comment and assign the issue.")
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "issue": issue_key,
+                            "transition": selected,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] no Jira writes were performed.")
+                    console.print("Pass --execute to add the comment and assign the issue.")
                 return
 
             ensure_issue_write_allowed(config, client, issue_key)
+            steps: list[dict[str, Any]] = []
             added_comment = client.add_comment(issue_key, comment)
-            client.assign_issue(issue_key, str(me["accountId"]))
-            _audit_committed_write(
+            comment_audit_warning = _audit_committed_write(
                 config,
-                action="smoke_write",
+                action="smoke_write_comment",
                 issue_key=issue_key,
-                payload={
-                    "comment": comment,
-                    "accountId": str(me["accountId"]),
-                    "transition": selected,
-                },
+                payload={"comment": comment},
                 result={"comment_id": added_comment.get("id")},
             )
-            console.print(f"added comment: {added_comment.get('id')}")
-            console.print("assigned issue to authenticated user")
+            comment_step = {
+                "step": "comment",
+                "committed": True,
+                "comment_id": added_comment.get("id"),
+            }
+            if comment_audit_warning:
+                comment_step.update(
+                    partial_success=True, audit_warning=comment_audit_warning
+                )
+            steps.append(comment_step)
+
+            try:
+                assign_result = client.assign_issue(issue_key, str(me["accountId"]))
+            except JiraApiError as exc:
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "steps": steps,
+                    "failed_step": "assign",
+                    "step_warning": committed_sequence_warning(failed_step="assign", exc=exc),
+                }
+                _emit_json(response) if json_output else _print_json(response)
+                return
+            assign_audit_warning = _audit_committed_write(
+                config,
+                action="smoke_write_assign",
+                issue_key=issue_key,
+                payload={"accountId": str(me["accountId"])},
+                result=assign_result,
+            )
+            assign_step = {
+                "step": "assign",
+                "committed": True,
+                "account_id": str(me["accountId"]),
+            }
+            if assign_audit_warning:
+                assign_step.update(partial_success=True, audit_warning=assign_audit_warning)
+            steps.append(assign_step)
+
             if selected:
-                client.transition_issue(issue_key, str(selected["id"]))
-                console.print(f"transitioned issue with {selected.get('name')}")
+                try:
+                    transition_result = client.transition_issue(issue_key, str(selected["id"]))
+                except JiraApiError as exc:
+                    response = {
+                        "ok": True,
+                        "committed": True,
+                        "partial_success": True,
+                        "issue": issue_key,
+                        "steps": steps,
+                        "failed_step": "transition",
+                        "step_warning": committed_sequence_warning(
+                            failed_step="transition", exc=exc
+                        ),
+                    }
+                    _emit_json(response) if json_output else _print_json(response)
+                    return
+                transition_audit_warning = _audit_committed_write(
+                    config,
+                    action="smoke_write_transition",
+                    issue_key=issue_key,
+                    payload={"transition": selected},
+                    result=transition_result,
+                )
+                transition_step = {
+                    "step": "transition",
+                    "committed": True,
+                    "transition_id": str(selected["id"]),
+                    "transition_name": selected.get("name"),
+                }
+                if transition_audit_warning:
+                    transition_step.update(
+                        partial_success=True, audit_warning=transition_audit_warning
+                    )
+                steps.append(transition_step)
+
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": any(step.get("partial_success") for step in steps),
+                "issue": issue_key,
+                "steps": steps,
+            }
+            _emit_json(response) if json_output else _print_json(response)
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
 
 
 @app.command()
@@ -3008,6 +3135,10 @@ def delete_issue_link(
         bool,
         typer.Option("--execute", help="Actually delete the validated issue link in Jira."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable deletion result."),
+    ] = False,
 ) -> None:
     """Delete one validated directed issue link. Defaults to dry-run."""
     try:
@@ -3016,7 +3147,7 @@ def delete_issue_link(
         if link_id is not None:
             link_id = str(normalize_jira_numeric_id(link_id, name="link_id"))
     except JiraApiError as exc:
-        _exit_api_error(exc)
+        _exit_api_error(exc, json_mode=json_output)
     config = _config()
     with JiraClient(config) as client:
         try:
@@ -3035,40 +3166,92 @@ def delete_issue_link(
             )
             resolved["id"] = str(normalize_jira_numeric_id(resolved["id"], name="link_id"))
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would delete issue link")
-                console.print(f"outward safety: {outward_safety}")
-                console.print(f"inward safety: {inward_safety}")
-                _print_json({"resolved_link": resolved})
-                console.print("Pass --execute to delete this exact link in Jira.")
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "resolved_link": resolved,
+                            "outward_safety": outward_safety,
+                            "inward_safety": inward_safety,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] would delete issue link")
+                    console.print(f"outward safety: {outward_safety}")
+                    console.print(f"inward safety: {inward_safety}")
+                    _print_json({"resolved_link": resolved})
+                    console.print("Pass --execute to delete this exact link in Jira.")
                 return
 
             result = client.delete_issue_link(resolved["id"], issue_key=outward_key)
-            verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
-            verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
-            still_present = {
-                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
-                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
-            }
-            _audit_committed_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="delete_issue_link",
                 issue_key=outward_key,
                 payload={"resolved_link": resolved},
-                result={"delete": result, "still_present": still_present},
+                result=result,
             )
+            try:
+                verified_outward = client.get_issue(outward_key, fields=["issuelinks"])
+                verified_inward = client.get_issue(inward_key, fields=["issuelinks"])
+            except JiraApiError as exc:
+                verification_warning = committed_verification_warning(
+                    action="delete_issue_link", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "resolved_link": resolved,
+                    "result": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                    return
+                error_console.print(f"[yellow]Warning:[/yellow] {verification_warning['message']}")
+                console.print(
+                    f"Deleted {link_type} link {resolved['id']} from {outward_key} to "
+                    f"{inward_key}; verification unavailable."
+                )
+                return
+            still_present = {
+                outward_key: issue_contains_link_id(verified_outward, resolved["id"]),
+                inward_key: issue_contains_link_id(verified_inward, resolved["id"]),
+            }
             if any(still_present.values()):
                 raise ValueError(
                     f"Issue-link deletion was not verified for {resolved['id']}: {still_present}"
                 )
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
         except ValueError as exc:
             error_console.print(f"[red]Issue-link deletion error:[/red] {exc}")
             raise typer.Exit(1) from exc
 
-    console.print(f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}.")
+    if json_output:
+        response = {
+            "ok": True,
+            "committed": True,
+            "resolved_link": resolved,
+            "result": result,
+            "verified_absent": True,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+    else:
+        console.print(
+            f"Deleted {link_type} link {resolved['id']} from {outward_key} to {inward_key}."
+        )
 
 
 @app.command("attach")
@@ -3474,6 +3657,10 @@ def embed_existing_png(
         bool,
         typer.Option("--execute", help="Actually embed the existing attachment in Jira."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the machine-readable embed result."),
+    ] = False,
 ) -> None:
     """Embed one existing PNG attachment without uploading a duplicate. Defaults to dry-run.
 
@@ -3504,7 +3691,7 @@ def embed_existing_png(
         if attachment_id is not None:
             attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
     except JiraApiError as exc:
-        _exit_api_error(exc)
+        _exit_api_error(exc, json_mode=json_output)
 
     with JiraClient(config) as client:
         try:
@@ -3558,11 +3745,22 @@ def embed_existing_png(
                 "replace_media_id": replace_media_id,
             }
             if not execute:
-                console.print("[yellow]Dry run:[/yellow] would embed existing PNG attachment")
-                console.print(f"issue: {issue_key}")
-                console.print(f"safety: {safety}")
-                _print_json(payload)
-                console.print("Pass --execute to embed this existing attachment in Jira.")
+                if json_output:
+                    _emit_json(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "issue": issue_key,
+                            "safety": safety,
+                            "payload": payload,
+                        }
+                    )
+                else:
+                    console.print("[yellow]Dry run:[/yellow] would embed existing PNG attachment")
+                    console.print(f"issue: {issue_key}")
+                    console.print(f"safety: {safety}")
+                    _print_json(payload)
+                    console.print("Pass --execute to embed this existing attachment in Jira.")
                 return
 
             description = replace_diagram_with_media(
@@ -3576,41 +3774,80 @@ def embed_existing_png(
             result = client.edit_issue_adf_description(
                 issue_key, description, expect_updated=expect_updated
             )
-            verified = client.get_issue(issue_key, fields=["description", "attachment"])
-            verified_attachment = resolve_png_attachment(
-                verified, filename=filename, attachment_id=resolved_id
-            )
-            verified_description = (verified.get("fields") or {}).get("description") or {}
-            embedded = adf_contains_media_id(verified_description, media_id)
-            _audit_committed_write(
+            audit_warning = _audit_committed_write(
                 config,
                 action="embed_existing_png",
                 issue_key=issue_key,
                 payload={**payload, "concurrency_guard": concurrency_guard},
-                result={
-                    "edit": result,
-                    "verified_attachment_id": verified_attachment["id"],
-                    "embedded": embedded,
-                },
+                result=result,
             )
+            try:
+                verified = client.get_issue(issue_key, fields=["description", "attachment"])
+                resolve_png_attachment(
+                    verified, filename=filename, attachment_id=resolved_id
+                )
+            except (JiraApiError, ValueError) as exc:
+                verification_warning = committed_verification_warning(
+                    action="embed_existing_png", exc=exc
+                )
+                response = {
+                    "ok": True,
+                    "committed": True,
+                    "partial_success": True,
+                    "issue": issue_key,
+                    "attachment_id": resolved_id,
+                    "media_id": media_id,
+                    "result": result,
+                    "verification_unavailable": True,
+                    "verification_warning": verification_warning,
+                    "dry_run": False,
+                }
+                if audit_warning:
+                    response["audit_warning"] = audit_warning
+                if json_output:
+                    _emit_json(response)
+                    return
+                error_console.print(f"[yellow]Warning:[/yellow] {verification_warning['message']}")
+                console.print(
+                    f"Embedded existing {filename} ({resolved_id}) into {issue_key}; "
+                    "verification unavailable."
+                )
+                return
+            verified_description = (verified.get("fields") or {}).get("description") or {}
+            embedded = adf_contains_media_id(verified_description, media_id)
             if not embedded:
                 raise ValueError(
                     f"Existing attachment {resolved_id} was not found inline after rereading "
                     f"{issue_key}."
                 )
         except JiraConcurrentEditError as exc:
-            _exit_concurrent_edit_error(exc, json_mode=False)
+            _exit_concurrent_edit_error(exc, json_mode=json_output)
         except JiraMissingConcurrencyTokenError as exc:
-            _exit_missing_concurrency_token_error(exc, json_mode=False)
+            _exit_missing_concurrency_token_error(exc, json_mode=json_output)
         except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
+            _exit_safety_error(exc, json_mode=json_output)
         except JiraApiError as exc:
-            _exit_api_error(exc)
+            _exit_api_error(exc, json_mode=json_output)
         except ValueError as exc:
             error_console.print(f"[red]Existing PNG embed error:[/red] {exc}")
             raise typer.Exit(1) from exc
 
-    console.print(f"Embedded existing {filename} ({resolved_id}) into {issue_key}.")
+    if json_output:
+        response = {
+            "ok": True,
+            "committed": True,
+            "issue": issue_key,
+            "attachment_id": resolved_id,
+            "media_id": media_id,
+            "result": result,
+            "verified_embedded": True,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
+    else:
+        console.print(f"Embedded existing {filename} ({resolved_id}) into {issue_key}.")
 
 
 @app.command("upsert-image-gallery")
@@ -4262,8 +4499,8 @@ def sprint_add(
     line each otherwise) reports whether it is now confirmed in `sprint_id` -- a key that is not
     exits non-zero even though the write itself returned success. If the reread itself fails
     (a transient Jira error, for instance), the write is reported as accepted but unverified
-    (`verified: null`) rather than as a failed write, and the command exits with the
-    verification-failure code, not the generic API-error one.
+    (`verified: null`) as committed partial success rather than as a failed write, and the
+    command exits successfully so an automation is not encouraged to retry the accepted move.
     """
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
@@ -4335,6 +4572,19 @@ def sprint_add(
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
+        audit_warning = _audit_committed_write(
+            client.config,
+            action="sprint_add",
+            issue_key=keys[0],
+            payload={
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "precondition": precondition,
+                "allow_sprint_reassignment": allow_sprint_reassignment,
+            },
+            result=data,
+        )
+
         verification_error: JiraApiError | None = None
         results: list[dict[str, Any]] | None = None
         try:
@@ -4345,23 +4595,6 @@ def sprint_add(
         except JiraApiError as exc:
             verification_error = exc
 
-        _audit_committed_write(
-            client.config,
-            action="sprint_add",
-            issue_key=keys[0],
-            payload={
-                "sprint_id": sprint_id,
-                "issue_keys": list(keys),
-                "precondition": precondition,
-                "allow_sprint_reassignment": allow_sprint_reassignment,
-            },
-            result=(
-                {**data, "verification": results}
-                if verification_error is None
-                else {**data, "verified": None, "verification_error": str(verification_error)}
-            ),
-        )
-
     if verification_error is not None:
         _print_error(
             "Verification unavailable:",
@@ -4369,21 +4602,24 @@ def sprint_add(
             f"be confirmed: {verification_error}",
         )
         if json_output:
-            _emit_json(
-                {
-                    "ok": False,
-                    "error_type": "sprint_verification_unavailable",
-                    "sprint_id": sprint_id,
-                    "issue_keys": list(keys),
-                    "verified": None,
-                    "message": (
-                        "The sprint-add write was accepted by Jira, but the post-write "
-                        "verification reread failed, so it could not be confirmed."
-                    ),
-                    "dry_run": False,
-                }
-            )
-        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": True,
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "verified": None,
+                "verification_unavailable": True,
+                "verification_warning": committed_verification_warning(
+                    action="sprint_add", exc=verification_error
+                ),
+                "result": data,
+                "dry_run": False,
+            }
+            if audit_warning:
+                response["audit_warning"] = audit_warning
+            _emit_json(response)
+        return
 
     assert results is not None
     failures = [entry for entry in results if not entry["verified"]]
@@ -4409,16 +4645,17 @@ def sprint_add(
             )
 
     if json_output:
-        _emit_json(
-            {
-                "sprint_id": sprint_id,
-                "issue_keys": list(keys),
-                "result": data,
-                "results": results,
-                "ok": not failures,
-                "dry_run": False,
-            }
-        )
+        response = {
+            "sprint_id": sprint_id,
+            "issue_keys": list(keys),
+            "result": data,
+            "results": results,
+            "ok": not failures,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
         if failures:
             raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
         return
@@ -4495,8 +4732,9 @@ def sprint_remove(
     `SPRINT_ID` -- naming any of them it is still in. A key that still verifies as present in one
     of them after the write is reported as a FAILURE and the command exits non-zero, even though
     the POST itself returned success. If the reread itself fails, the write is reported as
-    accepted but unverified (`verified: null`) rather than as a failed write, and the command
-    exits with the verification-failure code, not the generic API-error one.
+    accepted but unverified (`verified: null`) as committed partial success rather than as a
+    failed write, and the command exits successfully so an automation is not encouraged to
+    retry the accepted move.
     """
     if not keys:
         _print_error("No issue keys given:", "pass at least one issue key.")
@@ -4569,6 +4807,18 @@ def sprint_remove(
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
+        audit_warning = _audit_committed_write(
+            client.config,
+            action="sprint_remove",
+            issue_key=keys[0],
+            payload={
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
+            },
+            result=data,
+        )
+
         verification_error: JiraApiError | None = None
         results: list[dict[str, Any]] | None = None
         try:
@@ -4580,22 +4830,6 @@ def sprint_remove(
         except JiraApiError as exc:
             verification_error = exc
 
-        _audit_committed_write(
-            client.config,
-            action="sprint_remove",
-            issue_key=keys[0],
-            payload={
-                "sprint_id": sprint_id,
-                "issue_keys": list(keys),
-                "pre_write_sprints": {entry["key"]: entry["sprints"] for entry in precondition},
-            },
-            result=(
-                {**data, "verification": results}
-                if verification_error is None
-                else {**data, "verified": None, "verification_error": str(verification_error)}
-            ),
-        )
-
     if verification_error is not None:
         _print_error(
             "Verification unavailable:",
@@ -4603,21 +4837,24 @@ def sprint_remove(
             f"be confirmed: {verification_error}",
         )
         if json_output:
-            _emit_json(
-                {
-                    "ok": False,
-                    "error_type": "sprint_verification_unavailable",
-                    "sprint_id": sprint_id,
-                    "issue_keys": list(keys),
-                    "verified": None,
-                    "message": (
-                        "The sprint-remove write was accepted by Jira, but the post-write "
-                        "verification reread failed, so it could not be confirmed."
-                    ),
-                    "dry_run": False,
-                }
-            )
-        raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
+            response = {
+                "ok": True,
+                "committed": True,
+                "partial_success": True,
+                "sprint_id": sprint_id,
+                "issue_keys": list(keys),
+                "verified": None,
+                "verification_unavailable": True,
+                "verification_warning": committed_verification_warning(
+                    action="sprint_remove", exc=verification_error
+                ),
+                "result": data,
+                "dry_run": False,
+            }
+            if audit_warning:
+                response["audit_warning"] = audit_warning
+            _emit_json(response)
+        return
 
     assert results is not None
     failures = [entry for entry in results if not entry["verified"]]
@@ -4632,16 +4869,17 @@ def sprint_remove(
             )
 
     if json_output:
-        _emit_json(
-            {
-                "sprint_id": sprint_id,
-                "issue_keys": list(keys),
-                "result": data,
-                "results": results,
-                "ok": not failures,
-                "dry_run": False,
-            }
-        )
+        response = {
+            "sprint_id": sprint_id,
+            "issue_keys": list(keys),
+            "result": data,
+            "results": results,
+            "ok": not failures,
+            "dry_run": False,
+        }
+        if audit_warning:
+            response.update(audit_warning=audit_warning, partial_success=True)
+        _emit_json(response)
         if failures:
             raise typer.Exit(SPRINT_VERIFICATION_EXIT_CODE)
         return

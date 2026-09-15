@@ -78,3 +78,37 @@ def committed_audit_warning(*, action: str, exc: Exception) -> dict[str, Any]:
             f"{type(exc).__name__}: {exc}"
         ),
     }
+
+
+def committed_verification_warning(*, action: str, exc: Exception) -> dict[str, Any]:
+    """Describe a verification read that failed after Jira accepted the mutation."""
+    warning: dict[str, Any] = {
+        "error_type": "verification_unavailable_after_commit",
+        "committed": True,
+        "action": action,
+        "message": (
+            "Jira accepted the mutation, but its post-write verification read failed: "
+            f"{type(exc).__name__}: {exc}"
+        ),
+    }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        warning["status_code"] = status_code
+    return warning
+
+
+def committed_sequence_warning(*, failed_step: str, exc: Exception) -> dict[str, Any]:
+    """Describe a later failed step after at least one earlier remote step committed."""
+    warning: dict[str, Any] = {
+        "error_type": "sequence_step_failed_after_commit",
+        "committed": True,
+        "failed_step": failed_step,
+        "message": (
+            "Earlier Jira mutation step(s) are committed, but the later "
+            f"{failed_step} step failed: {type(exc).__name__}: {exc}"
+        ),
+    }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        warning["status_code"] = status_code
+    return warning

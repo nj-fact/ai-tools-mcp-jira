@@ -1197,6 +1197,51 @@ def test_clear_parent_cli_is_dry_run_by_default_and_verifies_execute(tmp_path, m
     assert "Cleared parent of FC-359." in executed.output
 
 
+def test_clear_parent_cli_post_commit_429_and_audit_failure_are_partial_success(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ClearParentCliFakeClient(config)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.writes:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(cli, "audit_write", failing_audit)
+
+    result = CliRunner().invoke(
+        cli.app, ["clear-parent", "FC-359", "--execute", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["verification_warning"]["status_code"] == 429
+    assert payload["audit_warning"]["committed"] is True
+    assert client.writes == 1
+
+
 class DeleteLinkCliFakeClient:
     def __init__(self, _config) -> None:
         self.deleted: list[str] = []
@@ -1253,9 +1298,53 @@ def test_delete_issue_link_cli_dry_run_resolves_without_delete(tmp_path, monkeyp
     result = CliRunner().invoke(cli.app, ["delete-issue-link", "FC-354", "FC-356"])
 
     assert result.exit_code == 0, result.output
-    assert "would delete issue link" in result.output
-    assert '"id": "10001"' in result.output
-    assert client.deleted == []
+
+
+def test_delete_issue_link_cli_post_commit_429_is_not_retryable_failure(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = DeleteLinkCliFakeClient(config)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.deleted:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(cli, "audit_write", failing_audit)
+
+    result = CliRunner().invoke(
+        cli.app, ["delete-issue-link", "FC-354", "FC-356", "--execute", "--json"]
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["resolved_link"]["id"] == "10001"
+    assert payload["verification_warning"]["status_code"] == 429
+    assert payload["audit_warning"]["committed"] is True
+    assert client.deleted == ["10001"]
 
 
 def test_delete_issue_link_cli_rejects_cross_scope_before_reads_or_delete(
@@ -1442,6 +1531,147 @@ def test_factory_contract_cli_audit_oserror_preserves_remote_ids_and_success(
     assert CommittedMutationCliFakeClient.creates == 2
 
 
+class SmokeSequenceFakeClient:
+    def __init__(self, config, *, fail_step: str | None = None) -> None:
+        self.config = config
+        self.fail_step = fail_step
+        self.committed: list[str] = []
+        self.events: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def myself(self):
+        return {"accountId": "acc-1", "displayName": "Fake User"}
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        return {
+            "key": issue_key,
+            "fields": {
+                "project": {"key": "FC"},
+                "summary": "Smoke",
+                "status": {"name": "Open"},
+            },
+        }
+
+    def get_transitions(self, issue_key):
+        return {
+            "transitions": [
+                {"id": "31", "name": "Done", "to": {"name": "Done"}, "fields": {}}
+            ]
+        }
+
+    def add_comment(self, issue_key, body):
+        self.committed.append("comment")
+        self.events.append("remote:comment")
+        return {"id": "7001"}
+
+    def assign_issue(self, issue_key, account_id):
+        if self.fail_step == "assign":
+            self.events.append("failed:assign")
+            raise JiraApiError("assign failed", status_code=429)
+        self.committed.append("assign")
+        self.events.append("remote:assign")
+        return {"accountId": account_id}
+
+    def transition_issue(self, issue_key, transition_id):
+        if self.fail_step == "transition":
+            self.events.append("failed:transition")
+            raise JiraApiError("transition failed", status_code=429)
+        self.committed.append("transition")
+        self.events.append("remote:transition")
+        return {"id": transition_id}
+
+
+def _run_smoke_sequence(monkeypatch, tmp_path, *, fail_step=None, audit_failure_action=None):
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_ISSUE_KEY": "FC-1",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = SmokeSequenceFakeClient(config, fail_step=fail_step)
+    audited: list[str] = []
+
+    def audit_writer(_config, **kwargs):
+        audited.append(kwargs["action"])
+        client.events.append(f"audit:{kwargs['action'].removeprefix('smoke_write_')}")
+        if kwargs["action"] == audit_failure_action:
+            raise OSError("audit failed")
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(cli, "audit_write", audit_writer)
+    result = CliRunner().invoke(
+        cli.app, ["smoke-write", "--transition", "Done", "--execute", "--json"]
+    )
+    return client, audited, result
+
+
+def test_smoke_write_audits_each_committed_step_immediately(tmp_path, monkeypatch) -> None:
+    client, audited, result = _run_smoke_sequence(
+        monkeypatch, tmp_path, audit_failure_action="smoke_write_assign"
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert client.committed == ["comment", "assign", "transition"]
+    assert audited == [
+        "smoke_write_comment",
+        "smoke_write_assign",
+        "smoke_write_transition",
+    ]
+    assert client.events == [
+        "remote:comment",
+        "audit:comment",
+        "remote:assign",
+        "audit:assign",
+        "remote:transition",
+        "audit:transition",
+    ]
+    assert [step["step"] for step in payload["steps"]] == [
+        "comment",
+        "assign",
+        "transition",
+    ]
+    assert payload["partial_success"] is True
+    assert payload["steps"][1]["audit_warning"]["committed"] is True
+
+
+@pytest.mark.parametrize(
+    ("failed_step", "expected_committed"),
+    [("assign", ["comment"]), ("transition", ["comment", "assign"])],
+)
+def test_smoke_write_later_failure_preserves_earlier_commits(
+    tmp_path, monkeypatch, failed_step, expected_committed
+) -> None:
+    client, audited, result = _run_smoke_sequence(
+        monkeypatch, tmp_path, fail_step=failed_step
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["failed_step"] == failed_step
+    assert payload["step_warning"]["error_type"] == "sequence_step_failed_after_commit"
+    assert client.committed == expected_committed
+    assert audited == [f"smoke_write_{step}" for step in expected_committed]
+    expected_events: list[str] = []
+    for step in expected_committed:
+        expected_events.extend([f"remote:{step}", f"audit:{step}"])
+    expected_events.append(f"failed:{failed_step}")
+    assert client.events == expected_events
+
+
 def test_attach_cli_rejects_empty_success_payload_without_audit(tmp_path, monkeypatch) -> None:
     config = JiraConfig.model_validate(
         {
@@ -1620,6 +1850,65 @@ def test_embed_existing_png_cli_dry_run_resolves_exact_existing_attachment(
     assert "would embed existing PNG attachment" in result.output
     assert '"attachment_id": "170501"' in result.output
     assert client.edits == []
+
+
+def test_embed_existing_png_cli_post_commit_429_is_not_retryable_failure(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = ExistingPngCliFakeClient(config)
+    original_get = client.get_issue
+    events: list[str] = []
+
+    def flaky_get(issue_key, *, fields=None, expand=None):
+        if client.edits:
+            events.append("verify")
+            assert events == ["audit", "verify"]
+            raise JiraApiError("rate limited", status_code=429)
+        return original_get(issue_key, fields=fields, expand=expand)
+
+    def failing_audit(*_args, **_kwargs):
+        events.append("audit")
+        raise OSError("audit failed")
+
+    client.get_issue = flaky_get
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(cli, "audit_write", failing_audit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "embed-existing-png",
+            "FC-349",
+            "--filename",
+            "fc349-disbursement-flow.png",
+            "--width",
+            "1600",
+            "--height",
+            "900",
+            "--execute",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["committed"] is True
+    assert payload["partial_success"] is True
+    assert payload["attachment_id"] == "170501"
+    assert payload["verification_warning"]["status_code"] == 429
+    assert payload["audit_warning"]["committed"] is True
+    assert len(client.edits) == 1
 
 
 def test_patch_description_section_cli_prints_the_lists_as_json_on_a_refusal(
@@ -1974,6 +2263,7 @@ def _json_purity_config(tmp_path) -> JiraConfig:
             "JIRA_SITE_URL": "https://example.atlassian.net",
             "JIRA_EMAIL": "user@example.com",
             "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_ISSUE_KEY": "FC-1",
             "JIRA_WRITE_PROJECT_KEYS": "FC",
             "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
         }
@@ -2859,6 +3149,35 @@ class _JsonExecuteSweepFakeClient:
                     "attachment": [],
                 },
             }
+        if fields == ["description", "attachment", "updated"]:
+            return {
+                "key": issue_key,
+                "fields": {
+                    "description": {"type": "doc", "version": 1, "content": []},
+                    "attachment": [
+                        {"id": "170501", "filename": "diagram.png", "mimeType": "image/png"}
+                    ],
+                    "updated": "2026-09-14T10:00:00.000+0200",
+                },
+            }
+        if fields == ["issuelinks"]:
+            if issue_key == "FC-1":
+                links = [
+                    {
+                        "id": "10001",
+                        "type": {"name": "Relates"},
+                        "outwardIssue": {"key": "FC-2"},
+                    }
+                ]
+            else:
+                links = [
+                    {
+                        "id": "10001",
+                        "type": {"name": "Relates"},
+                        "inwardIssue": {"key": "FC-1"},
+                    }
+                ]
+            return {"key": issue_key, "fields": {"issuelinks": links}}
         if fields == ["status"]:
             # `transition`'s direction check reads this. Same category as get_transitions' own
             # "Done" target below, so the sweep's dry run is a same-category move: allowed
@@ -2893,6 +3212,9 @@ class _JsonExecuteSweepFakeClient:
     def is_issue_type_allowed(self, issue_key, issue_type_name):
         return True
 
+    def attachment_media_id(self, attachment_id, *, issue_key):
+        return "media-170501"
+
     def get_edit_metadata(self, issue_key):
         return {"fields": {"issuetype": {"allowedValues": [{"name": "Bug"}, {"name": "Task"}]}}}
 
@@ -2919,6 +3241,18 @@ def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
         "render-mermaid": ["render-mermaid", "FC-1", "--json"],
         "edit-issue": ["edit-issue", "FC-1", "--summary", "New summary", "--json"],
         "clear-parent": ["clear-parent", "FC-1", "--json"],
+        "delete-issue-link": ["delete-issue-link", "FC-1", "FC-2", "--json"],
+        "embed-existing-png": [
+            "embed-existing-png",
+            "FC-1",
+            "--filename",
+            "diagram.png",
+            "--width",
+            "100",
+            "--height",
+            "100",
+            "--json",
+        ],
         "patch-description-section": [
             "patch-description-section",
             "FC-1",
@@ -2928,6 +3262,7 @@ def _json_execute_sweep_args(tmp_path) -> dict[str, list[str]]:
             "## Observed\n\nUpdated for the sweep.",
             "--json",
         ],
+        "smoke-write": ["smoke-write", "--json"],
         "assign": ["assign", "FC-1", "--json"],
         "attach": ["attach", "FC-1", "--file", str(attach_file), "--json"],
         "transition": ["transition", "FC-1", "Done", "--json"],
