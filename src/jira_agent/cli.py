@@ -32,11 +32,13 @@ from jira_agent.client import (
     issue_link_payload,
     issue_status_category,
     issue_type_allowed_values,
+    normalize_jira_issue_key,
     normalize_jira_numeric_id,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     require_concurrency_token,
+    require_matching_jira_numeric_id,
     require_shared_write_scope,
     select_transition,
     sprint_add_blast_radius,
@@ -48,6 +50,7 @@ from jira_agent.client import (
     transition_required_fields_missing,
     transition_target_category,
     validate_agile_issue_batch,
+    validate_attachment_upload_response,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -696,7 +699,11 @@ def edit_comment(
     to see exactly what they are about to overwrite before committing to it.
     """
     try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
         new_body = read_text_source(body, body_file)
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
     except (OSError, ValueError) as exc:
         _print_error("Edit error:", exc)
         raise typer.Exit(2) from exc
@@ -704,6 +711,7 @@ def edit_comment(
     with _client() as client:
         try:
             current = client.get_comment(key, comment_id)
+            require_matching_jira_numeric_id(current, comment_id, name="comment_id")
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
@@ -774,9 +782,16 @@ def delete_comment(
     Deleting a comment is irreversible, so the dry run prints the full current body: it is the
     only chance the caller gets to notice a wrong comment id before the comment is gone for good.
     """
+    try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
     with _client() as client:
         try:
             current = client.get_comment(key, comment_id)
+            require_matching_jira_numeric_id(current, comment_id, name="comment_id")
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
 
@@ -1121,6 +1136,11 @@ def create_test_issue(
         description=description,
     )
 
+    try:
+        ensure_project_write_allowed(config, config.test_project_key)
+    except JiraWriteSafetyError as exc:
+        _exit_safety_error(exc, json_mode=json_output)
+
     if not execute:
         _say("[yellow]Dry run:[/yellow] would create this Jira test issue", json_mode=json_output)
         _say(f"project: {config.test_project_key}", json_mode=json_output)
@@ -1226,6 +1246,10 @@ def create_issue(
     config = _config()
     project = project_key or config.test_project_key
     try:
+        ensure_project_write_allowed(config, project)
+    except JiraWriteSafetyError as exc:
+        _exit_safety_error(exc, json_mode=json_output)
+    try:
         body = (
             read_text_source(description, description_file, section=description_section)
             if description or description_file
@@ -1279,7 +1303,6 @@ def create_issue(
 
     with JiraClient(config) as client:
         try:
-            ensure_project_write_allowed(config, project)
             data = client.create_issue(
                 project_key=project,
                 issue_type_name=issue_type,
@@ -1300,24 +1323,32 @@ def create_issue(
             mermaid_result: dict[str, Any] | None = None
             if diagram_count and data.get("key") and isinstance(description_adf, dict):
                 try:
+                    created_key = str(data["key"])
+
+                    def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
+                        audit_write(
+                            config,
+                            action="render_mermaid_diagrams",
+                            issue_key=created_key,
+                            payload={
+                                "files": commit["files"],
+                                "attachment_ids": commit["attachment_ids"],
+                                "cleanup_pending_attachment_ids": commit[
+                                    "cleanup_pending_attachment_ids"
+                                ],
+                                "deleted_attachment_ids": [],
+                            },
+                            result=commit["result"],
+                        )
+
                     mermaid_result = embed_mermaid_diagrams(
                         client,
-                        issue_key=str(data["key"]),
+                        issue_key=created_key,
                         description=description_adf,
                         output_dir=Path(config.audit_log_path).parent
                         / "diagrams"
-                        / str(data["key"]),
-                    )
-                    audit_write(
-                        config,
-                        action="render_mermaid_diagrams",
-                        issue_key=str(data["key"]),
-                        payload={
-                            "files": mermaid_result["files"],
-                            "attachment_ids": mermaid_result["attachment_ids"],
-                            "deleted_attachment_ids": mermaid_result["deleted_attachment_ids"],
-                        },
-                        result=mermaid_result["result"],
+                        / created_key,
+                        on_description_committed=_audit_mermaid_commit,
                     )
                 except (JiraApiError, OSError, RuntimeError, ValueError) as exc:
                     mermaid_result = {"ok": False, "message": str(exc)}
@@ -1336,6 +1367,12 @@ def create_issue(
     if mermaid_result is not None:
         if mermaid_result.get("ok"):
             console.print(f"Embedded {mermaid_result['diagram_count']} Mermaid diagram(s).")
+            if mermaid_result.get("cleanup_failures"):
+                error_console.print(
+                    f"[yellow]Warning:[/yellow] {len(mermaid_result['cleanup_failures'])} "
+                    "superseded attachment(s) could not be deleted; the new description and "
+                    "uploads remain committed."
+                )
         else:
             error_console.print(
                 f"[yellow]Warning:[/yellow] issue was created, but Mermaid embedding failed: "
@@ -1431,6 +1468,23 @@ def render_mermaid(
                     console.print("Pass --execute to render, upload, and embed them.")
                 return
 
+            def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
+                audit_write(
+                    config,
+                    action="render_mermaid_diagrams",
+                    issue_key=key,
+                    payload={
+                        "files": commit["files"],
+                        "attachment_ids": commit["attachment_ids"],
+                        "cleanup_pending_attachment_ids": commit[
+                            "cleanup_pending_attachment_ids"
+                        ],
+                        "deleted_attachment_ids": [],
+                        "concurrency_guard": concurrency_guard,
+                    },
+                    result=commit["result"],
+                )
+
             result = embed_mermaid_diagrams(
                 client,
                 issue_key=key,
@@ -1439,18 +1493,7 @@ def render_mermaid(
                 output_dir=destination,
                 runtime=runtime,
                 guard_concurrent_edit=concurrency_guard,
-            )
-            audit_write(
-                config,
-                action="render_mermaid_diagrams",
-                issue_key=key,
-                payload={
-                    "files": result["files"],
-                    "attachment_ids": result["attachment_ids"],
-                    "deleted_attachment_ids": result["deleted_attachment_ids"],
-                    "concurrency_guard": concurrency_guard,
-                },
-                result=result["result"],
+                on_description_committed=_audit_mermaid_commit,
             )
     except JiraConcurrentEditError as exc:
         _exit_concurrent_edit_error(exc, json_mode=json_output)
@@ -1468,6 +1511,12 @@ def render_mermaid(
         _emit_json({**result, "dry_run": False})
         return
     console.print(f"Embedded {result['diagram_count']} Mermaid diagram(s) in {key}.")
+    if result.get("cleanup_failures"):
+        error_console.print(
+            f"[yellow]Warning:[/yellow] {len(result['cleanup_failures'])} superseded "
+            "attachment(s) could not be deleted; the new description and uploads remain "
+            "committed."
+        )
 
 
 @app.command("test-issue")
@@ -1786,7 +1835,9 @@ def factory_contract(
                     console.print(f"safety: {safety}")
                     console.print("Pass --execute to upload it to Jira.")
                     return
-                result = client.add_attachment(issue_key, file_path)
+                result = validate_attachment_upload_response(
+                    client.add_attachment(issue_key, file_path)
+                )
                 audit_write(
                     config,
                     action="factory_contract_attachment",
@@ -2919,6 +2970,13 @@ def delete_issue_link(
     ] = False,
 ) -> None:
     """Delete one validated directed issue link. Defaults to dry-run."""
+    try:
+        outward_key = normalize_jira_issue_key(outward_key, name="outward_key")
+        inward_key = normalize_jira_issue_key(inward_key, name="inward_key")
+        if link_id is not None:
+            link_id = str(normalize_jira_numeric_id(link_id, name="link_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc)
     config = _config()
     with JiraClient(config) as client:
         try:
@@ -2935,6 +2993,7 @@ def delete_issue_link(
                 link_type=link_type,
                 link_id=link_id,
             )
+            resolved["id"] = str(normalize_jira_numeric_id(resolved["id"], name="link_id"))
             if not execute:
                 console.print("[yellow]Dry run:[/yellow] would delete issue link")
                 console.print(f"outward safety: {outward_safety}")
@@ -3016,7 +3075,9 @@ def attach(
                 _say("Pass --execute to upload it to Jira.", json_mode=json_output)
                 return
 
-            data = client.add_attachment(issue_key, file_path)
+            data = validate_attachment_upload_response(
+                client.add_attachment(issue_key, file_path)
+            )
             audit_write(
                 config,
                 action="attach",
@@ -3062,6 +3123,11 @@ def delete_attachment(
     if not attachment_id:
         error_console.print("[red]--attachment-id is required.[/red]")
         raise typer.Exit(2)
+    try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc)
 
     with JiraClient(config) as client:
         try:
@@ -3187,7 +3253,13 @@ def embed_diagram(
         raise typer.Exit(2) from exc
 
     delete_names = set(_csv_list(delete_filename) or [])
-    delete_ids = set(_csv_list(delete_attachment_id) or [])
+    try:
+        delete_ids = {
+            str(normalize_jira_numeric_id(value, name="delete_attachment_id"))
+            for value in (_csv_list(delete_attachment_id) or [])
+        }
+    except JiraApiError as exc:
+        _exit_api_error(exc)
 
     with JiraClient(config) as client:
         uploaded_ids: list[str] = []
@@ -3270,14 +3342,10 @@ def embed_diagram(
             _cleanup_uploaded_attachments(client, issue_key, uploaded_ids)
             _exit_api_error(exc)
 
-        # The write above already succeeded and the new attachment is now referenced by the
-        # live description, so a failure from here on (deleting OTHER, already-superseded
-        # attachments) must not roll back the upload this call just committed.
-        deleted: list[str] = []
+        # The description write is already committed. Record it before best-effort cleanup so a
+        # cleanup failure cannot hide the accepted mutation and provoke a duplicate retry.
+        cleanup_pending_ids = sorted(delete_ids - {attachment_id})
         try:
-            for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id, issue_key=issue_key)
-                deleted.append(item_id)
             audit_write(
                 config,
                 action="embed_diagram",
@@ -3286,7 +3354,8 @@ def embed_diagram(
                     "file": str(file_path),
                     "attachment_id": attachment_id,
                     "media_id": media_id,
-                    "deleted_attachment_ids": deleted,
+                    "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                    "deleted_attachment_ids": [],
                     "dimensions": {"width": width, "height": height},
                     "concurrency_guard": concurrency_guard,
                 },
@@ -3294,11 +3363,19 @@ def embed_diagram(
             )
         except JiraApiError as exc:
             _exit_api_error(exc)
+        deleted, cleanup_failures = _delete_attachments_best_effort(
+            client, issue_key, cleanup_pending_ids
+        )
 
     console.print(
         f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
         f"deleted {len(deleted)} old attachment(s)."
     )
+    if cleanup_failures:
+        error_console.print(
+            f"[yellow]Warning:[/yellow] {len(cleanup_failures)} superseded attachment(s) "
+            "could not be deleted; the new description and upload remain committed."
+        )
 
 
 @app.command("embed-existing-png")
@@ -3379,6 +3456,12 @@ def embed_existing_png(
             "[red]--width and --height are required; dimensions are never guessed.[/red]"
         )
         raise typer.Exit(2)
+    try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        if attachment_id is not None:
+            attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+    except JiraApiError as exc:
+        _exit_api_error(exc)
 
     with JiraClient(config) as client:
         try:
@@ -3392,7 +3475,7 @@ def embed_existing_png(
             attachment = resolve_png_attachment(
                 issue, filename=filename, attachment_id=attachment_id
             )
-            resolved_id = str(attachment["id"])
+            resolved_id = str(normalize_jira_numeric_id(attachment["id"], name="attachment_id"))
             media_id = client.attachment_media_id(resolved_id, issue_key=issue_key)
             existing_description = issue.get("fields", {}).get("description") or {
                 "type": "doc",
@@ -4781,6 +4864,21 @@ def _cleanup_uploaded_attachments(
             client.delete_attachment(attachment_id, issue_key=issue_key)
         except JiraApiError:
             pass
+
+
+def _delete_attachments_best_effort(
+    client: JiraClient, issue_key: str, attachment_ids: list[str]
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Delete superseded attachments without turning a committed description write into failure."""
+    deleted: list[str] = []
+    failures: list[dict[str, str]] = []
+    for attachment_id in attachment_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+            deleted.append(attachment_id)
+        except JiraApiError as exc:
+            failures.append({"attachment_id": attachment_id, "message": str(exc)})
+    return deleted, failures
 
 
 def _exit_api_error(exc: JiraApiError, *, json_mode: bool = False) -> None:

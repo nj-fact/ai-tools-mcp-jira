@@ -377,6 +377,10 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   fresh read; a concurrent edit landing before that post-upload read is incorporated into the
   write rather than lost. All four refuse the write (exit code 4) if `updated` no longer matches
   immediately before it, and `--no-concurrency-guard` opts out of any of them.
+- `embed-diagram` and `render-mermaid` audit the accepted upload/description mutation before
+  attempting to delete superseded attachments. That cleanup is best-effort: failures are
+  reported without turning the already-committed write into a failed command that invites a
+  duplicate retry.
 - Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
   and embed them with `jira_render_mermaid_diagrams`
 - Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
@@ -598,7 +602,14 @@ Two comment commands fill a gap where only `add-comment` existed:
   gone for good.
 
 Both default to dry-run behind `--execute`, go through the same write-scope check as every other
-write command, and append to the audit log on execution.
+write command, and append to the audit log on execution. Comment, issue-link, and attachment ids
+used in REST paths must be positive numeric Jira ids; issue keys must have Jira's `ABC-123` shape.
+The comment GET used before edit/delete must also return exactly the requested comment id, or the
+operation fails closed before any mutation.
+
+`create-issue` and `create-test-issue` enforce the configured project write scope before reporting
+even a dry-run success. A dry run therefore cannot approve a project that the identical
+`--execute` invocation would refuse.
 
 ## Sprints, boards, and issue-type changes
 

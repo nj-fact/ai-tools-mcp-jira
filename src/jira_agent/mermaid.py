@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,7 @@ def embed_mermaid_diagrams(
     alt_texts: list[str] | None = None,
     runtime: MermaidRuntime | None = None,
     guard_concurrent_edit: bool = True,
+    on_description_committed: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Render, upload, and embed every top-level Mermaid block. Guarded by default.
 
@@ -239,10 +241,25 @@ def embed_mermaid_diagrams(
                 pass
         raise
 
+    cleanup_pending_ids = sorted(previous_ids - set(uploaded_ids))
+    if on_description_committed is not None:
+        on_description_committed(
+            {
+                "files": [str(path) for path in paths],
+                "attachment_ids": list(uploaded_ids),
+                "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                "result": result,
+            }
+        )
+
     deleted_ids: list[str] = []
-    for attachment_id in sorted(previous_ids - set(uploaded_ids)):
-        client.delete_attachment(attachment_id, issue_key=issue_key)
-        deleted_ids.append(attachment_id)
+    cleanup_failures: list[dict[str, str]] = []
+    for attachment_id in cleanup_pending_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+            deleted_ids.append(attachment_id)
+        except JiraApiError as exc:
+            cleanup_failures.append({"attachment_id": attachment_id, "message": str(exc)})
 
     return {
         "ok": True,
@@ -251,6 +268,7 @@ def embed_mermaid_diagrams(
         "attachments": uploaded_attachments,
         "attachment_ids": uploaded_ids,
         "deleted_attachment_ids": deleted_ids,
+        "cleanup_failures": cleanup_failures,
         "files": [str(path) for path in paths],
         "result": result,
     }

@@ -1097,6 +1097,86 @@ def test_add_attachment_posts_multipart_without_json_content_type(tmp_path) -> N
     assert seen["content_type"].startswith("multipart/form-data; boundary=")
 
 
+@pytest.mark.parametrize("payload", [[], [{}], [{"id": ""}], [{"id": "../content"}]])
+def test_add_attachment_rejects_empty_or_idless_success_payload(tmp_path, payload) -> None:
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(JiraApiError, match="attachment"):
+        client.add_attachment("FC-107", file_path)
+
+
+def test_raw_path_ids_are_rejected_before_any_http_request() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(204)
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+    operations = [
+        lambda: client.get_comment("FC-1", "../transitions"),
+        lambda: client.update_comment("FC-1", "../transitions", "body"),
+        lambda: client.delete_comment("FC-1", "../transitions"),
+        lambda: client.delete_issue_link("../issue/FC-2", issue_key="FC-1"),
+        lambda: client.delete_attachment("../100", issue_key="FC-1"),
+        lambda: client.attachment_media_id("../100", issue_key="FC-1"),
+    ]
+
+    for operation in operations:
+        with pytest.raises(JiraApiError, match="positive integer Jira id"):
+            operation()
+
+    assert requests == []
+
+
+def test_path_shaped_issue_keys_are_rejected_before_any_http_request(tmp_path) -> None:
+    requests: list[httpx.Request] = []
+    file_path = tmp_path / "note.txt"
+    file_path.write_text("hello", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={})
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+    operations = [
+        lambda: client.get_issue("../myself"),
+        lambda: client.get_comment("FC-1/../FC-2", "1"),
+        lambda: client.add_comment("FC-1/../FC-2", "body"),
+        lambda: client.assign_issue("FC-1/../FC-2", None),
+        lambda: client.add_attachment("FC-1/../FC-2", file_path),
+        lambda: client.get_changelog("FC-1/../FC-2"),
+    ]
+
+    for operation in operations:
+        with pytest.raises(JiraApiError, match="Jira issue key"):
+            operation()
+
+    assert requests == []
+
+
+def test_get_comment_rejects_mismatched_response_id() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "2", "body": {}})
+
+    client = JiraClient(make_config(), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(JiraApiError, match="while 1 was requested"):
+        client.get_comment("FC-1", "1")
+
+    assert len(requests) == 1
+    assert requests[0].method == "GET"
+
+
 def test_delete_attachment_uses_attachment_endpoint() -> None:
     seen: dict[str, str] = {}
 

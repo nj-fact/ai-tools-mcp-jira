@@ -163,6 +163,79 @@ def normalize_jira_numeric_id(value: int | str, *, name: str) -> int:
     return normalized
 
 
+def normalize_jira_issue_key(value: str, *, name: str = "issue_key") -> str:
+    """Return a canonical Jira issue key and reject URL/path-shaped input.
+
+    Issue keys are interpolated into REST paths throughout this client. Accepting slashes,
+    backslashes, or dot segments would let the HTTP client normalize a request onto a different
+    resource before it is sent. Jira issue keys have a project-key prefix and a positive numeric
+    sequence, so enforcing that public shape is both stricter and clearer than URL-escaping an
+    invalid key.
+    """
+    if not isinstance(value, str):
+        raise JiraApiError(f"{name} must be a Jira issue key like FC-123, got {value!r}.")
+    normalized = value.strip().upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*-[1-9][0-9]*", normalized):
+        raise JiraApiError(f"{name} must be a Jira issue key like FC-123, got {value!r}.")
+    return normalized
+
+
+def require_matching_jira_numeric_id(
+    payload: dict[str, Any], expected_id: int | str, *, name: str
+) -> int:
+    """Fail closed unless a Jira response identifies the exact resource requested."""
+    expected = normalize_jira_numeric_id(expected_id, name=name)
+    if not isinstance(payload, dict):
+        raise JiraApiError(
+            f"Jira did not confirm {name} {expected} in the GET response.",
+            details={f"requested_{name}": str(expected)},
+        )
+    try:
+        returned = normalize_jira_numeric_id(payload.get("id"), name=f"returned {name}")
+    except JiraApiError as exc:
+        raise JiraApiError(
+            f"Jira did not confirm {name} {expected} in the GET response.",
+            details={f"requested_{name}": str(expected)},
+        ) from exc
+    if returned != expected:
+        raise JiraApiError(
+            f"Jira returned {name} {returned} while {expected} was requested.",
+            details={
+                f"requested_{name}": str(expected),
+                f"returned_{name}": str(returned),
+            },
+        )
+    return expected
+
+
+def validate_attachment_upload_response(
+    data: Any, *, status_code: int | None = None
+) -> list[dict[str, Any]]:
+    """Require at least one attachment object and a usable numeric id on every object."""
+    if not isinstance(data, list) or not data:
+        raise JiraApiError(
+            "Jira returned an unexpected attachment payload",
+            status_code=status_code,
+            details={"attachment_count": len(data) if isinstance(data, list) else None},
+        )
+    for attachment in data:
+        if not isinstance(attachment, dict):
+            raise JiraApiError(
+                "Jira returned an unexpected attachment payload",
+                status_code=status_code,
+                details={"attachment_count": len(data)},
+            )
+        try:
+            normalize_jira_numeric_id(attachment.get("id"), name="attachment id")
+        except JiraApiError as exc:
+            raise JiraApiError(
+                "Jira returned attachment metadata without a usable id",
+                status_code=status_code,
+                details={"attachment_count": len(data)},
+            ) from exc
+    return data
+
+
 def validate_agile_issue_batch(issue_keys: list[str]) -> None:
     """Enforce Jira Agile's one-to-fifty issue batch contract locally."""
     if not issue_keys:
@@ -171,6 +244,8 @@ def validate_agile_issue_batch(issue_keys: list[str]) -> None:
         raise JiraApiError(
             f"Jira Agile accepts at most 50 issues per sprint/backlog write; got {len(issue_keys)}."
         )
+    for issue_key in issue_keys:
+        normalize_jira_issue_key(issue_key)
 
 
 def require_shared_write_scope(config: JiraConfig, issue_keys: Iterable[str]) -> None:
@@ -304,6 +379,7 @@ class JiraClient:
         fields: Iterable[str] | None = None,
         expand: Iterable[str] | None = None,
     ) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
         params: dict[str, str] = {}
         if fields:
             params["fields"] = ",".join(fields)
@@ -445,6 +521,7 @@ class JiraClient:
         newest-first instead; the parameter is passed through as the ``orderBy`` query parameter
         only when set, so the unguarded default stays exactly what it was before.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
         params: dict[str, Any] = {"startAt": start_at, "maxResults": limit}
         if order_by:
             params["orderBy"] = order_by
@@ -503,6 +580,7 @@ class JiraClient:
         return {"comments": comments, "total": reported_total}
 
     def add_comment(self, issue_key: str, body: str) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
         return self._request(
             "POST",
             f"/issue/{issue_key}/comment",
@@ -511,7 +589,15 @@ class JiraClient:
         )
 
     def get_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/issue/{issue_key}/comment/{comment_id}", key=issue_key)
+        issue_key = normalize_jira_issue_key(issue_key)
+        normalized_comment_id = normalize_jira_numeric_id(comment_id, name="comment_id")
+        result = self._request(
+            "GET",
+            f"/issue/{issue_key}/comment/{normalized_comment_id}",
+            key=issue_key,
+        )
+        require_matching_jira_numeric_id(result, normalized_comment_id, name="comment_id")
+        return result
 
     def update_comment(self, issue_key: str, comment_id: str, body: str) -> dict[str, Any]:
         """Replace the body of one existing comment.
@@ -519,6 +605,8 @@ class JiraClient:
         Jira keeps the original author and created instant and records the edit through
         updateAuthor and updated, so a correction stays attributable without a second comment.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
         return self._request(
             "PUT",
             f"/issue/{issue_key}/comment/{comment_id}",
@@ -527,6 +615,8 @@ class JiraClient:
         )
 
     def delete_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
         return self._request(
             "DELETE",
             f"/issue/{issue_key}/comment/{comment_id}",
@@ -542,6 +632,7 @@ class JiraClient:
         and `transition_fields_payload`, which are the only things that read `fields`. Probed
         fact (FC-458): the metadata is per-transition, not a separate call.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
         return self._request(
             "GET",
             f"/issue/{issue_key}/transitions",
@@ -563,6 +654,7 @@ class JiraClient:
         `transition_fields_payload` for how a caller's plain values are shaped against each
         field's own metadata before reaching here.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
         payload: dict[str, Any] = {"transition": {"id": transition_id}}
         if fields:
             payload["fields"] = fields
@@ -588,6 +680,7 @@ class JiraClient:
         return self._request("GET", "/issue/createmeta", params=params, key=project_key)
 
     def get_edit_metadata(self, issue_key: str) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
         return self._request("GET", f"/issue/{issue_key}/editmeta", key=issue_key)
 
     def is_issue_type_allowed(self, issue_key: str, issue_type_name: str) -> bool:
@@ -614,6 +707,7 @@ class JiraClient:
         story_points: float | None = None,
     ) -> dict[str, Any]:
         if parent_key is not None:
+            parent_key = normalize_jira_issue_key(parent_key, name="parent_key")
             self.require_shared_write_scope([project_key, parent_key])
         return self._request(
             "POST",
@@ -634,6 +728,7 @@ class JiraClient:
         )
 
     def assign_issue(self, issue_key: str, account_id: str | None) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
         return self._request(
             "PUT",
             f"/issue/{issue_key}/assignee",
@@ -654,6 +749,7 @@ class JiraClient:
             "maxResults": limit,
         }
         if issue_key:
+            issue_key = normalize_jira_issue_key(issue_key)
             params["issueKey"] = issue_key
         if project_key:
             params["project"] = project_key
@@ -679,6 +775,7 @@ class JiraClient:
         generic "Jira API error" exit that the other guarded commands do not produce for the
         same condition.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
         data = self._request(
             "GET", f"/issue/{issue_key}", params={"fields": "updated"}, key=issue_key
         )
@@ -711,6 +808,7 @@ class JiraClient:
         the same PUT; the token, when given, gates the whole request, `update` included, since
         Jira offers only one PUT per issue, not a way to guard one section and not the other.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
         if expect_updated is not None:
             found = self.issue_version(issue_key)
             if found != expect_updated:
@@ -816,6 +914,10 @@ class JiraClient:
         link_type: str = "Relates",
         comment: str | None = None,
     ) -> dict[str, Any]:
+        outward_issue_key = normalize_jira_issue_key(
+            outward_issue_key, name="outward_issue_key"
+        )
+        inward_issue_key = normalize_jira_issue_key(inward_issue_key, name="inward_issue_key")
         self.require_shared_write_scope([outward_issue_key, inward_issue_key])
         return self._request(
             "POST",
@@ -835,9 +937,12 @@ class JiraClient:
         Callers must validate the link against fresh issue reads before invoking this endpoint.
         ``issue_key`` only selects the correct per-project credential set.
         """
+        issue_key = normalize_jira_issue_key(issue_key)
+        link_id = str(normalize_jira_numeric_id(link_id, name="link_id"))
         return self._request("DELETE", f"/issueLink/{link_id}", key=issue_key)
 
     def add_attachment(self, issue_key: str, file_path: str | Path) -> list[dict[str, Any]]:
+        issue_key = normalize_jira_issue_key(issue_key)
         path = Path(file_path)
         with path.open("rb") as handle:
             try:
@@ -862,13 +967,7 @@ class JiraClient:
                 status_code=response.status_code,
                 details=response.text[:500],
             ) from exc
-        if not isinstance(data, list):
-            raise JiraApiError(
-                "Jira returned an unexpected attachment payload",
-                status_code=response.status_code,
-                details=data,
-            )
-        return data
+        return validate_attachment_upload_response(data, status_code=response.status_code)
 
     def delete_attachment(
         self,
@@ -876,9 +975,15 @@ class JiraClient:
         *,
         issue_key: str | None = None,
     ) -> dict[str, Any]:
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+        if issue_key is not None:
+            issue_key = normalize_jira_issue_key(issue_key)
         return self._request("DELETE", f"/attachment/{attachment_id}", key=issue_key)
 
     def attachment_media_id(self, attachment_id: str, *, issue_key: str | None = None) -> str:
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+        if issue_key is not None:
+            issue_key = normalize_jira_issue_key(issue_key)
         try:
             response = self._http_client_for(issue_key).get(
                 f"/attachment/content/{attachment_id}",
@@ -906,6 +1011,7 @@ class JiraClient:
         start_at: int = 0,
         limit: int = 20,
     ) -> dict[str, Any]:
+        issue_key = normalize_jira_issue_key(issue_key)
         return self._request(
             "GET",
             f"/issue/{issue_key}/changelog",

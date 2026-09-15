@@ -153,6 +153,55 @@ def test_embed_mermaid_diagrams_renders_before_upload_and_replaces_blocks(
     assert client.expect_updated == "T-fresh"
 
 
+def test_embed_mermaid_audits_commit_before_best_effort_cleanup_failure(
+    tmp_path, monkeypatch
+) -> None:
+    events: list[str] = []
+
+    def fake_render(_source, output_path, *, runtime):
+        Path(output_path).write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + struct.pack(">II", 10, 10)
+        )
+        return Path(output_path)
+
+    monkeypatch.setattr("jira_agent.mermaid.render_mermaid_png", fake_render)
+    description = text_to_adf("```mermaid\nflowchart LR\nA --> B\n```")
+
+    class FakeClient:
+        def get_issue(self, _issue_key, *, fields=None, expand=None):
+            return {"fields": {"description": description, "updated": "T-fresh"}}
+
+        def add_attachment(self, _issue_key, path):
+            return [{"id": "9001", "filename": Path(path).name}]
+
+        def attachment_media_id(self, attachment_id, *, issue_key):
+            return "media-9001"
+
+        def edit_issue_adf_description(self, issue_key, description, *, expect_updated=None):
+            events.append("description_write")
+            return {"updated": True}
+
+        def delete_attachment(self, attachment_id, *, issue_key):
+            events.append("cleanup_delete")
+            raise JiraApiError("cleanup failed")
+
+    result = embed_mermaid_diagrams(
+        FakeClient(),
+        issue_key="FC-123",
+        description=description,
+        attachments=[{"id": "8000", "filename": "fc-123-mermaid-1.png"}],
+        output_dir=tmp_path,
+        runtime=MermaidRuntime(tmp_path / "node", tmp_path / "cli", tmp_path / "browser"),
+        on_description_committed=lambda _commit: events.append("audit"),
+    )
+
+    assert events == ["description_write", "audit", "cleanup_delete"]
+    assert result["deleted_attachment_ids"] == []
+    assert result["cleanup_failures"] == [
+        {"attachment_id": "8000", "message": "cleanup failed"}
+    ]
+
+
 def test_embed_mermaid_diagrams_rolls_back_uploads_when_description_edit_fails(
     tmp_path, monkeypatch
 ) -> None:

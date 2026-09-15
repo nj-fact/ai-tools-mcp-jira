@@ -29,11 +29,13 @@ from jira_agent.client import (
     issue_link_payload,
     issue_status_category,
     issue_type_allowed_values,
+    normalize_jira_issue_key,
     normalize_jira_numeric_id,
     patch_adf_description_section,
     png_dimensions,
     replace_diagram_with_media,
     require_concurrency_token,
+    require_matching_jira_numeric_id,
     require_shared_write_scope,
     select_transition,
     sprint_add_blast_radius,
@@ -44,6 +46,7 @@ from jira_agent.client import (
     transition_fields_payload,
     transition_required_fields_missing,
     validate_agile_issue_batch,
+    validate_attachment_upload_response,
 )
 from jira_agent.config import load_config
 from jira_agent.image_gallery import (
@@ -230,6 +233,21 @@ def _cleanup_uploaded_attachments(config: Any, issue_key: str, attachment_ids: l
                     pass
     except JiraApiError:
         pass
+
+
+def _delete_attachments_best_effort(
+    client: JiraClient, issue_key: str, attachment_ids: list[str]
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Delete superseded attachments without turning a committed description write into failure."""
+    deleted: list[str] = []
+    failures: list[dict[str, str]] = []
+    for attachment_id in attachment_ids:
+        try:
+            client.delete_attachment(attachment_id, issue_key=issue_key)
+            deleted.append(attachment_id)
+        except JiraApiError as exc:
+            failures.append({"attachment_id": attachment_id, "message": str(exc)})
+    return deleted, failures
 
 
 def _guard_unavailable_error(exc: JiraMissingConcurrencyTokenError) -> dict[str, Any]:
@@ -478,7 +496,9 @@ def jira_create_issue(
     jira_patch_description_section. A parent_key is validated as an existing issue in the same
     Jira site and credential scope before either dry-run success or a write is reported.
     """
+    config = load_config()
     try:
+        ensure_project_write_allowed(config, project_key)
         body = (
             read_text_source(description, description_file, section=description_section)
             if description or description_file
@@ -496,6 +516,8 @@ def jira_create_issue(
             story_points=story_points,
             story_points_field=_story_points_field(),
         )
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     except (OSError, ValueError) as exc:
         return {"ok": False, "message": str(exc)}
 
@@ -506,9 +528,7 @@ def jira_create_issue(
         else 0
     )
 
-    config = None
     if parent_key is not None:
-        config = load_config()
         try:
             require_shared_write_scope(config, [project_key, parent_key])
             with JiraClient(config) as parent_client:
@@ -525,11 +545,8 @@ def jira_create_issue(
             "message": "Pass execute=true to create this issue in Jira.",
         }
 
-    if config is None:
-        config = load_config()
     try:
         with JiraClient(config) as client:
-            ensure_project_write_allowed(config, project_key)
             issue_result = client.create_issue(
                 project_key=project_key,
                 issue_type_name=issue_type_name,
@@ -551,24 +568,32 @@ def jira_create_issue(
             result: dict[str, Any] = {"ok": True, "issue": issue_result}
             if diagram_count and issue_result.get("key") and isinstance(description_adf, dict):
                 try:
+                    created_key = str(issue_result["key"])
+
+                    def _audit_mermaid_commit(commit: dict[str, Any]) -> None:
+                        audit_write(
+                            config,
+                            action="render_mermaid_diagrams",
+                            issue_key=created_key,
+                            payload={
+                                "files": commit["files"],
+                                "attachment_ids": commit["attachment_ids"],
+                                "cleanup_pending_attachment_ids": commit[
+                                    "cleanup_pending_attachment_ids"
+                                ],
+                                "deleted_attachment_ids": [],
+                            },
+                            result=commit["result"],
+                        )
+
                     mermaid_result = embed_mermaid_diagrams(
                         client,
-                        issue_key=str(issue_result["key"]),
+                        issue_key=created_key,
                         description=description_adf,
                         output_dir=Path(config.audit_log_path).parent
                         / "diagrams"
-                        / str(issue_result["key"]),
-                    )
-                    audit_write(
-                        config,
-                        action="render_mermaid_diagrams",
-                        issue_key=str(issue_result["key"]),
-                        payload={
-                            "files": mermaid_result["files"],
-                            "attachment_ids": mermaid_result["attachment_ids"],
-                            "deleted_attachment_ids": mermaid_result["deleted_attachment_ids"],
-                        },
-                        result=mermaid_result["result"],
+                        / created_key,
+                        on_description_committed=_audit_mermaid_commit,
                     )
                     result["mermaid"] = mermaid_result
                 except (JiraApiError, OSError, RuntimeError, ValueError) as exc:
@@ -594,6 +619,10 @@ def jira_create_test_issue(
         summary=summary,
         description=description,
     )
+    try:
+        ensure_project_write_allowed(config, config.test_project_key)
+    except JiraWriteSafetyError as exc:
+        return _safety_error(exc)
     if not execute:
         return {
             "ok": True,
@@ -604,7 +633,6 @@ def jira_create_test_issue(
 
     try:
         with JiraClient(config) as client:
-            ensure_project_write_allowed(config, config.test_project_key)
             issue_result = client.create_issue(
                 project_key=config.test_project_key,
                 issue_type_name=config.test_issue_type,
@@ -1321,7 +1349,9 @@ def jira_store_factory_contract(
                         "file_path": file_path,
                         "safety": safety,
                     }
-                result = client.add_attachment(issue_key, file_path)
+                result = validate_attachment_upload_response(
+                    client.add_attachment(issue_key, file_path)
+                )
                 audit_write(
                     config,
                     action="factory_contract_attachment",
@@ -1671,10 +1701,13 @@ def jira_update_comment(
     (this used to be spelled `new_body` here only).
     """
     try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
         with _client() as client:
             safety = ensure_issue_write_allowed(client.config, client, key)
             try:
                 current = client.get_comment(key, comment_id)
+                require_matching_jira_numeric_id(current, comment_id, name="comment_id")
             except JiraApiError as exc:
                 if exc.status_code == 404:
                     return {
@@ -1814,6 +1847,13 @@ def jira_delete_issue_link(
     Fresh reads of both endpoints must identify one link with the requested type and direction.
     Pass link_id to additionally pin the expected Jira id; otherwise ambiguity is refused.
     """
+    try:
+        outward_key = normalize_jira_issue_key(outward_key, name="outward_key")
+        inward_key = normalize_jira_issue_key(inward_key, name="inward_key")
+        if link_id is not None:
+            link_id = str(normalize_jira_numeric_id(link_id, name="link_id"))
+    except JiraApiError as exc:
+        return _error(exc)
     config = load_config()
     try:
         with JiraClient(config) as client:
@@ -1830,6 +1870,7 @@ def jira_delete_issue_link(
                 link_type=link_type,
                 link_id=link_id,
             )
+            resolved["id"] = str(normalize_jira_numeric_id(resolved["id"], name="link_id"))
             if not execute:
                 return {
                     "ok": True,
@@ -1898,7 +1939,9 @@ def jira_attach_file(
                     "message": "Pass execute=true to upload this attachment to Jira.",
                 }
 
-            result = client.add_attachment(issue_key, file_path)
+            result = validate_attachment_upload_response(
+                client.add_attachment(issue_key, file_path)
+            )
             audit_write(
                 config,
                 action="attach",
@@ -1928,6 +1971,8 @@ def jira_delete_attachment(
             "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
         }
     try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
             issue = client.get_issue(issue_key, fields=["attachment"])
@@ -2113,10 +2158,6 @@ def jira_render_mermaid_diagrams(
             # them) so a failure in the OLD-attachment cleanup below cannot trigger this call's
             # own except clauses into deleting the attachment(s) the write just committed.
             uploaded_ids.clear()
-            deleted: list[str] = []
-            for attachment_id in to_delete:
-                client.delete_attachment(attachment_id, issue_key=issue_key)
-                deleted.append(attachment_id)
             audit_write(
                 config,
                 action="render_mermaid_diagrams",
@@ -2124,16 +2165,21 @@ def jira_render_mermaid_diagrams(
                 payload={
                     "files": [str(path) for path in paths],
                     "attachment_ids": committed_attachment_ids,
-                    "deleted_attachment_ids": deleted,
+                    "cleanup_pending_attachment_ids": to_delete,
+                    "deleted_attachment_ids": [],
                     "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
+            )
+            deleted, cleanup_failures = _delete_attachments_best_effort(
+                client, issue_key, to_delete
             )
             return {
                 "ok": True,
                 "issue": issue_key,
                 "attachments": new_attachments,
                 "deleted_attachment_ids": deleted,
+                "cleanup_failures": cleanup_failures,
             }
     # JiraApiError (and its subclasses JiraConcurrentEditError and JiraMissingConcurrencyTokenError)
     # is itself a RuntimeError, and JiraWriteSafetyError is *also* a RuntimeError — directly
@@ -2199,7 +2245,13 @@ def jira_embed_diagram(
         return {"ok": False, "message": str(exc)}
 
     delete_names = set(delete_filenames or [])
-    delete_ids = set(delete_attachment_ids or [])
+    try:
+        delete_ids = {
+            str(normalize_jira_numeric_id(value, name="delete_attachment_id"))
+            for value in (delete_attachment_ids or [])
+        }
+    except JiraApiError as exc:
+        return _error(exc)
     uploaded_ids: list[str] = []
     try:
         with JiraClient(config) as client:
@@ -2267,10 +2319,7 @@ def jira_embed_diagram(
             # attachments below cannot trigger this call's own except clauses into deleting the
             # attachment the write just committed.
             uploaded_ids.clear()
-            deleted: list[str] = []
-            for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id, issue_key=issue_key)
-                deleted.append(item_id)
+            cleanup_pending_ids = sorted(delete_ids - {attachment_id})
             audit_write(
                 config,
                 action="embed_diagram",
@@ -2279,11 +2328,15 @@ def jira_embed_diagram(
                     "file": file_path,
                     "attachment_id": attachment_id,
                     "media_id": media_id,
-                    "deleted_attachment_ids": deleted,
+                    "cleanup_pending_attachment_ids": cleanup_pending_ids,
+                    "deleted_attachment_ids": [],
                     "dimensions": {"width": width, "height": height},
                     "guard_concurrent_edit": guard_concurrent_edit,
                 },
                 result=result,
+            )
+            deleted, cleanup_failures = _delete_attachments_best_effort(
+                client, issue_key, cleanup_pending_ids
             )
             return {
                 "ok": True,
@@ -2291,6 +2344,7 @@ def jira_embed_diagram(
                 "attachment": attachment,
                 "media_id": media_id,
                 "deleted_attachment_ids": deleted,
+                "cleanup_failures": cleanup_failures,
             }
     except JiraConcurrentEditError as exc:
         _cleanup_uploaded_attachments(config, issue_key, uploaded_ids)
@@ -2340,6 +2394,9 @@ def jira_embed_existing_png_attachment(
         return {"ok": False, "message": "width and height must both be positive integers."}
 
     try:
+        issue_key = normalize_jira_issue_key(issue_key)
+        if attachment_id is not None:
+            attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
         with JiraClient(config) as client:
             safety = ensure_issue_write_allowed(config, client, issue_key)
             issue = client.get_issue(issue_key, fields=["description", "attachment", "updated"])
@@ -2351,7 +2408,7 @@ def jira_embed_existing_png_attachment(
             attachment = resolve_png_attachment(
                 issue, filename=filename, attachment_id=attachment_id
             )
-            resolved_id = str(attachment["id"])
+            resolved_id = str(normalize_jira_numeric_id(attachment["id"], name="attachment_id"))
             media_id = client.attachment_media_id(resolved_id, issue_key=issue_key)
             existing_description = issue.get("fields", {}).get("description") or {
                 "type": "doc",
@@ -2674,10 +2731,13 @@ def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dic
     the raw ADF document is still available, under `current_body_adf`.
     """
     try:
+        key = normalize_jira_issue_key(key)
+        comment_id = str(normalize_jira_numeric_id(comment_id, name="comment_id"))
         with _client() as client:
             safety = ensure_issue_write_allowed(client.config, client, key)
             try:
                 current = client.get_comment(key, comment_id)
+                require_matching_jira_numeric_id(current, comment_id, name="comment_id")
             except JiraApiError as exc:
                 if exc.status_code == 404:
                     return {

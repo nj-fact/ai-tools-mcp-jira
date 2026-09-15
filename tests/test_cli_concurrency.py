@@ -817,10 +817,12 @@ def test_edit_issue_combines_whole_array_labels_with_atomic_op_on_a_different_fi
 # --- edit-comment / delete-comment ----------------------------------------------------------
 
 
-def _make_comment_fake_client(*, current_text: str) -> tuple[type, dict[str, Any]]:
+def _make_comment_fake_client(
+    *, current_text: str, current_id: str = "10099"
+) -> tuple[type, dict[str, Any]]:
     state: dict[str, Any] = {"updates": [], "deletes": [], "get_comment_calls": 0}
     current_comment = {
-        "id": "10099",
+        "id": current_id,
         "body": {
             "type": "doc",
             "version": 1,
@@ -955,6 +957,48 @@ def test_delete_comment_execute_calls_delete_comment_once_and_audits(tmp_path, m
     _, audit_kwargs = audits[0]
     assert audit_kwargs["action"] == "delete_comment"
     assert audit_kwargs["issue_key"] == ISSUE_KEY
+
+
+def test_delete_comment_rejects_path_id_before_any_read_or_write(tmp_path, monkeypatch) -> None:
+    FakeClient, state = _make_comment_fake_client(current_text="Do not read")
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["delete-comment", ISSUE_KEY, "../transitions", "--execute", "--json"],
+    )
+    issue_key_result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["delete-comment", "FC-1/../FC-2", "10099", "--execute", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error_type"] == "jira_api_error"
+    assert issue_key_result.exit_code == 1
+    assert "Jira issue key" in json.loads(issue_key_result.stdout)["message"]
+    assert state["get_comment_calls"] == 0
+    assert state["deletes"] == []
+
+
+def test_delete_comment_rejects_mismatched_get_id_without_delete(tmp_path, monkeypatch) -> None:
+    FakeClient, state = _make_comment_fake_client(
+        current_text="Wrong resource", current_id="10100"
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        ["delete-comment", ISSUE_KEY, "10099", "--execute", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert "while 10099 was requested" in json.loads(result.stdout)["message"]
+    assert state["get_comment_calls"] == 1
+    assert state["deletes"] == []
 
 
 # --- Integration seam: issue-type was built alongside these commands, in a separate worktree,
@@ -1325,6 +1369,7 @@ def _make_embed_diagram_fake_client(
     concurrent_description: dict[str, Any] | None = None,
     delete_attachment_raises: bool = False,
     empty_upload_response: bool = False,
+    initial_attachments: list[dict[str, Any]] | None = None,
 ) -> tuple[type, list, list]:
     """Fake client for embed-diagram.
 
@@ -1373,7 +1418,7 @@ def _make_embed_diagram_fake_client(
             if "description" in fields:
                 payload["fields"]["description"] = state["description"]
             if "attachment" in fields:
-                payload["fields"]["attachment"] = []
+                payload["fields"]["attachment"] = initial_attachments or []
             return payload
 
         def add_attachment(self, issue_key: str, file_path):
@@ -1455,7 +1500,7 @@ def test_embed_diagram_rejects_attachment_id_not_owned_by_target_issue(
             "--file",
             str(png),
             "--delete-attachment-id",
-            "foreign-9000",
+            "9000",
             "--execute",
         ],
     )
@@ -1503,6 +1548,42 @@ def test_embed_diagram_rejects_empty_upload_response_without_writing(
     assert "returned no attachment metadata" in result.stderr
     assert writes == []
     assert deleted == []
+
+
+def test_embed_diagram_cleanup_failure_preserves_committed_write_and_audit(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes, deleted = _make_embed_diagram_fake_client(
+        after_upload_updated=READ_UPDATED,
+        delete_attachment_raises=True,
+        initial_attachments=[{"id": "8000", "filename": "old.png"}],
+    )
+    audits: list[tuple[tuple, dict]] = []
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "embed-diagram",
+            ISSUE_KEY,
+            "--file",
+            str(png),
+            "--delete-attachment-id",
+            "8000",
+            "--execute",
+        ],
+        audits=audits,
+    )
+
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert len(writes) == 1
+    assert deleted == ["8000"]
+    assert audits[0][1]["action"] == "embed_diagram"
+    assert audits[0][1]["payload"]["cleanup_pending_attachment_ids"] == ["8000"]
+    assert "remain committed" in result.stderr
 
 
 def test_embed_diagram_refuses_when_guard_on_and_updated_missing(tmp_path, monkeypatch) -> None:
@@ -1994,6 +2075,36 @@ def test_embed_existing_png_execute_writes_when_updated_matches(tmp_path, monkey
 
     assert result.exit_code == 0, result.stdout + result.stderr
     assert len(writes) == 1
+
+
+def test_embed_existing_png_rejects_path_attachment_id_before_any_read(
+    tmp_path, monkeypatch
+) -> None:
+    FakeClient, writes = _make_embed_existing_png_fake_client(
+        read_updated=READ_UPDATED, server_updated=READ_UPDATED
+    )
+
+    result = _run(
+        monkeypatch,
+        tmp_path,
+        FakeClient,
+        [
+            "embed-existing-png",
+            ISSUE_KEY,
+            "--filename",
+            "diagram.png",
+            "--attachment-id",
+            "../content",
+            "--width",
+            "800",
+            "--height",
+            "600",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "positive integer Jira id" in " ".join(result.stderr.split())
+    assert writes == []
 
 
 def _write_gallery_manifest(tmp_path: Path) -> Path:

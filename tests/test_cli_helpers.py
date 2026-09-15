@@ -688,6 +688,53 @@ def test_create_issue_cli_rejects_nonexistent_parent_in_dry_run(tmp_path, monkey
     assert client.creates == []
 
 
+def test_create_issue_cli_dry_run_enforces_project_write_scope(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "OTHER",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(
+        cli,
+        "JiraClient",
+        lambda _config: (_ for _ in ()).throw(AssertionError("client must not open")),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["create-issue", "Child", "--issue-type", "Task", "--project", "FC", "--json"],
+    )
+
+    assert result.exit_code == 3
+    assert json.loads(result.stdout)["error_type"] == "write_safety_error"
+
+
+def test_create_test_issue_cli_dry_run_enforces_project_write_scope(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_PROJECT_KEY": "FC",
+            "JIRA_WRITE_PROJECT_KEYS": "OTHER",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+
+    result = CliRunner().invoke(cli.app, ["create-test-issue", "Child", "--json"])
+
+    assert result.exit_code == 3
+    assert json.loads(result.stdout)["error_type"] == "write_safety_error"
+
+
 def test_edit_issue_cli_rejects_cross_scope_parent_before_reads_or_write(
     tmp_path, monkeypatch
 ) -> None:
@@ -1048,6 +1095,120 @@ def test_delete_issue_link_cli_rejects_cross_scope_before_reads_or_delete(
     assert "b-token" not in normalized
     assert client.reads == []
     assert client.deleted == []
+
+
+def test_delete_issue_link_cli_rejects_path_id_before_reads_or_delete(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    client = DeleteLinkCliFakeClient(config)
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", lambda _config: client)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "delete-issue-link",
+            "FC-354",
+            "FC-356",
+            "--link-id",
+            "../10001",
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "positive integer Jira id" in " ".join(result.stderr.split())
+    assert client.reads == []
+    assert client.deleted == []
+
+
+class EmptyUploadCliFakeClient:
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def add_attachment(self, issue_key, file_path):
+        return []
+
+
+def test_attach_cli_rejects_empty_success_payload_without_audit(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    upload = tmp_path / "empty.txt"
+    upload.write_text("body", encoding="utf-8")
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", EmptyUploadCliFakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda _config, **kwargs: audited.append(kwargs))
+
+    result = CliRunner().invoke(
+        cli.app, ["attach", "FC-1", "--file", str(upload), "--execute", "--json"]
+    )
+
+    assert result.exit_code == 1
+    assert "unexpected attachment payload" in json.loads(result.stdout)["message"]
+    assert audited == []
+
+
+def test_factory_contract_cli_rejects_empty_success_payload_without_audit(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    upload = tmp_path / "factory.txt"
+    upload.write_text("body", encoding="utf-8")
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", EmptyUploadCliFakeClient)
+    monkeypatch.setattr(cli, "audit_write", lambda _config, **kwargs: audited.append(kwargs))
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "factory-contract",
+            "FC-1",
+            "--mode",
+            "attachment",
+            "--file",
+            str(upload),
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unexpected attachment payload" in " ".join(result.stderr.split())
+    assert audited == []
 
 
 class LinkCreateCliFakeClient:

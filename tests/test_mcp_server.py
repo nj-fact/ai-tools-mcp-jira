@@ -45,7 +45,10 @@ def make_mixed_scope_config(tmp_path) -> JiraConfig:
     )
 
 
-def test_jira_create_issue_dry_run_reports_mermaid_diagrams() -> None:
+def test_jira_create_issue_dry_run_reports_mermaid_diagrams(tmp_path, monkeypatch) -> None:
+    config = make_config(tmp_path)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+
     result = mcp_server.jira_create_issue(
         project_key="FC",
         issue_type_name="Task",
@@ -120,6 +123,45 @@ def test_jira_create_issue_rejects_nonexistent_parent_even_in_dry_run(
     assert result["status_code"] == 404
     assert client.reads == ["FC-999"]
     assert client.creates == []
+
+
+def test_jira_create_issue_dry_run_enforces_project_write_scope(tmp_path, monkeypatch) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "OTHER",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+
+    result = mcp_server.jira_create_issue("FC", "Task", "Child")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "write_safety"
+
+
+def test_jira_create_test_issue_dry_run_enforces_project_write_scope(
+    tmp_path, monkeypatch
+) -> None:
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_TEST_PROJECT_KEY": "FC",
+            "JIRA_WRITE_PROJECT_KEYS": "OTHER",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+
+    result = mcp_server.jira_create_test_issue("Child")
+
+    assert result["ok"] is False
+    assert result["error_type"] == "write_safety"
 
 
 def test_jira_edit_issue_rejects_cross_scope_parent_before_read_or_write(
@@ -554,6 +596,78 @@ def test_jira_delete_issue_link_rejects_cross_scope_before_reads_or_delete(
     assert client.deleted_link_ids == []
 
 
+def test_jira_delete_issue_link_rejects_path_id_before_reads_or_delete(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_link_parent_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_delete_issue_link(
+        "FC-354", "FC-356", link_id="../10001", execute=True
+    )
+
+    assert result["ok"] is False
+    assert "positive integer Jira id" in result["message"]
+    assert client.reads == []
+    assert client.deleted_link_ids == []
+
+
+class EmptyUploadMcpFakeClient:
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def get_issue(self, issue_key, *, fields=None, expand=None):
+        return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
+
+    def add_attachment(self, issue_key, file_path):
+        return []
+
+
+def test_jira_attach_file_rejects_empty_success_payload_without_audit(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = EmptyUploadMcpFakeClient(config)
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(
+        mcp_server, "audit_write", lambda _config, **kwargs: audited.append(kwargs)
+    )
+
+    result = mcp_server.jira_attach_file("/tmp/file.txt", key="FC-1", execute=True)
+
+    assert result["ok"] is False
+    assert "unexpected attachment payload" in result["message"]
+    assert audited == []
+
+
+def test_jira_factory_contract_rejects_empty_success_payload_without_audit(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = EmptyUploadMcpFakeClient(config)
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+    monkeypatch.setattr(
+        mcp_server, "audit_write", lambda _config, **kwargs: audited.append(kwargs)
+    )
+
+    result = mcp_server.jira_store_factory_contract(
+        key="FC-1", file_path="/tmp/file.txt", mode="attachment", execute=True
+    )
+
+    assert result["ok"] is False
+    assert "unexpected attachment payload" in result["message"]
+    assert audited == []
+
+
 class LinkCreateFakeClient:
     def __init__(self, _config) -> None:
         self.created: list[dict[str, object]] = []
@@ -650,6 +764,7 @@ class ExistingPngFakeClient:
     def __init__(self, _config, *, updated="2026-01-01T00:00:00.000+0000", server_updated=None):
         self.description = {"type": "doc", "version": 1, "content": []}
         self.edits: list[dict[str, object]] = []
+        self.get_calls = 0
         self.expect_updated_calls: list[str | None] = []
         self.attachment = {
             "id": "170501",
@@ -666,6 +781,7 @@ class ExistingPngFakeClient:
         return None
 
     def get_issue(self, issue_key, *, fields=None, expand=None):
+        self.get_calls += 1
         if fields == ["project"]:
             return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
         # The initial read includes "updated" (the guard token); the post-write verification
@@ -749,6 +865,28 @@ def test_jira_embed_existing_png_attachment_dry_run_then_reuses_existing_attachm
     ]
     assert executed["ok"] is True
     assert executed["media_id"] == "media-fc349"
+
+
+def test_jira_embed_existing_png_rejects_path_attachment_id_before_any_read(
+    tmp_path, monkeypatch
+) -> None:
+    config = make_config(tmp_path)
+    client = ExistingPngFakeClient(config)
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", lambda _config: client)
+
+    result = mcp_server.jira_embed_existing_png_attachment(
+        "fc349-disbursement-flow.png",
+        key="FC-349",
+        attachment_id="../content",
+        width=1600,
+        height=900,
+    )
+
+    assert result["ok"] is False
+    assert "positive integer Jira id" in result["message"]
+    assert client.get_calls == 0
+    assert client.edits == []
 
 
 def test_jira_embed_existing_png_attachment_refuses_on_concurrent_edit(
@@ -1866,9 +2004,13 @@ _COMMENT_BODY_ADF = {
 
 
 class DeleteCommentFakeClient:
-    def __init__(self, _config, *, missing: bool = False) -> None:
+    def __init__(
+        self, _config, *, missing: bool = False, returned_id: str | None = None
+    ) -> None:
         self.config = _config
         self.missing = missing
+        self.returned_id = returned_id
+        self.get_comment_calls = 0
         self.deleted: list[tuple[str, str]] = []
 
     def __enter__(self):
@@ -1882,10 +2024,11 @@ class DeleteCommentFakeClient:
         return {"key": issue_key, "fields": {"project": {"key": "FC"}}}
 
     def get_comment(self, issue_key, comment_id):
+        self.get_comment_calls += 1
         if self.missing:
             raise JiraApiError("not found", status_code=404)
         return {
-            "id": comment_id,
+            "id": self.returned_id or comment_id,
             "author": {"displayName": "Agent"},
             "body": _COMMENT_BODY_ADF,
         }
@@ -1945,6 +2088,37 @@ def test_jira_delete_comment_refuses_a_missing_comment(tmp_path, monkeypatch) ->
     result = mcp_server.jira_delete_comment("FC-403", "999", execute=True)
 
     assert result == {"ok": False, "message": "Comment 999 is not present on FC-403."}
+    assert client.deleted == []
+
+
+def test_jira_delete_comment_rejects_path_id_before_any_read_or_write(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_delete_comment_client(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_delete_comment("FC-403", "../transitions", execute=True)
+    issue_key_result = mcp_server.jira_delete_comment(
+        "FC-403/../FC-404", "555", execute=True
+    )
+
+    assert result["ok"] is False
+    assert "positive integer Jira id" in result["message"]
+    assert issue_key_result["ok"] is False
+    assert "Jira issue key" in issue_key_result["message"]
+    assert client.get_comment_calls == 0
+    assert client.deleted == []
+
+
+def test_jira_delete_comment_rejects_mismatched_get_id_without_delete(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_delete_comment_client(monkeypatch, tmp_path, returned_id="556")
+
+    result = mcp_server.jira_delete_comment("FC-403", "555", execute=True)
+
+    assert result["ok"] is False
+    assert "while 555 was requested" in result["message"]
+    assert client.get_comment_calls == 1
     assert client.deleted == []
 
 
@@ -3000,6 +3174,8 @@ class EmbedDiagramMcpFakeClient:
         initial_description=None,
         concurrent_description=None,
         empty_upload_response=False,
+        initial_attachments=None,
+        delete_attachment_raises=False,
     ):
         self.state = {
             "updated": "T-before-upload",
@@ -3011,8 +3187,11 @@ class EmbedDiagramMcpFakeClient:
         )
         self.concurrent_description = concurrent_description
         self.empty_upload_response = empty_upload_response
+        self.initial_attachments = initial_attachments or []
+        self.delete_attachment_raises = delete_attachment_raises
         self.writes: list[dict[str, object]] = []
         self.deleted: list[str] = []
+        self.events: list[str] = []
 
     def __enter__(self):
         return self
@@ -3031,7 +3210,7 @@ class EmbedDiagramMcpFakeClient:
         if "description" in fields:
             payload["fields"]["description"] = self.state["description"]
         if "attachment" in fields:
-            payload["fields"]["attachment"] = []
+            payload["fields"]["attachment"] = self.initial_attachments
         return payload
 
     def add_attachment(self, issue_key, file_path):
@@ -3062,10 +3241,14 @@ class EmbedDiagramMcpFakeClient:
                 found_updated=self.at_put_time_updated,
             )
         self.writes.append({"issue": issue_key, "description": description})
+        self.events.append("description_write")
         return {"id": "1"}
 
     def delete_attachment(self, attachment_id, *, issue_key):
         self.deleted.append(attachment_id)
+        self.events.append("cleanup_delete")
+        if self.delete_attachment_raises:
+            raise JiraApiError("cleanup failed")
         return {}
 
 
@@ -3113,6 +3296,39 @@ def test_jira_embed_diagram_rejects_empty_upload_response_without_writing(
     assert "returned no attachment metadata" in result["message"]
     assert client.writes == []
     assert client.deleted == []
+
+
+def test_jira_embed_diagram_cleanup_failure_preserves_committed_write_and_audit(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_embed_diagram_mcp_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        initial_attachments=[{"id": "8000", "filename": "old.png"}],
+        delete_attachment_raises=True,
+    )
+    audited: list[dict[str, object]] = []
+
+    def _audit(_config, **kwargs):
+        client.events.append("audit")
+        audited.append(kwargs)
+
+    monkeypatch.setattr(mcp_server, "audit_write", _audit)
+    png = tmp_path / "diagram.png"
+    png.write_bytes(_PNG_BYTES)
+
+    result = mcp_server.jira_embed_diagram(
+        str(png), key="FC-1", delete_attachment_ids=["8000"], execute=True
+    )
+
+    assert result["ok"] is True
+    assert len(client.writes) == 1
+    assert client.events == ["description_write", "audit", "cleanup_delete"]
+    assert audited[0]["payload"]["cleanup_pending_attachment_ids"] == ["8000"]
+    assert result["cleanup_failures"] == [
+        {"attachment_id": "8000", "message": "cleanup failed"}
+    ]
 
 
 def test_jira_embed_diagram_refuses_on_genuine_concurrent_edit(tmp_path, monkeypatch) -> None:
@@ -3237,7 +3453,7 @@ def test_jira_embed_diagram_rejects_attachment_id_not_owned_by_target_issue(
     png.write_bytes(_PNG_BYTES)
 
     result = mcp_server.jira_embed_diagram(
-        str(png), key="FC-1", delete_attachment_ids=["foreign-9000"], execute=True
+        str(png), key="FC-1", delete_attachment_ids=["9000"], execute=True
     )
 
     assert result["ok"] is False
@@ -3259,6 +3475,8 @@ class MermaidFakeClient:
         after_upload_updated,
         at_put_time_updated=None,
         concurrent_description=None,
+        existing_attachments=None,
+        delete_attachment_raises=False,
     ):
         self.state = {"updated": "T-before-upload"}
         self.after_upload_updated = after_upload_updated
@@ -3277,9 +3495,12 @@ class MermaidFakeClient:
             ],
         }
         self.concurrent_description = concurrent_description
+        self.existing_attachments = existing_attachments or []
+        self.delete_attachment_raises = delete_attachment_raises
         self.writes: list[dict[str, object]] = []
         self.uploaded: list[str] = []
         self.deleted: list[str] = []
+        self.events: list[str] = []
         self._next_id = 9200
 
     def __enter__(self):
@@ -3298,7 +3519,7 @@ class MermaidFakeClient:
         if fields is None or "description" in fields:
             payload["fields"]["description"] = self.description
         if fields is not None and "attachment" in fields:
-            payload["fields"]["attachment"] = []
+            payload["fields"]["attachment"] = self.existing_attachments
         return payload
 
     def add_attachment(self, issue_key, path):
@@ -3330,10 +3551,14 @@ class MermaidFakeClient:
                 found_updated=self.at_put_time_updated,
             )
         self.writes.append({"issue": issue_key, "description": description})
+        self.events.append("description_write")
         return {"id": "1"}
 
     def delete_attachment(self, attachment_id, *, issue_key):
         self.deleted.append(attachment_id)
+        self.events.append("cleanup_delete")
+        if self.delete_attachment_raises:
+            raise JiraApiError("cleanup failed")
         return {}
 
 
@@ -3389,6 +3614,37 @@ def test_jira_render_mermaid_audit_keeps_committed_attachment_ids(tmp_path, monk
     assert result["ok"] is True
     assert audited[0]["payload"]["attachment_ids"] == client.uploaded
     assert audited[0]["payload"]["attachment_ids"] != []
+
+
+def test_jira_render_mermaid_cleanup_failure_preserves_committed_write_and_audit(
+    tmp_path, monkeypatch
+) -> None:
+    client = _install_mermaid_client(
+        monkeypatch,
+        tmp_path,
+        after_upload_updated="2026-01-01T00:01:00.000+0000",
+        existing_attachments=[{"id": "8000", "filename": "fc-1-mermaid-1.png"}],
+        delete_attachment_raises=True,
+    )
+    audited: list[dict[str, object]] = []
+
+    def _audit(_config, **kwargs):
+        client.events.append("audit")
+        audited.append(kwargs)
+
+    monkeypatch.setattr(mcp_server, "audit_write", _audit)
+
+    result = mcp_server.jira_render_mermaid_diagrams(
+        key="FC-1", output_dir=str(tmp_path / "out"), execute=True
+    )
+
+    assert result["ok"] is True
+    assert len(client.writes) == 1
+    assert client.events == ["description_write", "audit", "cleanup_delete"]
+    assert audited[0]["payload"]["cleanup_pending_attachment_ids"] == ["8000"]
+    assert result["cleanup_failures"] == [
+        {"attachment_id": "8000", "message": "cleanup failed"}
+    ]
 
 
 def test_jira_render_mermaid_empty_later_upload_cleans_up_prior_upload(
