@@ -3,36 +3,9 @@ from __future__ import annotations
 from jira_agent.workflows import (
     drift_reconcile_comment_body,
     factory_contract_comment_body,
-    markdown_section,
     normalize_drift_label,
-    read_text_source,
     update_drift_labels,
 )
-
-
-def test_read_text_source_can_select_one_markdown_section(tmp_path) -> None:
-    source = tmp_path / "issue.md"
-    source.write_text(
-        "# Wrapper\n\n## Exact description\n\n### Outcome\nReady.\n\n## Notes\nLocal only.\n",
-        encoding="utf-8",
-    )
-
-    assert read_text_source(file_path=source, section="Exact description") == (
-        "### Outcome\nReady."
-    )
-
-
-def test_markdown_section_rejects_missing_or_ambiguous_headings() -> None:
-    for source, message in [
-        ("## Other\nText", "Markdown section not found: Exact"),
-        ("## Exact\nOne\n## Exact\nTwo", "Markdown section is ambiguous: Exact"),
-    ]:
-        try:
-            markdown_section(source, "Exact")
-        except ValueError as exc:
-            assert str(exc) == message
-        else:
-            raise AssertionError("Expected ValueError")
 
 
 def test_factory_contract_comment_body_includes_source() -> None:

@@ -10,6 +10,8 @@ Fill `.env`:
 JIRA_SITE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your-api-token
+# Optional: this file overrides JIRA_API_TOKEN.
+# JIRA_API_TOKEN_FILE=/run/secrets/actico.token
 JIRA_TEST_JQL=project = FC AND updated >= -365d ORDER BY updated DESC
 JIRA_TEST_PROJECT_KEY=FC
 JIRA_TEST_ISSUE_TYPE=Task
@@ -18,29 +20,6 @@ JIRA_WRITE_PROJECT_KEYS=FC
 JIRA_WRITE_ISSUE_KEYS=
 JIRA_AUDIT_LOG_PATH=.jira-agent/audit.jsonl
 ```
-
-### Per-project credentials
-
-Some Jira projects require a different user/API token on the same site. Add per-project
-overrides with `JIRA_PROJECT__<PROJECTKEY>__*` variables; every other project keeps using
-the default `JIRA_EMAIL`/`JIRA_API_TOKEN`:
-
-```env
-JIRA_PROJECT__FINRP__EMAIL=finrp-user@example.com
-JIRA_PROJECT__FINRP__API_TOKEN=finrp-api-token
-# Optional; falls back to JIRA_SITE_URL:
-# JIRA_PROJECT__FINRP__SITE_URL=https://your-domain.atlassian.net
-```
-
-The project key is case-insensitive in the variable name and is normalized to uppercase.
-`EMAIL` and `API_TOKEN` must both be set for a project; a partial override fails config
-validation. Requests are matched by the target project or issue key (`FINRP-123` uses the
-`FINRP` credentials); requests without a project target, such as `jira_myself` or plain
-JQL searches, use the default credentials. `jira_myself`, `jira_search_issues`, `jira_mine`,
-and `jira_by_status` accept an optional project argument to run under that project's
-credential set. Write audit records name the credential set used as `credential_source`
-(the project key or `default`); tokens are never logged. Restart the MCP server (or the
-Claude/Codex session hosting it) after changing `.env`.
 
 Install and run:
 
@@ -85,46 +64,6 @@ uv run jira-agent transition ABC-123 "In Progress" --execute
 uv run python scripts/smoke_mcp.py
 ```
 
-Without `uv`, use a local virtual environment. The generated MCP configuration uses that
-environment's Python executable and therefore does not depend on `uv` being on the client PATH:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e .
-.venv\Scripts\jira-agent.exe myself
-.venv\Scripts\jira-agent.exe mcp-config
-.venv\Scripts\python.exe scripts\smoke_mcp.py
-```
-
-On a fresh Windows system, the repository setup script installs the Python development extras and
-the pinned Mermaid CLI, verifies that an installed Chrome or Edge browser can be reused, and runs
-the local verification suite. It runs the Jira MCP smoke test as well when `.env` is configured:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
-```
-
-Create commands are dry-run by default. They accept Markdown text or a UTF-8 Markdown file; use
-`--description-section` to file one heading body from a larger preparation document:
-
-```powershell
-.venv\Scripts\jira-agent.exe create-issue `
-  "Establish the immutable external-evidence foundation" `
-  --project FC `
-  --issue-type Task `
-  --description-file C:\path\to\story-draft.md `
-  --description-section "Exact proposed Jira description" `
-  --labels FA101,MVP,risk-high `
-  --parent FC-123 `
-  --priority High `
-  --story-points 8
-```
-
-`--story-points` writes to the Jira custom field named by `JIRA_STORY_POINTS_FIELD`, which defaults
-to `customfield_10028`. That numeric id differs per Jira site: look yours up under
-`/rest/api/3/field` and set the variable in `.env` if it is not the default. Whole values are sent as
-integers, halves such as `0.5` are preserved, and `edit-issue` takes the same option.
-
 ## Current Scope
 
 - Read current Jira user with `myself`
@@ -134,8 +73,6 @@ integers, halves such as `0.5` are preserved, and `edit-issue` takes the same op
 - Use friendly searches with `mine`, `assigned-to-me`, `fc-open`, and `by-status`
 - Run read-only smoke checks inside the configured FC test scope with `test-scope`
 - Inspect create metadata and create dry-run/real test issues in the configured FC project
-- Create arbitrary allowed issue types with labels, parent, priority, story points, and
-  Markdown-to-ADF descriptions; optionally select one Markdown section from a preparation file
 - Fetch and assign the configured test issue
 - Build compact agent-friendly issue reports with `agent-report`
 - Prepare standardized agent comments with `agent-plan-comment`
@@ -143,20 +80,12 @@ integers, halves such as `0.5` are preserved, and `edit-issue` takes the same op
 - Store Factory Contracts as comments or attachments with `factory-contract`
 - Post Drift Reconcile comments with `drift-reconcile-comment`
 - Set or remove `drift-*` labels with `drift-labels`
-- Edit summary, description, labels, parent, priority, and story points with `edit-issue`
+- Edit summary, description, and labels with `edit-issue`
 - Search assignable users with `user-search` and assign by query with `assign-user`
 - Link issues with `link-issue`
 - Attach local files with `attach`
 - Delete issue attachments with `delete-attachment`
 - Upload PNG diagrams and embed them in descriptions with `embed-diagram`
-- Insert or replace a linked screenshot gallery from existing attachments with
-  `upsert-image-gallery`
-- Render every Mermaid code block locally with the pinned Mermaid CLI, upload the generated PNGs,
-  and embed them with `jira_render_mermaid_diagrams`
-- Render Markdown headings, wrapped paragraphs, bullet and numbered lists, task checkboxes, tables,
-  inline code, emphasis, and HTTP links as native Jira ADF
-- Treat Markdown blank lines as source readability only; Jira headings, paragraphs, lists, and
-  tables provide their own layout spacing, so no empty ADF paragraphs are written
 - Inspect issue history with `changelog` or `agent-report --changelog`
 - Inspect local write audit records with `audit-log`
 - Run bundled write smoke checks against the configured test issue
@@ -180,9 +109,11 @@ Example MCP server command for local clients:
 
 ```json
 {
-  "command": "C:\\path\\to\\mcp-jira\\.venv\\Scripts\\python.exe",
-  "args": ["-m", "jira_agent.mcp_server"],
-  "cwd": "C:\\path\\to\\mcp-jira"
+  "command": "/run/current-system/sw/bin/bash",
+  "args": [
+    "-lc",
+    "cd /home/norman/Fact/mcp-jira && exec env PYTHONPATH=/home/norman/Fact/mcp-jira/src JIRA_API_TOKEN_FILE=/run/secrets/actico.token /home/norman/Fact/mcp-jira/.venv/bin/python -m jira_agent.mcp_server"
+  ]
 }
 ```
 
@@ -196,7 +127,6 @@ Available MCP tools:
 - `jira_fc_open`
 - `jira_by_status`
 - `jira_test_scope_issues`
-- `jira_create_issue`
 - `jira_create_test_issue`
 - `jira_get_test_issue`
 - `jira_assign_issue`
@@ -211,14 +141,11 @@ Available MCP tools:
 - `jira_assign_user`
 - `jira_list_comments`
 - `jira_add_comment`
-- `jira_update_comment`
 - `jira_list_transitions`
 - `jira_link_issue`
 - `jira_attach_file`
 - `jira_delete_attachment`
 - `jira_embed_diagram`
-- `jira_upsert_image_gallery`
-- `jira_render_mermaid_diagrams`
 - `jira_changelog`
 - `jira_transition_issue`
 

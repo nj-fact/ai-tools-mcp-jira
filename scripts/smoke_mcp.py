@@ -17,7 +17,6 @@ EXPECTED_TOOLS = {
     "jira_fc_open",
     "jira_by_status",
     "jira_test_scope_issues",
-    "jira_create_issue",
     "jira_create_test_issue",
     "jira_get_test_issue",
     "jira_assign_issue",
@@ -35,7 +34,6 @@ EXPECTED_TOOLS = {
     "jira_list_transitions",
     "jira_link_issue",
     "jira_attach_file",
-    "jira_render_mermaid_diagrams",
     "jira_changelog",
     "jira_transition_issue",
 }
@@ -66,6 +64,7 @@ async def main() -> None:
                 "command": sys.executable,
                 "args": ["-m", "jira_agent.mcp_server"],
                 "cwd": str(repo_root),
+                "env": {"PYTHONPATH": str(repo_root / "src")},
             }
         }
     }
@@ -76,28 +75,6 @@ async def main() -> None:
         missing_tools = EXPECTED_TOOLS - tool_names
         if missing_tools:
             raise SystemExit(f"Missing MCP tools: {', '.join(sorted(missing_tools))}")
-
-        create_result = await client.call_tool(
-            "jira_create_issue",
-            {
-                "project_key": "FC",
-                "issue_type_name": "Task",
-                "summary": "MCP formatting dry run",
-                "description": "## Acceptance criteria\n\n- [ ] Native Jira checkbox",
-                "labels": ["MVP", "risk-high"],
-                "parent_key": "FC-123",
-                "priority": "High",
-            },
-        )
-        create_data = create_result.data
-        if not isinstance(create_data, dict) or not create_data.get("dry_run"):
-            raise SystemExit(f"jira_create_issue dry run failed: {create_data!r}")
-        create_fields = (create_data.get("payload") or {}).get("fields") or {}
-        description = create_fields.get("description") or {}
-        if not any(block.get("type") == "taskList" for block in description.get("content") or []):
-            raise SystemExit("jira_create_issue did not render a native ADF taskList")
-        if create_fields.get("parent") != {"key": "FC-123"}:
-            raise SystemExit("jira_create_issue omitted the parent field")
 
         arguments: dict[str, Any] = {"comments_limit": args.comments}
         if args.issue:
@@ -117,7 +94,6 @@ async def main() -> None:
 
     print("MCP smoke test passed")
     print(f"tools: {len(tool_names)}")
-    print("generic create dry run: passed")
     print(f"issue: {key}")
     print(f"url: {url}")
     print(f"status: {status}")

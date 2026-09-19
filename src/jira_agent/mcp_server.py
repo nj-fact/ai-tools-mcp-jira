@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
 
 from jira_agent.audit import audit_write
 from jira_agent.client import (
-    DEFAULT_STORY_POINTS_FIELD,
     JiraApiError,
     JiraClient,
     create_issue_payload,
@@ -18,17 +16,6 @@ from jira_agent.client import (
     select_transition,
 )
 from jira_agent.config import load_config
-from jira_agent.image_gallery import (
-    image_gallery_blocks,
-    load_image_gallery_manifest,
-    newest_attachments_by_filename,
-    upsert_top_level_section,
-)
-from jira_agent.mermaid import (
-    discover_mermaid_runtime,
-    mermaid_sources_from_adf,
-    render_mermaid_png,
-)
 from jira_agent.reporting import agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
@@ -39,7 +26,6 @@ from jira_agent.safety import (
 from jira_agent.workflows import (
     drift_reconcile_comment_body,
     factory_contract_comment_body,
-    read_text_source,
     update_drift_labels,
 )
 
@@ -54,15 +40,6 @@ def _client() -> JiraClient:
 
 def _fields_or_default(fields: list[str] | None) -> list[str]:
     return fields or DEFAULT_FIELDS
-
-
-def _story_points_field() -> str:
-    """Dry runs must show the same field id the write would use, but must not fail
-    when the environment is incomplete."""
-    try:
-        return load_config().story_points_field
-    except Exception:
-        return DEFAULT_STORY_POINTS_FIELD
 
 
 def _error(exc: JiraApiError) -> dict[str, Any]:
@@ -82,29 +59,24 @@ def _safety_error(exc: JiraWriteSafetyError) -> dict[str, Any]:
     }
 
 
-def _run_jql(jql: str, limit: int = 20, project: str | None = None) -> dict[str, Any]:
+def _run_jql(jql: str, limit: int = 20) -> dict[str, Any]:
     try:
         with _client() as client:
             return {
                 "ok": True,
                 "jql": jql,
-                "result": client.search_issues(
-                    jql,
-                    limit=limit,
-                    fields=DEFAULT_FIELDS,
-                    project_key=project,
-                ),
+                "result": client.search_issues(jql, limit=limit, fields=DEFAULT_FIELDS),
             }
     except JiraApiError as exc:
         return _error(exc)
 
 
 @mcp.tool
-def jira_myself(project: str | None = None) -> dict[str, Any]:
-    """Return the authenticated Jira user. Pass a project key to check its credential set."""
+def jira_myself() -> dict[str, Any]:
+    """Return the authenticated Jira user."""
     try:
         with _client() as client:
-            return {"ok": True, "user": client.myself(key=project)}
+            return {"ok": True, "user": client.myself()}
     except JiraApiError as exc:
         return _error(exc)
 
@@ -125,9 +97,8 @@ def jira_search_issues(
     limit: int = 20,
     fields: list[str] | None = None,
     next_page_token: str | None = None,
-    project: str | None = None,
 ) -> dict[str, Any]:
-    """Search Jira issues with JQL. Pass a project key to search with its credential set."""
+    """Search Jira issues with JQL."""
     try:
         with _client() as client:
             return {
@@ -137,7 +108,6 @@ def jira_search_issues(
                     limit=limit,
                     fields=_fields_or_default(fields),
                     next_page_token=next_page_token,
-                    project_key=project,
                 ),
             }
     except JiraApiError as exc:
@@ -157,7 +127,7 @@ def jira_mine(project: str | None = None, limit: int = 20) -> dict[str, Any]:
     clauses = ["assignee = currentUser()", "resolution = Unresolved"]
     if project:
         clauses.insert(0, f"project = {project}")
-    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit, project=project)
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
 
 
 @mcp.tool
@@ -173,7 +143,7 @@ def jira_by_status(status: str, project: str | None = None, limit: int = 20) -> 
     clauses = [f'status = "{escaped_status}"']
     if project:
         clauses.insert(0, f"project = {project}")
-    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit, project=project)
+    return _run_jql(" AND ".join(clauses) + " ORDER BY updated DESC", limit=limit)
 
 
 @mcp.tool
@@ -191,80 +161,6 @@ def jira_test_scope_issues(limit: int = 5) -> dict[str, Any]:
                     fields=DEFAULT_FIELDS,
                 ),
             }
-    except JiraApiError as exc:
-        return _error(exc)
-
-
-@mcp.tool
-def jira_create_issue(
-    project_key: str,
-    issue_type_name: str,
-    summary: str,
-    description: str | None = None,
-    description_file: str | None = None,
-    description_section: str | None = None,
-    labels: list[str] | None = None,
-    fix_versions: list[str] | None = None,
-    parent_key: str | None = None,
-    priority: str | None = None,
-    story_points: float | None = None,
-    execute: bool = False,
-) -> dict[str, Any]:
-    """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
-    try:
-        body = (
-            read_text_source(description, description_file, section=description_section)
-            if description or description_file
-            else None
-        )
-        payload = create_issue_payload(
-            project_key=project_key,
-            issue_type_name=issue_type_name,
-            summary=summary,
-            description=body,
-            labels=labels,
-            fix_versions=fix_versions,
-            parent_key=parent_key,
-            priority=priority,
-            story_points=story_points,
-            story_points_field=_story_points_field(),
-        )
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "message": str(exc)}
-
-    if not execute:
-        return {
-            "ok": True,
-            "dry_run": True,
-            "payload": payload,
-            "message": "Pass execute=true to create this issue in Jira.",
-        }
-
-    try:
-        config = load_config()
-        with JiraClient(config) as client:
-            ensure_project_write_allowed(config, project_key)
-            issue_result = client.create_issue(
-                project_key=project_key,
-                issue_type_name=issue_type_name,
-                summary=summary,
-                description=body,
-                labels=labels,
-                fix_versions=fix_versions,
-                parent_key=parent_key,
-                priority=priority,
-                story_points=story_points,
-            )
-            audit_write(
-                config,
-                action="create_issue",
-                issue_key=issue_result.get("key"),
-                payload=payload,
-                result=issue_result,
-            )
-            return {"ok": True, "issue": issue_result}
-    except JiraWriteSafetyError as exc:
-        return _safety_error(exc)
     except JiraApiError as exc:
         return _error(exc)
 
@@ -351,7 +247,7 @@ def jira_assign_issue(
 
     try:
         with JiraClient(config) as client:
-            me = client.myself(key=issue_key)
+            me = client.myself()
             target_account_id = None if unassigned else account_id or str(me["accountId"])
             if not execute:
                 return {
@@ -420,20 +316,10 @@ def jira_edit_issue(
     key: str | None = None,
     summary: str | None = None,
     description: str | None = None,
-    description_file: str | None = None,
-    description_section: str | None = None,
     labels: list[str] | None = None,
-    fix_versions: list[str] | None = None,
-    parent_key: str | None = None,
-    priority: str | None = None,
-    story_points: float | None = None,
     execute: bool = False,
 ) -> dict[str, Any]:
-    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run.
-
-    Omitting fix_versions leaves the issue's fix versions untouched. Pass an empty list to
-    clear them, matching the labels convention; pass one or more version names to set them.
-    """
+    """Edit summary, description, or labels. Defaults to dry-run."""
     config = load_config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -443,22 +329,8 @@ def jira_edit_issue(
         }
 
     try:
-        body = (
-            read_text_source(description, description_file, section=description_section)
-            if description or description_file
-            else None
-        )
-        payload = edit_issue_payload(
-            summary=summary,
-            description=body,
-            labels=labels,
-            fix_versions=fix_versions,
-            parent_key=parent_key,
-            priority=priority,
-            story_points=story_points,
-            story_points_field=config.story_points_field,
-        )
-    except (OSError, ValueError) as exc:
+        payload = edit_issue_payload(summary=summary, description=description, labels=labels)
+    except ValueError as exc:
         return {"ok": False, "message": str(exc)}
 
     try:
@@ -475,16 +347,7 @@ def jira_edit_issue(
                     "message": "Pass execute=true to edit this issue in Jira.",
                 }
 
-            client.edit_issue(
-                issue_key,
-                summary=summary,
-                description=body,
-                labels=labels,
-                fix_versions=fix_versions,
-                parent_key=parent_key,
-                priority=priority,
-                story_points=story_points,
-            )
+            client.edit_issue(issue_key, summary=summary, description=description, labels=labels)
             audit_write(
                 config,
                 action="edit_issue",
@@ -883,60 +746,6 @@ def jira_add_comment(key: str, body: str, execute: bool = False) -> dict[str, An
 
 
 @mcp.tool
-def jira_update_comment(
-    key: str,
-    comment_id: str,
-    body: str,
-    execute: bool = False,
-) -> dict[str, Any]:
-    """Replace the body of one existing comment on a Jira issue. Defaults to dry-run.
-
-    Use this to correct a comment in place instead of stacking a second comment that contradicts
-    the first. Jira keeps the original author and created instant and records the edit separately,
-    so the correction stays attributable. The dry run returns the current body so the replacement
-    can be compared against what it overwrites.
-    """
-    try:
-        with _client() as client:
-            safety = ensure_issue_write_allowed(client.config, client, key)
-            try:
-                current = client.get_comment(key, comment_id)
-            except JiraApiError as exc:
-                if exc.status_code == 404:
-                    return {
-                        "ok": False,
-                        "message": f"Comment {comment_id} is not present on {key}.",
-                    }
-                raise
-            if not execute:
-                return {
-                    "ok": True,
-                    "dry_run": True,
-                    "issue": key,
-                    "comment_id": comment_id,
-                    "current_author": (current.get("author") or {}).get("displayName"),
-                    "current_body": current.get("body"),
-                    "new_body": body,
-                    "safety": safety,
-                    "message": "Pass execute=true to replace this comment body in Jira.",
-                }
-
-            result = client.update_comment(key, comment_id, body)
-            audit_write(
-                client.config,
-                action="update_comment",
-                issue_key=key,
-                payload={"comment_id": comment_id, "body": body},
-                result={"id": result.get("id"), "updated": result.get("updated")},
-            )
-            return {"ok": True, "comment": result}
-    except JiraWriteSafetyError as exc:
-        return _safety_error(exc)
-    except JiraApiError as exc:
-        return _error(exc)
-
-
-@mcp.tool
 def jira_list_transitions(key: str) -> dict[str, Any]:
     """List available transitions for one Jira issue."""
     try:
@@ -1075,7 +884,7 @@ def jira_delete_attachment(
                     "safety": safety,
                     "message": "Pass execute=true to delete this attachment from Jira.",
                 }
-            result = client.delete_attachment(attachment_id, issue_key=issue_key)
+            result = client.delete_attachment(attachment_id)
             audit_write(
                 config,
                 action="delete_attachment",
@@ -1090,143 +899,6 @@ def jira_delete_attachment(
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:
-        return _error(exc)
-
-
-@mcp.tool
-def jira_render_mermaid_diagrams(
-    key: str | None = None,
-    filenames: list[str] | None = None,
-    alt_texts: list[str] | None = None,
-    output_dir: str | None = None,
-    execute: bool = False,
-) -> dict[str, Any]:
-    """Render Mermaid code blocks locally, upload PNGs, and embed them. Defaults to dry-run."""
-    config = load_config()
-    issue_key = key or config.test_issue_key
-    if not issue_key:
-        return {
-            "ok": False,
-            "message": "No issue key provided and JIRA_TEST_ISSUE_KEY is not configured.",
-        }
-
-    uploaded_ids: list[str] = []
-    try:
-        with JiraClient(config) as client:
-            safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["description", "attachment"])
-            description = issue.get("fields", {}).get("description") or {
-                "type": "doc",
-                "version": 1,
-                "content": [],
-            }
-            sources = mermaid_sources_from_adf(description)
-            if not sources:
-                return {"ok": False, "message": f"No Mermaid code blocks found on {issue_key}."}
-
-            names = filenames or [
-                f"{issue_key.lower()}-mermaid-{index}.png" for index in range(1, len(sources) + 1)
-            ]
-            alts = alt_texts or [f"Mermaid diagram {index}" for index in range(1, len(sources) + 1)]
-            if len(names) != len(sources) or len(alts) != len(sources):
-                return {
-                    "ok": False,
-                    "message": "filenames and alt_texts must match the Mermaid block count.",
-                }
-            if len(set(names)) != len(names):
-                return {"ok": False, "message": "Diagram filenames must be unique."}
-            for name in names:
-                path = Path(name)
-                if path.name != name or path.suffix.lower() != ".png":
-                    return {
-                        "ok": False,
-                        "message": f"Diagram filename must be a plain PNG filename: {name}",
-                    }
-
-            runtime = discover_mermaid_runtime()
-            destination = (
-                Path(output_dir)
-                if output_dir
-                else (Path(config.audit_log_path).parent / "diagrams" / issue_key)
-            )
-            paths = [destination / name for name in names]
-            if not execute:
-                return {
-                    "ok": True,
-                    "dry_run": True,
-                    "issue": issue_key,
-                    "diagram_count": len(sources),
-                    "files": [str(path) for path in paths],
-                    "runtime": {
-                        "node": str(runtime.node),
-                        "cli": str(runtime.cli),
-                        "browser": str(runtime.browser),
-                    },
-                    "safety": safety,
-                    "message": "Pass execute=true to render, upload, and embed the diagrams.",
-                }
-
-            for source, path in zip(sources, paths, strict=True):
-                render_mermaid_png(source, path, runtime=runtime)
-
-            attachments = issue.get("fields", {}).get("attachment") or []
-            previous_ids = {
-                str(attachment.get("id"))
-                for attachment in attachments
-                if attachment.get("filename") in names
-            }
-            new_attachments: list[dict[str, Any]] = []
-            updated_description = description
-            for path, alt in zip(paths, alts, strict=True):
-                uploaded = client.add_attachment(issue_key, path)
-                attachment = uploaded[0]
-                attachment_id = str(attachment.get("id"))
-                uploaded_ids.append(attachment_id)
-                new_attachments.append(attachment)
-                media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
-                width, height = png_dimensions(path)
-                updated_description = replace_diagram_with_media(
-                    updated_description,
-                    media_id=media_id,
-                    alt=alt,
-                    width=width,
-                    height=height,
-                )
-
-            result = client.edit_issue_adf_description(issue_key, updated_description)
-            deleted: list[str] = []
-            for attachment_id in sorted(previous_ids - set(uploaded_ids)):
-                client.delete_attachment(attachment_id, issue_key=issue_key)
-                deleted.append(attachment_id)
-            audit_write(
-                config,
-                action="render_mermaid_diagrams",
-                issue_key=issue_key,
-                payload={
-                    "files": [str(path) for path in paths],
-                    "attachment_ids": uploaded_ids,
-                    "deleted_attachment_ids": deleted,
-                },
-                result=result,
-            )
-            return {
-                "ok": True,
-                "issue": issue_key,
-                "attachments": new_attachments,
-                "deleted_attachment_ids": deleted,
-            }
-    except (OSError, RuntimeError, ValueError) as exc:
-        return {"ok": False, "message": str(exc)}
-    except JiraWriteSafetyError as exc:
-        return _safety_error(exc)
-    except JiraApiError as exc:
-        if uploaded_ids:
-            try:
-                with JiraClient(config) as cleanup_client:
-                    for attachment_id in uploaded_ids:
-                        cleanup_client.delete_attachment(attachment_id, issue_key=issue_key)
-            except JiraApiError:
-                pass
         return _error(exc)
 
 
@@ -1276,7 +948,7 @@ def jira_embed_diagram(
             uploaded = client.add_attachment(issue_key, file_path)
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
-            media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
+            media_id = client.attachment_media_id(attachment_id)
             description = replace_diagram_with_media(
                 issue.get("fields", {}).get("description")
                 or {"type": "doc", "version": 1, "content": []},
@@ -1288,7 +960,7 @@ def jira_embed_diagram(
             result = client.edit_issue_adf_description(issue_key, description)
             deleted: list[str] = []
             for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id, issue_key=issue_key)
+                client.delete_attachment(item_id)
                 deleted.append(item_id)
             audit_write(
                 config,
@@ -1310,82 +982,6 @@ def jira_embed_diagram(
                 "media_id": media_id,
                 "deleted_attachment_ids": deleted,
             }
-    except JiraWriteSafetyError as exc:
-        return _safety_error(exc)
-    except JiraApiError as exc:
-        return _error(exc)
-
-
-@mcp.tool
-def jira_upsert_image_gallery(
-    manifest_path: str,
-    key: str | None = None,
-    documentation_filename: str | None = None,
-    before_heading: str = "Child Issues",
-    execute: bool = False,
-) -> dict[str, Any]:
-    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
-    config = load_config()
-    issue_key = key or config.test_issue_key
-    if not issue_key:
-        return {"ok": False, "message": "No issue key provided."}
-    try:
-        manifest = load_image_gallery_manifest(manifest_path)
-        filenames = {
-            str(row["file"]) for section in manifest["sections"] for row in section["rows"]
-        }
-        with JiraClient(config) as client:
-            safety = ensure_issue_write_allowed(config, client, issue_key)
-            issue = client.get_issue(issue_key, fields=["description", "attachment"])
-            attachments = issue.get("fields", {}).get("attachment") or []
-            by_name = newest_attachments_by_filename(attachments)
-            missing = sorted(filenames - set(by_name))
-            if documentation_filename and documentation_filename not in by_name:
-                missing.append(documentation_filename)
-            if missing:
-                return {"ok": False, "message": "Missing Jira attachments.", "missing": missing}
-            blocks = image_gallery_blocks(
-                manifest,
-                attachment_urls={name: str(by_name[name]["content"]) for name in filenames},
-                documentation_url=(
-                    str(by_name[documentation_filename]["content"])
-                    if documentation_filename
-                    else None
-                ),
-            )
-            description = upsert_top_level_section(
-                issue.get("fields", {}).get("description")
-                or {"type": "doc", "version": 1, "content": []},
-                title=str(manifest["title"]),
-                blocks=blocks,
-                before_heading=before_heading,
-            )
-            if not execute:
-                return {
-                    "ok": True,
-                    "dry_run": True,
-                    "issue": issue_key,
-                    "title": manifest["title"],
-                    "screenshot_count": len(filenames),
-                    "before_heading": before_heading,
-                    "safety": safety,
-                }
-            result = client.edit_issue_adf_description(issue_key, description)
-            audit_write(
-                config,
-                action="upsert_image_gallery",
-                issue_key=issue_key,
-                payload={
-                    "manifest": manifest_path,
-                    "filenames": sorted(filenames),
-                    "documentation_filename": documentation_filename,
-                    "before_heading": before_heading,
-                },
-                result=result,
-            )
-            return {"ok": True, "issue": issue_key, "screenshot_count": len(filenames)}
-    except (OSError, ValueError) as exc:
-        return {"ok": False, "message": str(exc)}
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
     except JiraApiError as exc:

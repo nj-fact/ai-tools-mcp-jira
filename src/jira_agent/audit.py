@@ -22,7 +22,6 @@ def audit_write(
         "timestamp": datetime.now(UTC).isoformat(),
         "action": action,
         "issue_key": issue_key,
-        "credential_source": config.credential_source_for(issue_key),
         "payload": payload or {},
         "result": result or {},
     }

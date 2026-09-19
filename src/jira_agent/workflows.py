@@ -1,51 +1,16 @@
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 
-def read_text_source(
-    text: str | None = None,
-    file_path: str | Path | None = None,
-    section: str | None = None,
-) -> str:
+def read_text_source(text: str | None = None, file_path: str | Path | None = None) -> str:
     if text and file_path:
         raise ValueError("Use either text or file_path, not both")
     if file_path:
-        source = Path(file_path).read_text(encoding="utf-8")
-    elif text:
-        source = text
-    else:
-        raise ValueError("Either text or file_path is required")
-    return markdown_section(source, section) if section else source
-
-
-def markdown_section(markdown: str, heading: str) -> str:
-    """Return the body below one Markdown heading, up to the next peer heading."""
-    wanted = re.sub(r"^#{1,6}\s+", "", heading.strip()).casefold()
-    lines = markdown.splitlines()
-    start: int | None = None
-    level: int | None = None
-
-    for index, line in enumerate(lines):
-        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
-        if not match or match.group(2).strip().casefold() != wanted:
-            continue
-        if start is not None:
-            raise ValueError(f"Markdown section is ambiguous: {heading}")
-        start = index + 1
-        level = len(match.group(1))
-
-    if start is None or level is None:
-        raise ValueError(f"Markdown section not found: {heading}")
-
-    end = len(lines)
-    for index in range(start, len(lines)):
-        match = re.match(r"^(#{1,6})\s+", lines[index])
-        if match and len(match.group(1)) <= level:
-            end = index
-            break
-    return "\n".join(lines[start:end]).strip()
+        return Path(file_path).read_text(encoding="utf-8")
+    if text:
+        return text
+    raise ValueError("Either text or file_path is required")
 
 
 def factory_contract_comment_body(contract: str, *, source_name: str | None = None) -> str:

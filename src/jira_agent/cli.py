@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -21,12 +20,6 @@ from jira_agent.client import (
     select_transition,
 )
 from jira_agent.config import load_config
-from jira_agent.image_gallery import (
-    image_gallery_blocks,
-    load_image_gallery_manifest,
-    newest_attachments_by_filename,
-    upsert_top_level_section,
-)
 from jira_agent.reporting import adf_to_text, agent_plan_comment_body, fetch_agent_report
 from jira_agent.safety import (
     JiraWriteSafetyError,
@@ -207,8 +200,8 @@ def _mcp_config_payload() -> dict[str, Any]:
     return {
         "mcpServers": {
             "jira-agent": {
-                "command": sys.executable,
-                "args": ["-m", "jira_agent.mcp_server"],
+                "command": "uv",
+                "args": ["run", "jira-agent-mcp"],
                 "cwd": str(Path.cwd()),
             }
         }
@@ -711,119 +704,6 @@ def create_test_issue(
     console.print(f"Created Jira test issue {data.get('key')} ({data.get('id')}).")
 
 
-@app.command("create-issue")
-def create_issue(
-    summary: Annotated[str, typer.Argument(help="Issue summary.")],
-    issue_type: Annotated[str, typer.Option("--issue-type", help="Jira issue type name.")],
-    project_key: Annotated[
-        str | None,
-        typer.Option("--project", help="Jira project key. Defaults to JIRA_TEST_PROJECT_KEY."),
-    ] = None,
-    description: Annotated[
-        str | None,
-        typer.Option("--description", help="Markdown description text."),
-    ] = None,
-    description_file: Annotated[
-        Path | None,
-        typer.Option("--description-file", help="UTF-8 Markdown description file."),
-    ] = None,
-    description_section: Annotated[
-        str | None,
-        typer.Option(
-            "--description-section",
-            help="Optional heading whose body is selected from the description source.",
-        ),
-    ] = None,
-    labels: Annotated[
-        str | None,
-        typer.Option("--labels", help="Comma-separated labels."),
-    ] = None,
-    parent: Annotated[
-        str | None,
-        typer.Option("--parent", help="Optional parent issue key."),
-    ] = None,
-    priority: Annotated[
-        str | None,
-        typer.Option("--priority", help="Optional Jira priority name."),
-    ] = None,
-    story_points: Annotated[
-        float | None,
-        typer.Option("--story-points", help="Optional story-point estimate."),
-    ] = None,
-    execute: Annotated[
-        bool,
-        typer.Option("--execute", help="Actually create the issue in Jira."),
-    ] = False,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Print the raw Jira JSON response."),
-    ] = False,
-) -> None:
-    """Create a Jira issue with Markdown-to-ADF rendering. Defaults to dry-run."""
-    config = _config()
-    project = project_key or config.test_project_key
-    try:
-        body = (
-            read_text_source(description, description_file, section=description_section)
-            if description or description_file
-            else None
-        )
-    except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Description error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-
-    try:
-        payload = create_issue_payload(
-            project_key=project,
-            issue_type_name=issue_type,
-            summary=summary,
-            description=body,
-            labels=_csv_list(labels),
-            parent_key=parent,
-            priority=priority,
-            story_points=story_points,
-            story_points_field=config.story_points_field,
-        )
-    except ValueError as exc:
-        error_console.print(f"[red]Create error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-    if not execute:
-        console.print("[yellow]Dry run:[/yellow] would create this Jira issue")
-        _print_json(payload)
-        console.print("Pass --execute to create it in Jira.")
-        return
-
-    with JiraClient(config) as client:
-        try:
-            ensure_project_write_allowed(config, project)
-            data = client.create_issue(
-                project_key=project,
-                issue_type_name=issue_type,
-                summary=summary,
-                description=body,
-                labels=_csv_list(labels),
-                parent_key=parent,
-                priority=priority,
-                story_points=story_points,
-            )
-            audit_write(
-                config,
-                action="create_issue",
-                issue_key=data.get("key"),
-                payload=payload,
-                result=data,
-            )
-        except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
-        except JiraApiError as exc:
-            _exit_api_error(exc)
-
-    if json_output:
-        _print_json(data)
-        return
-    console.print(f"Created Jira issue {data.get('key')} ({data.get('id')}).")
-
-
 @app.command("test-issue")
 def test_issue(
     json_output: Annotated[
@@ -1265,34 +1145,11 @@ def edit_issue(
     ] = None,
     description: Annotated[
         str | None,
-        typer.Option("--description", help="New Markdown issue description."),
-    ] = None,
-    description_file: Annotated[
-        Path | None,
-        typer.Option("--description-file", help="UTF-8 Markdown description file."),
-    ] = None,
-    description_section: Annotated[
-        str | None,
-        typer.Option(
-            "--description-section",
-            help="Optional heading whose body is selected from the description source.",
-        ),
+        typer.Option("--description", help="New issue description."),
     ] = None,
     labels: Annotated[
         str | None,
         typer.Option("--labels", help="Comma-separated labels to set."),
-    ] = None,
-    parent: Annotated[
-        str | None,
-        typer.Option("--parent", help="New parent issue key."),
-    ] = None,
-    priority: Annotated[
-        str | None,
-        typer.Option("--priority", help="New Jira priority name."),
-    ] = None,
-    story_points: Annotated[
-        float | None,
-        typer.Option("--story-points", help="New story-point estimate."),
     ] = None,
     execute: Annotated[
         bool,
@@ -1303,7 +1160,7 @@ def edit_issue(
         typer.Option("--json", help="Print the raw Jira JSON response."),
     ] = False,
 ) -> None:
-    """Edit issue fields with Markdown-to-ADF rendering. Defaults to dry-run."""
+    """Edit summary, description, or labels. Defaults to dry-run."""
     config = _config()
     issue_key = key or config.test_issue_key
     if not issue_key:
@@ -1313,21 +1170,12 @@ def edit_issue(
         raise typer.Exit(2)
 
     try:
-        body = (
-            read_text_source(description, description_file, section=description_section)
-            if description or description_file
-            else None
-        )
         payload = edit_issue_payload(
             summary=summary,
-            description=body,
+            description=description,
             labels=_csv_list(labels),
-            parent_key=parent,
-            priority=priority,
-            story_points=story_points,
-            story_points_field=config.story_points_field,
         )
-    except (OSError, ValueError) as exc:
+    except ValueError as exc:
         error_console.print(f"[red]Edit error:[/red] {exc}")
         raise typer.Exit(2) from exc
 
@@ -1345,11 +1193,8 @@ def edit_issue(
             data = client.edit_issue(
                 issue_key,
                 summary=summary,
-                description=body,
+                description=description,
                 labels=_csv_list(labels),
-                parent_key=parent,
-                priority=priority,
-                story_points=story_points,
             )
             audit_write(
                 config,
@@ -1747,7 +1592,7 @@ def delete_attachment(
                 console.print("Pass --execute to delete it from Jira.")
                 return
 
-            data = client.delete_attachment(attachment_id, issue_key=issue_key)
+            data = client.delete_attachment(attachment_id)
             audit_write(
                 config,
                 action="delete_attachment",
@@ -1837,7 +1682,7 @@ def embed_diagram(
             uploaded = client.add_attachment(issue_key, file_path)
             attachment = uploaded[0]
             attachment_id = str(attachment.get("id"))
-            media_id = client.attachment_media_id(attachment_id, issue_key=issue_key)
+            media_id = client.attachment_media_id(attachment_id)
             existing_description = issue.get("fields", {}).get("description") or {
                 "type": "doc",
                 "version": 1,
@@ -1853,7 +1698,7 @@ def embed_diagram(
             result = client.edit_issue_adf_description(issue_key, description)
             deleted: list[str] = []
             for item_id in sorted(delete_ids - {attachment_id}):
-                client.delete_attachment(item_id, issue_key=issue_key)
+                client.delete_attachment(item_id)
                 deleted.append(item_id)
             audit_write(
                 config,
@@ -1877,97 +1722,6 @@ def embed_diagram(
         f"Embedded {file_path.name} ({attachment_id}) into {issue_key}; "
         f"deleted {len(deleted)} old attachment(s)."
     )
-
-
-@app.command("upsert-image-gallery")
-def upsert_image_gallery(
-    key: Annotated[str, typer.Argument(help="Jira issue key.")],
-    manifest_path: Annotated[
-        Path,
-        typer.Option("--manifest", exists=True, dir_okay=False, readable=True),
-    ],
-    documentation_filename: Annotated[
-        str | None,
-        typer.Option("--documentation-filename"),
-    ] = None,
-    before_heading: Annotated[
-        str,
-        typer.Option("--before-heading"),
-    ] = "Child Issues",
-    execute: Annotated[
-        bool,
-        typer.Option("--execute", help="Actually update the Jira description."),
-    ] = False,
-) -> None:
-    """Insert or replace a linked screenshot gallery using existing Jira attachments."""
-    config = _config()
-    try:
-        manifest = load_image_gallery_manifest(manifest_path)
-    except (OSError, ValueError) as exc:
-        error_console.print(f"[red]Gallery manifest error:[/red] {exc}")
-        raise typer.Exit(2) from exc
-
-    filenames = {str(row["file"]) for section in manifest["sections"] for row in section["rows"]}
-    with JiraClient(config) as client:
-        try:
-            safety = ensure_issue_write_allowed(config, client, key)
-            issue = client.get_issue(key, fields=["description", "attachment"])
-            attachments = issue.get("fields", {}).get("attachment") or []
-            by_name = newest_attachments_by_filename(attachments)
-            missing = sorted(filenames - set(by_name))
-            if documentation_filename and documentation_filename not in by_name:
-                missing.append(documentation_filename)
-            if missing:
-                error_console.print(
-                    f"[red]Missing Jira attachments on {key}:[/red] {', '.join(missing)}"
-                )
-                raise typer.Exit(2)
-
-            urls = {name: str(by_name[name]["content"]) for name in filenames}
-            documentation_url = (
-                str(by_name[documentation_filename]["content"]) if documentation_filename else None
-            )
-            blocks = image_gallery_blocks(
-                manifest,
-                attachment_urls=urls,
-                documentation_url=documentation_url,
-            )
-            description = upsert_top_level_section(
-                issue.get("fields", {}).get("description")
-                or {"type": "doc", "version": 1, "content": []},
-                title=str(manifest["title"]),
-                blocks=blocks,
-                before_heading=before_heading,
-            )
-            if not execute:
-                console.print("[yellow]Dry run:[/yellow] would upsert image gallery")
-                console.print(f"issue: {key}")
-                console.print(f"title: {manifest['title']}")
-                console.print(f"screenshots: {len(filenames)}")
-                console.print(f"before heading: {before_heading}")
-                console.print(f"safety: {safety}")
-                console.print("Pass --execute to update the Jira description.")
-                return
-
-            result = client.edit_issue_adf_description(key, description)
-            audit_write(
-                config,
-                action="upsert_image_gallery",
-                issue_key=key,
-                payload={
-                    "manifest": str(manifest_path),
-                    "filenames": sorted(filenames),
-                    "documentation_filename": documentation_filename,
-                    "before_heading": before_heading,
-                },
-                result=result,
-            )
-        except JiraWriteSafetyError as exc:
-            _exit_safety_error(exc)
-        except JiraApiError as exc:
-            _exit_api_error(exc)
-
-    console.print(f"Updated image gallery '{manifest['title']}' on {key}.")
 
 
 @app.command()
