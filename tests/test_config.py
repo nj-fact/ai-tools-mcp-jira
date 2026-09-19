@@ -154,6 +154,70 @@ def resolve(tmp_path: Path, monkeypatch) -> dict[str, str]:
     return resolve_environment()
 
 
+def test_api_token_file_overrides_inline_token_and_is_reloaded(tmp_path) -> None:
+    token_file = tmp_path / "jira.token"
+    token_file.write_text("token-from-file\n")
+    env_file = write_env(
+        tmp_path / ".env",
+        JIRA_SITE_URL="https://example.atlassian.net",
+        JIRA_EMAIL="user@example.com",
+        JIRA_API_TOKEN="inline-token",
+        JIRA_API_TOKEN_FILE=str(token_file),
+    )
+
+    config = load_config(env_file=env_file, envrc_file=tmp_path / ".envrc")
+    assert config.api_token.get_secret_value() == "token-from-file"
+
+    token_file.write_text("rotated-token\n")
+
+    config = load_config(env_file=env_file, envrc_file=tmp_path / ".envrc")
+    assert config.api_token.get_secret_value() == "rotated-token"
+
+
+def test_api_token_file_can_supply_the_only_token(tmp_path) -> None:
+    token_file = tmp_path / "jira.token"
+    token_file.write_text("token-from-file\n")
+    env_file = write_env(
+        tmp_path / ".env",
+        JIRA_SITE_URL="https://example.atlassian.net",
+        JIRA_EMAIL="user@example.com",
+        JIRA_API_TOKEN_FILE=str(token_file),
+    )
+
+    config = load_config(env_file=env_file, envrc_file=tmp_path / ".envrc")
+
+    assert config.api_token.get_secret_value() == "token-from-file"
+
+
+def test_missing_api_token_file_fails_without_falling_back_to_inline_token(tmp_path) -> None:
+    missing_token_file = tmp_path / "missing.token"
+    env_file = write_env(
+        tmp_path / ".env",
+        JIRA_SITE_URL="https://example.atlassian.net",
+        JIRA_EMAIL="user@example.com",
+        JIRA_API_TOKEN="inline-token",
+        JIRA_API_TOKEN_FILE=str(missing_token_file),
+    )
+
+    with pytest.raises(ValueError, match=r"Cannot read JIRA_API_TOKEN_FILE"):
+        load_config(env_file=env_file, envrc_file=tmp_path / ".envrc")
+
+
+def test_empty_api_token_file_fails_without_falling_back_to_inline_token(tmp_path) -> None:
+    token_file = tmp_path / "jira.token"
+    token_file.write_text(" \n")
+    env_file = write_env(
+        tmp_path / ".env",
+        JIRA_SITE_URL="https://example.atlassian.net",
+        JIRA_EMAIL="user@example.com",
+        JIRA_API_TOKEN="inline-token",
+        JIRA_API_TOKEN_FILE=str(token_file),
+    )
+
+    with pytest.raises(ValueError, match=r"JIRA_API_TOKEN_FILE is empty"):
+        load_config(env_file=env_file, envrc_file=tmp_path / ".envrc")
+
+
 def test_env_file_values_are_layered_over_the_process_environment(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JIRA_SITE_URL", "https://from-process.atlassian.net")
     monkeypatch.setenv("JIRA_EMAIL", "process@example.com")

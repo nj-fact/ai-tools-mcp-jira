@@ -16,6 +16,7 @@ DEFAULT_ENVRC_FILE = ".envrc"
 
 ENV_FILE_VARIABLE = "JIRA_ENV_FILE"
 ENVRC_FILE_VARIABLE = "JIRA_ENVRC_FILE"
+API_TOKEN_FILE_VARIABLE = "JIRA_API_TOKEN_FILE"
 
 
 def _find_project_root(module_path: Path) -> Path | None:
@@ -482,4 +483,15 @@ def load_config(
     env_file: str | Path | None = None,
     envrc_file: str | Path | None = None,
 ) -> JiraConfig:
-    return JiraConfig.model_validate(resolve_environment(env_file, envrc_file))
+    values = resolve_environment(env_file, envrc_file)
+    token_file_value = values.get(API_TOKEN_FILE_VARIABLE, "").strip()
+    if token_file_value:
+        token_file = Path(token_file_value).expanduser()
+        try:
+            token = token_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"Cannot read {API_TOKEN_FILE_VARIABLE}: {token_file}") from exc
+        if not token:
+            raise ValueError(f"{API_TOKEN_FILE_VARIABLE} is empty: {token_file}")
+        values["JIRA_API_TOKEN"] = token
+    return JiraConfig.model_validate(values)

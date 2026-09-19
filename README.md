@@ -10,6 +10,8 @@ Fill `.env`:
 JIRA_SITE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your-api-token
+# Optional; overrides JIRA_API_TOKEN when set:
+# JIRA_API_TOKEN_FILE=/run/secrets/jira-api-token
 JIRA_TEST_JQL=project = FC AND updated >= -365d ORDER BY updated DESC
 JIRA_TEST_PROJECT_KEY=FC
 JIRA_TEST_ISSUE_TYPE=Task
@@ -31,6 +33,10 @@ Both files are re-checked on **every** CLI command and MCP tool call and reparse
 when they changed, so an edit takes effect on the next call instead of at the next
 process start. Files are only reparsed when their mtime or size moved, and a file
 that does not exist yet is watched too — creating `.envrc.local` later is picked up.
+When `JIRA_API_TOKEN_FILE` is set, its UTF-8 text content supplies the default API
+token and overrides `JIRA_API_TOKEN`. The secret file is also read on every call, so
+token rotation takes effect without restarting the MCP server. A missing, unreadable,
+or empty token file fails configuration instead of silently using an inline token.
 
 #### Which files are read
 
