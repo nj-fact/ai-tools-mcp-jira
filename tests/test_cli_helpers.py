@@ -2022,6 +2022,7 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
                 "description": None,
                 "labels": None,
                 "fix_versions": ["FCL-MVP"],
+                "components": None,
                 "parent_key": None,
                 "priority": None,
                 "story_points": None,
@@ -2029,6 +2030,8 @@ def test_edit_issue_cli_sets_fix_version_and_audits_it(tmp_path, monkeypatch) ->
                 "labels_remove": None,
                 "fix_versions_add": None,
                 "fix_versions_remove": None,
+                "components_add": None,
+                "components_remove": None,
                 "expect_updated": "2026-09-14T10:00:00.000+0200",
             },
         }
@@ -3338,3 +3341,141 @@ def test_json_help_no_longer_claims_raw_response_for_curated_commands() -> None:
         help_text = (json_param.help or "").lower()
         assert stale_claim not in help_text, f"{name}: {json_param.help!r}"
         assert "curated" in help_text, f"{name}: {json_param.help!r}"
+
+
+# --- Components -------------------------------------------------------------------------------
+
+
+def _install_cli_components_jira(monkeypatch, tmp_path) -> list[str]:
+    import httpx
+
+    from jira_agent.client import JiraClient
+
+    config = JiraConfig.model_validate(
+        {
+            "JIRA_SITE_URL": "https://example.atlassian.net",
+            "JIRA_EMAIL": "user@example.com",
+            "JIRA_API_TOKEN": "token",
+            "JIRA_WRITE_PROJECT_KEYS": "FC",
+            "JIRA_AUDIT_LOG_PATH": str(tmp_path / "audit.jsonl"),
+        }
+    )
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(f"{request.method} {request.url.path}")
+        if request.url.path.endswith("/project/FC/components"):
+            return httpx.Response(200, json=[{"id": "1", "name": "Platform"}])
+        if request.method == "GET" and "/issue/" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "key": "FC-834",
+                    "fields": {"project": {"key": "FC"}, "updated": "2026-10-19T10:00:00.000+0200"},
+                },
+            )
+        if request.method == "PUT":
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    def factory(_config):
+        return JiraClient(
+            config,
+            http_client=httpx.Client(
+                base_url="https://example.atlassian.net/rest/api/3",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda: config)
+    monkeypatch.setattr(cli, "JiraClient", factory)
+    monkeypatch.setattr(cli, "audit_write", lambda *_args, **_kwargs: None)
+    return sent
+
+
+def test_edit_issue_cli_dry_run_shows_validated_components(tmp_path, monkeypatch) -> None:
+    sent = _install_cli_components_jira(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app, ["edit-issue", "FC-834", "--component", "Platform", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["fields"]["components"] == [{"name": "Platform"}]
+    assert payload["dry_run"] is True
+    assert "GET /rest/api/3/project/FC/components" in sent
+    assert not any(entry.startswith("PUT") for entry in sent)
+
+
+def test_edit_issue_cli_refuses_an_unknown_component(tmp_path, monkeypatch) -> None:
+    sent = _install_cli_components_jira(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app, ["edit-issue", "FC-834", "--component", "Plattform", "--execute", "--json"]
+    )
+
+    assert result.exit_code == 2
+    output = json.loads(result.stdout)
+    assert output["error_type"] == "unknown_component"
+    assert output["valid_components"] == ["Platform"]
+    assert not any(entry.startswith("PUT") for entry in sent)
+
+
+def test_edit_issue_cli_executes_components(tmp_path, monkeypatch) -> None:
+    sent = _install_cli_components_jira(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app, ["edit-issue", "FC-834", "--component", "Platform", "--execute"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sent[-1] == "PUT /rest/api/3/issue/FC-834"
+
+
+def test_edit_issue_cli_refuses_component_with_add_component(tmp_path, monkeypatch) -> None:
+    _install_cli_components_jira(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["edit-issue", "FC-834", "--component", "Platform", "--add-component", "Platform"],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_create_issue_cli_dry_run_validates_components(tmp_path, monkeypatch) -> None:
+    _install_cli_components_jira(monkeypatch, tmp_path)
+
+    ok = CliRunner().invoke(
+        cli.app,
+        [
+            "create-issue",
+            "S",
+            "--issue-type",
+            "Task",
+            "--project",
+            "FC",
+            "--component",
+            "Platform",
+            "--json",
+        ],
+    )
+    refused = CliRunner().invoke(
+        cli.app,
+        ["create-issue", "S", "--issue-type", "Task", "--project", "FC", "--component", "Nope"],
+    )
+
+    assert ok.exit_code == 0, ok.output
+    assert json.loads(ok.stdout)["fields"]["components"] == [{"name": "Platform"}]
+    assert refused.exit_code == 2
+
+
+def test_components_cli_lists_names(tmp_path, monkeypatch) -> None:
+    _install_cli_components_jira(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_client", lambda: cli.JiraClient(None))
+
+    result = CliRunner().invoke(cli.app, ["components", "FC", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["names"] == ["Platform"]

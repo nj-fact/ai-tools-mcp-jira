@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from jira_agent.config import DEFAULT_CREDENTIAL_SOURCE, JiraConfig
+from jira_agent.config import DEFAULT_CREDENTIAL_SOURCE, JiraConfig, normalize_project_key
 
 # Jira Cloud exposes two REST families this client reaches: the platform API this class was
 # originally built against, and the Agile API that carries boards, sprints, and backlog moves.
@@ -98,6 +98,45 @@ class JiraConcurrentEditError(JiraApiError):
         self.issue_key = issue_key
         self.expected_updated = expected_updated
         self.found_updated = found_updated
+
+
+class JiraUnknownComponentError(ValueError):
+    """One or more requested component names do not exist in the target Jira project.
+
+    Raised before any write, after reading the project's components, so a typo or a draft name
+    never reaches Jira (which would reject it with a less helpful message). Carries both the
+    unknown names and every valid name so a caller can correct the request by copying.
+    """
+
+    def __init__(self, *, project_key: str, unknown: list[str], valid: list[str]) -> None:
+        super().__init__(
+            f"Unknown component(s) for project {project_key}: {json.dumps(unknown)}. "
+            f"Valid components: {json.dumps(valid)}."
+        )
+        self.project_key = project_key
+        self.unknown = unknown
+        self.valid = valid
+
+
+def component_names(components: list[dict[str, Any]]) -> list[str]:
+    """Extract component names from a `GET /project/{key}/components` response."""
+    return [
+        str(component["name"])
+        for component in components
+        if isinstance(component, dict) and component.get("name")
+    ]
+
+
+def validate_component_names(project_key: str, requested: list[str], valid: list[str]) -> list[str]:
+    """Refuse any requested component name that is not an exact project component name.
+
+    Matching is exact (case and whitespace included) so the name written is the name Jira
+    shows; the error lists every valid name instead of guessing a near match.
+    """
+    unknown = [name for name in requested if name not in valid]
+    if unknown:
+        raise JiraUnknownComponentError(project_key=project_key, unknown=unknown, valid=valid)
+    return requested
 
 
 class JiraMissingConcurrencyTokenError(JiraApiError):
@@ -683,6 +722,27 @@ class JiraClient:
         issue_key = normalize_jira_issue_key(issue_key)
         return self._request("GET", f"/issue/{issue_key}/editmeta", key=issue_key)
 
+    def list_project_components(self, project_key: str) -> list[dict[str, Any]]:
+        """Return the project's components (`GET /project/{key}/components`). Read-only."""
+        project = (normalize_project_key(project_key) or "").strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", project):
+            raise JiraApiError(f"project_key must be a Jira project key, got {project_key!r}.")
+        data = self._request("GET", f"/project/{project}/components", key=project)
+        return data if isinstance(data, list) else []
+
+    def require_project_components(self, project_key: str, names: list[str]) -> list[str]:
+        """Read the project's components and refuse any name in `names` that is not one.
+
+        `project_key` may be an issue key; its project prefix is used. Raises
+        `JiraUnknownComponentError` listing every valid name. An empty `names` (clearing the
+        field) needs no lookup and is returned unchanged.
+        """
+        if not names:
+            return names
+        project = normalize_project_key(project_key) or project_key
+        valid = component_names(self.list_project_components(project))
+        return validate_component_names(project, names, valid)
+
     def is_issue_type_allowed(self, issue_key: str, issue_type_name: str) -> bool:
         """Read editmeta and report whether `issue_type_name` is an allowed issuetype value.
 
@@ -702,6 +762,7 @@ class JiraClient:
         description: str | None = None,
         labels: list[str] | None = None,
         fix_versions: list[str] | None = None,
+        components: list[str] | None = None,
         parent_key: str | None = None,
         priority: str | None = None,
         story_points: float | None = None,
@@ -719,6 +780,7 @@ class JiraClient:
                 description=description,
                 labels=labels,
                 fix_versions=fix_versions,
+                components=components,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -834,6 +896,7 @@ class JiraClient:
         description: str | None = None,
         labels: list[str] | None = None,
         fix_versions: list[str] | None = None,
+        components: list[str] | None = None,
         parent_key: str | None = None,
         clear_parent: bool = False,
         priority: str | None = None,
@@ -842,14 +905,17 @@ class JiraClient:
         labels_remove: list[str] | None = None,
         fix_versions_add: list[str] | None = None,
         fix_versions_remove: list[str] | None = None,
+        components_add: list[str] | None = None,
+        components_remove: list[str] | None = None,
         expect_updated: str | None = None,
     ) -> dict[str, Any]:
         """Edit one issue. See `edit_issue_payload` for the `fields` vs. `update` split and the
         set-and-update-the-same-field refusal.
 
         Pass `expect_updated` only when this call includes a whole-field rewrite (`labels`,
-        `fix_versions`, or any other keyword here) worth guarding. A call carrying only
-        `labels_add`/`labels_remove`/`fix_versions_add`/`fix_versions_remove` needs no guard at
+        `fix_versions`, `components`, or any other keyword here) worth guarding. A call carrying
+        only the `*_add`/`*_remove` array operations (labels, fix versions, components) needs no
+        guard at
         all -- Jira applies those against its own current state -- so such a call should leave
         `expect_updated` at its default `None` rather than pay for a read that protects nothing.
         """
@@ -860,6 +926,7 @@ class JiraClient:
             description=description,
             labels=labels,
             fix_versions=fix_versions,
+            components=components,
             parent_key=parent_key,
             clear_parent=clear_parent,
             priority=priority,
@@ -868,6 +935,8 @@ class JiraClient:
             labels_remove=labels_remove,
             fix_versions_add=fix_versions_add,
             fix_versions_remove=fix_versions_remove,
+            components_add=components_add,
+            components_remove=components_remove,
             story_points_field=self.config.story_points_field,
         )
         return self._guarded_issue_put(
@@ -2254,6 +2323,7 @@ def create_issue_payload(
     description: str | None = None,
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
+    components: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -2270,6 +2340,8 @@ def create_issue_payload(
         fields["labels"] = labels
     if fix_versions is not None:
         fields["fixVersions"] = [{"name": version} for version in fix_versions]
+    if components is not None:
+        fields["components"] = [{"name": component} for component in components]
     if parent_key:
         fields["parent"] = {"key": parent_key}
     if priority:
@@ -2285,6 +2357,7 @@ def edit_issue_payload(
     description: str | None = None,
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
+    components: list[str] | None = None,
     parent_key: str | None = None,
     clear_parent: bool = False,
     priority: str | None = None,
@@ -2293,6 +2366,8 @@ def edit_issue_payload(
     labels_remove: list[str] | None = None,
     fix_versions_add: list[str] | None = None,
     fix_versions_remove: list[str] | None = None,
+    components_add: list[str] | None = None,
+    components_remove: list[str] | None = None,
     story_points_field: str = DEFAULT_STORY_POINTS_FIELD,
 ) -> dict[str, Any]:
     """Build the PUT body `edit_issue` sends: a `fields` section (whole-field replacement) and,
@@ -2312,7 +2387,9 @@ def edit_issue_payload(
     (`{"name": ...}`). Jira applies `add`/`remove` against whatever the field holds server-side
     at write time, not against a value read earlier, so there is no read-modify-write here for a
     stale `expect_updated` token to protect -- and none should be passed for a call built only
-    from these four parameters (see `edit_issue`'s docstring).
+    from these four parameters (see `edit_issue`'s docstring). `components`/`components_add`/
+    `components_remove` follow the exact same set/add/remove shape as `fixVersions`, with
+    component-object items (`{"name": ...}`).
 
     A value named in BOTH the add and the remove side of the same field (for example
     `labels_add=["x"], labels_remove=["x"]`) resolves to added, never removed: the matching
@@ -2343,6 +2420,8 @@ def edit_issue_payload(
         ("labels_remove", labels_remove),
         ("fix_versions_add", fix_versions_add),
         ("fix_versions_remove", fix_versions_remove),
+        ("components_add", components_add),
+        ("components_remove", components_remove),
     ):
         for _value in _values or []:
             if not _value.strip():
@@ -2358,6 +2437,8 @@ def edit_issue_payload(
         fields["labels"] = labels
     if fix_versions is not None:
         fields["fixVersions"] = [{"name": version} for version in fix_versions]
+    if components is not None:
+        fields["components"] = [{"name": component} for component in components]
     if clear_parent:
         fields["parent"] = None
     elif parent_key is not None:
@@ -2398,6 +2479,21 @@ def edit_issue_payload(
         update["fixVersions"] = [
             {"add": {"name": value}} for value in fix_versions_add_values
         ] + [{"remove": {"name": value}} for value in fix_versions_remove_values]
+    if components_add or components_remove:
+        if components is not None:
+            raise ValueError(
+                "Cannot set and update `components` in the same request: Jira rejects a PUT "
+                "that both sets a field via `fields` and updates it via `update`. Pass either "
+                "components (the whole array) or components_add/components_remove (atomic "
+                "operations), not both."
+            )
+        components_add_values = list(components_add or [])
+        components_remove_values = [
+            value for value in components_remove or [] if value not in components_add_values
+        ]
+        update["components"] = [
+            {"add": {"name": value}} for value in components_add_values
+        ] + [{"remove": {"name": value}} for value in components_remove_values]
 
     if not fields and not update:
         raise ValueError("At least one editable field must be provided")

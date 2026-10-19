@@ -16,6 +16,7 @@ from jira_agent.client import (
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
+    JiraUnknownComponentError,
     SprintMultiRemovalError,
     SprintPreconditionError,
     SprintReassignmentError,
@@ -23,6 +24,7 @@ from jira_agent.client import (
     TransitionFieldsMissingError,
     adf_contains_media_id,
     check_transition_direction,
+    component_names,
     create_issue_payload,
     describe_transition_options,
     edit_issue_payload,
@@ -157,6 +159,17 @@ def _error(exc: JiraApiError) -> dict[str, Any]:
         "status_code": exc.status_code,
         "message": str(exc),
         "details": exc.details,
+    }
+
+
+def _unknown_component_error(exc: JiraUnknownComponentError) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "message": str(exc),
+        "error_type": "unknown_component",
+        "project": exc.project_key,
+        "unknown_components": exc.unknown,
+        "valid_components": exc.valid,
     }
 
 
@@ -508,6 +521,7 @@ def jira_create_issue(
     description_section: str | None = None,
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
+    components: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -521,6 +535,11 @@ def jira_create_issue(
     entire description field. To change one section of an issue that already exists, use
     jira_patch_description_section. A parent_key is validated as an existing issue in the same
     Jira site and credential scope before either dry-run success or a write is reported.
+
+    components takes exact component names of the target project (see jira_list_components).
+    They are checked against the project's components before either dry-run success or a write
+    is reported; an unknown name is refused with error_type "unknown_component" and the list of
+    valid names.
     """
     config = load_config()
     try:
@@ -537,6 +556,7 @@ def jira_create_issue(
             description=body,
             labels=labels,
             fix_versions=fix_versions,
+            components=components,
             parent_key=parent_key,
             priority=priority,
             story_points=story_points,
@@ -562,6 +582,15 @@ def jira_create_issue(
         except JiraApiError as exc:
             return _error(exc)
 
+    if components:
+        try:
+            with JiraClient(config) as component_client:
+                component_client.require_project_components(project_key, components)
+        except JiraUnknownComponentError as exc:
+            return _unknown_component_error(exc)
+        except JiraApiError as exc:
+            return _error(exc)
+
     if not execute:
         return {
             "ok": True,
@@ -580,6 +609,7 @@ def jira_create_issue(
                 description=body,
                 labels=labels,
                 fix_versions=fix_versions,
+                components=components,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -828,6 +858,7 @@ def jira_edit_issue(
     description_section: str | None = None,
     labels: list[str] | None = None,
     fix_versions: list[str] | None = None,
+    components: list[str] | None = None,
     parent_key: str | None = None,
     priority: str | None = None,
     story_points: float | None = None,
@@ -835,6 +866,8 @@ def jira_edit_issue(
     labels_remove: list[str] | None = None,
     fix_versions_add: list[str] | None = None,
     fix_versions_remove: list[str] | None = None,
+    components_add: list[str] | None = None,
+    components_remove: list[str] | None = None,
     guard_concurrent_edit: bool = True,
     execute: bool = False,
 ) -> dict[str, Any]:
@@ -857,8 +890,15 @@ def jira_edit_issue(
     fix_versions_add/fix_versions_remove: Jira rejects a PUT that both sets and updates the same
     field, and this refuses the same way before sending it.
 
+    components, components_add and components_remove follow the same whole-array vs. atomic
+    split as fix_versions. Every named component must exist in the issue's project (see
+    jira_list_components): names are checked against the project's components before either
+    dry-run success or a write is reported, and an unknown name is refused with error_type
+    "unknown_component" plus the list of valid names.
+
     guard_concurrent_edit defaults to true: when this call includes at least one whole-field
-    write (summary, description, labels, fix_versions, parent_key, priority, or story_points),
+    write (summary, description, labels, fix_versions, components, parent_key, priority, or
+    story_points),
     the issue's `updated` timestamp is read right before the write and passed back as a
     concurrency guard, so a change that lands between that read and this write is refused with
     error_type "concurrent_edit" naming both timestamps, instead of being silently overwritten.
@@ -889,6 +929,17 @@ def jira_edit_issue(
                 "none. Use one form or the other."
             ),
         }
+    if components is not None and (components_add or components_remove):
+        return {
+            "ok": False,
+            "message": (
+                "Cannot combine components with components_add/components_remove: Jira "
+                "rejects a PUT that both sets and updates the same field. components replaces "
+                "the whole array and carries the concurrency guard; "
+                "components_add/components_remove are atomic and carry none. Use one form "
+                "or the other."
+            ),
+        }
     if fix_versions is not None and (fix_versions_add or fix_versions_remove):
         return {
             "ok": False,
@@ -912,6 +963,7 @@ def jira_edit_issue(
             description=body,
             labels=labels,
             fix_versions=fix_versions,
+            components=components,
             parent_key=parent_key,
             priority=priority,
             story_points=story_points,
@@ -919,6 +971,8 @@ def jira_edit_issue(
             labels_remove=labels_remove,
             fix_versions_add=fix_versions_add,
             fix_versions_remove=fix_versions_remove,
+            components_add=components_add,
+            components_remove=components_remove,
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
@@ -930,6 +984,13 @@ def jira_edit_issue(
                 require_shared_write_scope(config, [issue_key, parent_key])
                 client.get_issue(parent_key, fields=["project"])
             safety = ensure_issue_write_allowed(config, client, issue_key)
+            requested_components = [
+                *(components or []),
+                *(components_add or []),
+                *(components_remove or []),
+            ]
+            if requested_components:
+                client.require_project_components(issue_key, requested_components)
             expect_updated = (
                 client.issue_version(issue_key)
                 if guard_concurrent_edit and payload.get("fields")
@@ -953,6 +1014,7 @@ def jira_edit_issue(
                 description=body,
                 labels=labels,
                 fix_versions=fix_versions,
+                components=components,
                 parent_key=parent_key,
                 priority=priority,
                 story_points=story_points,
@@ -960,6 +1022,8 @@ def jira_edit_issue(
                 labels_remove=labels_remove,
                 fix_versions_add=fix_versions_add,
                 fix_versions_remove=fix_versions_remove,
+                components_add=components_add,
+                components_remove=components_remove,
                 expect_updated=expect_updated,
             )
             audit_warning = _audit_committed_write(
@@ -970,6 +1034,8 @@ def jira_edit_issue(
                 result={},
             )
             return _with_audit_warning({"ok": True, "issue": issue_key}, audit_warning)
+    except JiraUnknownComponentError as exc:
+        return _unknown_component_error(exc)
     except JiraConcurrentEditError as exc:
         return _concurrent_edit_error(exc)
     except JiraMissingConcurrencyTokenError as exc:
@@ -2884,6 +2950,35 @@ def jira_delete_comment(key: str, comment_id: str, execute: bool = False) -> dic
             )
     except JiraWriteSafetyError as exc:
         return _safety_error(exc)
+    except JiraApiError as exc:
+        return _error(exc)
+
+
+@mcp.tool
+def jira_list_components(project_key: str) -> dict[str, Any]:
+    """List a project's component names. Read-only.
+
+    These are the exact names jira_create_issue and jira_edit_issue accept for components,
+    components_add and components_remove. `components` carries id, name and description per
+    component; `names` is the plain list.
+    """
+    try:
+        with _client() as client:
+            raw = client.list_project_components(project_key)
+            return {
+                "ok": True,
+                "project": project_key,
+                "names": component_names(raw),
+                "components": [
+                    {
+                        "id": component.get("id"),
+                        "name": component.get("name"),
+                        "description": component.get("description"),
+                    }
+                    for component in raw
+                    if isinstance(component, dict)
+                ],
+            }
     except JiraApiError as exc:
         return _error(exc)
 

@@ -4653,3 +4653,123 @@ def test_jira_list_transitions_returns_raw_transitions_document(tmp_path, monkey
     assert result["transitions"]["transitions"][0]["to"]["statusCategory"]["name"] == (
         "In Progress"
     )
+
+
+# --- Components -------------------------------------------------------------------------------
+
+
+def _install_components_jira(monkeypatch, tmp_path) -> list[str]:
+    """Back the MCP surface with a real JiraClient over a mock transport serving FC's components,
+    one issue read and `updated`. Returns the "METHOD path" log of every request sent."""
+    import httpx
+
+    from jira_agent.client import JiraClient
+
+    config = make_config(tmp_path)
+    sent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(f"{request.method} {request.url.path}")
+        if request.url.path.endswith("/project/FC/components"):
+            return httpx.Response(
+                200, json=[{"id": "1", "name": "Platform"}, {"id": "2", "name": "FA103 Loan terms"}]
+            )
+        if request.method == "GET" and "/issue/" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "key": "FC-822",
+                    "fields": {"project": {"key": "FC"}, "updated": "2026-10-19T10:00:00.000+0200"},
+                },
+            )
+        if request.method == "PUT":
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    def factory(_config):
+        return JiraClient(
+            config,
+            http_client=httpx.Client(
+                base_url="https://example.atlassian.net/rest/api/3",
+                transport=httpx.MockTransport(handler),
+            ),
+        )
+
+    monkeypatch.setattr(mcp_server, "load_config", lambda: config)
+    monkeypatch.setattr(mcp_server, "JiraClient", factory)
+    monkeypatch.setattr(mcp_server, "audit_write", lambda *_args, **_kwargs: None)
+    return sent
+
+
+def test_jira_edit_issue_dry_run_shows_validated_components(tmp_path, monkeypatch) -> None:
+    sent = _install_components_jira(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(key="FC-822", components=["Platform"])
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["payload"] == {"fields": {"components": [{"name": "Platform"}]}}
+    assert "GET /rest/api/3/project/FC/components" in sent
+    assert not any(entry.startswith("PUT") for entry in sent)
+
+
+def test_jira_edit_issue_refuses_an_unknown_component_before_writing(tmp_path, monkeypatch) -> None:
+    sent = _install_components_jira(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(key="FC-822", components=["Plattform"], execute=True)
+
+    assert result["ok"] is False
+    assert result["error_type"] == "unknown_component"
+    assert result["unknown_components"] == ["Plattform"]
+    assert result["valid_components"] == ["Platform", "FA103 Loan terms"]
+    assert not any(entry.startswith("PUT") for entry in sent)
+
+
+def test_jira_edit_issue_executes_components_with_the_guard(tmp_path, monkeypatch) -> None:
+    sent = _install_components_jira(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(key="FC-822", components=["Platform"], execute=True)
+
+    assert result == {"ok": True, "issue": "FC-822"}
+    assert sent[-1] == "PUT /rest/api/3/issue/FC-822"
+
+
+def test_jira_edit_issue_refuses_to_combine_whole_array_components_with_atomic_ops(
+    tmp_path, monkeypatch
+) -> None:
+    sent = _install_components_jira(monkeypatch, tmp_path)
+
+    result = mcp_server.jira_edit_issue(
+        key="FC-822", components=["Platform"], components_add=["FA103 Loan terms"], execute=True
+    )
+
+    assert result["ok"] is False
+    assert "components_add" in result["message"]
+    assert sent == []
+
+
+def test_jira_create_issue_dry_run_validates_components(tmp_path, monkeypatch) -> None:
+    _install_components_jira(monkeypatch, tmp_path)
+
+    ok = mcp_server.jira_create_issue(
+        project_key="FC", issue_type_name="Task", summary="S", components=["Platform"]
+    )
+    refused = mcp_server.jira_create_issue(
+        project_key="FC", issue_type_name="Task", summary="S", components=["Nope"]
+    )
+
+    assert ok["dry_run"] is True
+    assert ok["payload"]["fields"]["components"] == [{"name": "Platform"}]
+    assert refused["ok"] is False
+    assert refused["error_type"] == "unknown_component"
+
+
+def test_jira_list_components_returns_names(tmp_path, monkeypatch) -> None:
+    _install_components_jira(monkeypatch, tmp_path)
+    monkeypatch.setattr(mcp_server, "_client", lambda: mcp_server.JiraClient(None))
+
+    result = mcp_server.jira_list_components("FC")
+
+    assert result["ok"] is True
+    assert result["names"] == ["Platform", "FA103 Loan terms"]
+    assert result["components"][0] == {"id": "1", "name": "Platform", "description": None}

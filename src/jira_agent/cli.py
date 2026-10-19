@@ -24,6 +24,7 @@ from jira_agent.client import (
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
+    JiraUnknownComponentError,
     SprintMultiRemovalError,
     SprintPreconditionError,
     SprintReassignmentError,
@@ -31,6 +32,7 @@ from jira_agent.client import (
     TransitionFieldsMissingError,
     adf_contains_media_id,
     check_transition_direction,
+    component_names,
     create_issue_payload,
     describe_transition_options,
     edit_issue_payload,
@@ -1235,6 +1237,16 @@ def create_issue(
         str | None,
         typer.Option("--labels", help="Comma-separated labels."),
     ] = None,
+    component: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--component",
+            help=(
+                "Component name to set (repeatable). Must exactly match a component of the "
+                "project; see `components`. Checked before the dry run is reported."
+            ),
+        ),
+    ] = None,
     parent: Annotated[
         str | None,
         typer.Option(
@@ -1290,6 +1302,7 @@ def create_issue(
             summary=summary,
             description=body,
             labels=_csv_list(labels),
+            components=component,
             parent_key=parent,
             priority=priority,
             story_points=story_points,
@@ -1309,6 +1322,14 @@ def create_issue(
             require_shared_write_scope(config, [project, parent])
             with JiraClient(config) as parent_client:
                 parent_client.get_issue(parent, fields=["project"])
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+    if component:
+        try:
+            with JiraClient(config) as component_client:
+                component_client.require_project_components(project, component)
+        except JiraUnknownComponentError as exc:
+            _exit_unknown_component_error(exc, json_mode=json_output)
         except JiraApiError as exc:
             _exit_api_error(exc, json_mode=json_output)
     if not execute:
@@ -1333,6 +1354,7 @@ def create_issue(
                 summary=summary,
                 description=body,
                 labels=_csv_list(labels),
+                components=component,
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
@@ -2178,6 +2200,38 @@ def edit_issue(
             ),
         ),
     ] = None,
+    component: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--component",
+            help=(
+                "Component name to set. Repeat to set several; pass none to leave unchanged. "
+                "Whole-array form with the concurrency guard, like --fix-version. Names must "
+                "exactly match the project's components (see `components`). Cannot be combined "
+                "with --add-component/--remove-component."
+            ),
+        ),
+    ] = None,
+    add_component: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--add-component",
+            help=(
+                "Add one component without touching the rest (repeatable). Atomic form, so it "
+                "carries NO concurrency guard. Cannot be combined with --component."
+            ),
+        ),
+    ] = None,
+    remove_component: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--remove-component",
+            help=(
+                "Remove one component without touching the rest (repeatable). Atomic form, so "
+                "it carries NO concurrency guard. Cannot be combined with --component."
+            ),
+        ),
+    ] = None,
     parent: Annotated[
         str | None,
         typer.Option(
@@ -2238,6 +2292,11 @@ def edit_issue(
     with `--add-label`/`--remove-label`, and `--fix-version` cannot be combined with
     `--add-fix-version`/`--remove-fix-version`: Jira rejects a PUT that both sets and updates the
     same field.
+
+    `--component`, `--add-component` and `--remove-component` follow the same whole-array vs.
+    atomic split as the fix-version options. Every named component is checked against the
+    issue's project components before the dry run or the write; an unknown name exits 2 and
+    lists the valid names.
     """
     config = _config()
     issue_key = key or config.test_issue_key
@@ -2266,17 +2325,29 @@ def edit_issue(
         )
         raise typer.Exit(2)
 
+    if component and (add_component or remove_component):
+        _print_error(
+            "Edit error:",
+            "Cannot combine --component with --add-component/--remove-component: Jira rejects "
+            "a PUT that both sets and updates the same field. --component replaces the whole "
+            "array and carries the concurrency guard; --add-component/--remove-component are "
+            "atomic and carry none. Use one form or the other.",
+        )
+        raise typer.Exit(2)
+
     for _option_name, _values in (
         ("--add-label", add_label),
         ("--remove-label", remove_label),
         ("--add-fix-version", add_fix_version),
         ("--remove-fix-version", remove_fix_version),
+        ("--add-component", add_component),
+        ("--remove-component", remove_component),
     ):
         if _values and any(not value.strip() for value in _values):
             _print_error(
                 "Edit error:",
-                f"{_option_name} must not be empty or whitespace-only. Pass a real label or "
-                "fix version name, or omit the option entirely.",
+                f"{_option_name} must not be empty or whitespace-only. Pass a real label, "
+                "fix version or component name, or omit the option entirely.",
             )
             raise typer.Exit(2)
 
@@ -2291,6 +2362,7 @@ def edit_issue(
             description=body,
             labels=_csv_list(labels),
             fix_versions=fix_version,
+            components=component,
             parent_key=parent,
             priority=priority,
             story_points=story_points,
@@ -2298,6 +2370,8 @@ def edit_issue(
             labels_remove=remove_label,
             fix_versions_add=add_fix_version,
             fix_versions_remove=remove_fix_version,
+            components_add=add_component,
+            components_remove=remove_component,
             story_points_field=config.story_points_field,
         )
     except (OSError, ValueError) as exc:
@@ -2310,6 +2384,13 @@ def edit_issue(
                 require_shared_write_scope(config, [issue_key, parent])
                 client.get_issue(parent, fields=["project"])
             safety = ensure_issue_write_allowed(config, client, issue_key)
+            requested_components = [
+                *(component or []),
+                *(add_component or []),
+                *(remove_component or []),
+            ]
+            if requested_components:
+                client.require_project_components(issue_key, requested_components)
             if not execute:
                 _say("[yellow]Dry run:[/yellow] would edit issue", json_mode=json_output)
                 _say(f"issue: {issue_key}", json_mode=json_output)
@@ -2342,6 +2423,7 @@ def edit_issue(
                 description=body,
                 labels=_csv_list(labels),
                 fix_versions=fix_version,
+                components=component,
                 parent_key=parent,
                 priority=priority,
                 story_points=story_points,
@@ -2349,6 +2431,8 @@ def edit_issue(
                 labels_remove=remove_label,
                 fix_versions_add=add_fix_version,
                 fix_versions_remove=remove_fix_version,
+                components_add=add_component,
+                components_remove=remove_component,
                 expect_updated=expect_updated,
             )
             _audit_committed_write(
@@ -2358,6 +2442,8 @@ def edit_issue(
                 payload={**payload, "concurrency_guard": concurrency_guard},
                 result=data,
             )
+        except JiraUnknownComponentError as exc:
+            _exit_unknown_component_error(exc, json_mode=json_output)
         except JiraConcurrentEditError as exc:
             _exit_concurrent_edit_error(exc, json_mode=json_output)
         except JiraMissingConcurrencyTokenError as exc:
@@ -4897,6 +4983,50 @@ def sprint_remove(
 # --- Issue type change ---------------------------------------------------------------------
 
 
+@app.command("components")
+def components(
+    project_key: Annotated[str, typer.Argument(help="Jira project key, for example FC.")],
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print the curated result document (project, names, components).",
+        ),
+    ] = False,
+) -> None:
+    """List a project's component names. Read-only, no --execute."""
+    with _client() as client:
+        try:
+            raw = client.list_project_components(project_key)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    names = component_names(raw)
+    if json_output:
+        _emit_json(
+            {
+                "project": project_key,
+                "names": names,
+                "components": [
+                    {
+                        "id": component.get("id"),
+                        "name": component.get("name"),
+                        "description": component.get("description"),
+                    }
+                    for component in raw
+                    if isinstance(component, dict)
+                ],
+            }
+        )
+        return
+
+    if names:
+        for name in names:
+            console.print(escape(name))
+    else:
+        console.print(f"{project_key}: no components.")
+
+
 @app.command("issue-type-options")
 def issue_type_options(
     key: Annotated[str, typer.Argument(help="Jira issue key, for example ABC-123.")],
@@ -5185,6 +5315,25 @@ def _exit_api_error(exc: JiraApiError, *, json_mode: bool = False) -> None:
             }
         )
     raise typer.Exit(1) from exc
+
+
+def _exit_unknown_component_error(
+    exc: JiraUnknownComponentError, *, json_mode: bool = False
+) -> None:
+    """Refuse a component name the project does not have, listing the valid ones. Exit 2."""
+    _print_error("Component error:", exc)
+    if json_mode:
+        _emit_json(
+            {
+                "ok": False,
+                "error_type": "unknown_component",
+                "message": str(exc),
+                "project": exc.project_key,
+                "unknown_components": exc.unknown,
+                "valid_components": exc.valid,
+            }
+        )
+    raise typer.Exit(2) from exc
 
 
 def _exit_safety_error(exc: JiraWriteSafetyError, *, json_mode: bool = False) -> None:

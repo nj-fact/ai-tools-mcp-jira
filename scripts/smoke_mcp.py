@@ -45,6 +45,7 @@ EXPECTED_TOOLS = {
     "jira_add_issues_to_sprint",
     "jira_move_issues_to_backlog",
     "jira_config_fields",
+    "jira_list_components",
 }
 
 

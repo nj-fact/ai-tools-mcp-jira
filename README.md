@@ -355,6 +355,9 @@ item that belongs to an attachment of the same filename; zero or multiple candid
   `--remove-label` and `--add-fix-version`/`--remove-fix-version`, alongside the whole-array
   `--labels`/`--fix-version` (see
   [Atomic label and fix-version operations](#atomic-label-and-fix-version-operations))
+- Set components on `create-issue` and `edit-issue` with `--component` (and atomically on
+  `edit-issue` with `--add-component`/`--remove-component`), validated against the project's
+  components; list them with `components <PROJECT>` (see [Components](#components))
 - Clear an issue parent explicitly with `clear-parent`, with a post-write reread
 - Rewrite one section of an existing description with `patch-description-section`, which
   replaces, appends to, prepends to, or deletes the matched section and carries every top-level
@@ -509,6 +512,7 @@ Available MCP tools:
 - `jira_add_issues_to_sprint`
 - `jira_move_issues_to_backlog`
 - `jira_config_fields`
+- `jira_list_components`
 
 Run an end-to-end MCP smoke test:
 
@@ -538,9 +542,10 @@ lands inside that narrowed window is still silently lost. Pass `--no-concurrency
 the seven opt-out-capable commands for the previous unguarded behaviour.
 
 On `edit-issue` specifically, the guard only fires for a call that includes at least one
-whole-field rewrite (`--summary`, `--description`, the whole-array `--labels`/`--fix-version`,
-`--parent`, `--priority`, or `--story-points`): a call built entirely from the atomic
-`--add-label`/`--remove-label`/`--add-fix-version`/`--remove-fix-version` options below reads
+whole-field rewrite (`--summary`, `--description`, the whole-array `--labels`/`--fix-version`/
+`--component`, `--parent`, `--priority`, or `--story-points`): a call built entirely from the
+atomic `--add-label`/`--remove-label`/`--add-fix-version`/`--remove-fix-version`/
+`--add-component`/`--remove-component` options reads
 nothing and carries no guard, because there is no whole-array read for a stale token to protect.
 
 `drift-labels` no longer appears in the list above or carries a `--concurrency-guard` option at
@@ -628,6 +633,30 @@ operation fails closed before any mutation.
 even a dry-run success. A dry run therefore cannot approve a project that the identical
 `--execute` invocation would refuse.
 
+## Components
+
+Components follow the fix-version shape exactly: sent as `{"components": [{"name": ...}]}`,
+omitted means untouched, an empty list clears, and `edit-issue` offers the whole-array
+`--component` (repeatable, guarded) next to the atomic `--add-component`/`--remove-component`.
+Combining the two forms is refused the same way.
+
+Every named component is checked against the project's components
+(`GET /rest/api/3/project/{key}/components`) before the dry run or the write is reported; for
+`edit-issue` the project is the issue key's prefix. Matching is exact, case included. An unknown
+name exits 2 (`error_type: "unknown_component"` under `--json`) and lists every valid name:
+
+```bash
+uv run jira-agent components FC
+uv run jira-agent edit-issue FC-834 --component Platform            # dry run shows the payload
+uv run jira-agent edit-issue FC-834 --component Platform --execute
+uv run jira-agent create-issue "New work" --issue-type Task --component "FA103 Loan terms"
+```
+
+The MCP tools take `components` on `jira_create_issue` and `jira_edit_issue`, plus
+`components_add`/`components_remove` on `jira_edit_issue`, and refuse an unknown name with
+`error_type: "unknown_component"`, `unknown_components` and `valid_components`.
+`jira_list_components(project_key)` is the read-only lookup.
+
 ## Sprints, boards, and issue-type changes
 
 These commands automate two things a human previously did by hand in the Jira board UI: moving
@@ -699,6 +728,9 @@ the workaround was creating a duplicate issue and retiring the original).
   refused and the command exits with code 4, naming both the expected and the found `updated`
   timestamp. A Jira-side rejection not predicted by `editmeta` (for example a required field on
   the target type) surfaces Jira's own error text rather than being swallowed.
+- `components <PROJECT>` — read-only. Lists the project's component names, the exact values
+  `--component`/`--add-component`/`--remove-component` accept. `--json` adds ids and
+  descriptions.
 - `issue-type-options <KEY>` — read-only. Lists the issue types `<KEY>` may become, from the same
   `editmeta` allowed-values list `issue-type` checks against.
 - `config-fields` — read-only, no Jira call. Shows the custom field ids this tool has resolved

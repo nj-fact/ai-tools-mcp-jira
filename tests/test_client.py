@@ -14,12 +14,14 @@ from jira_agent.client import (
     JiraApiError,
     JiraClient,
     JiraConcurrentEditError,
+    JiraUnknownComponentError,
     SprintPreconditionError,
     TransitionDirectionRefusedError,
     TransitionFieldsMissingError,
     adf_contains_media_id,
     adf_heading_text,
     check_transition_direction,
+    component_names,
     create_issue_payload,
     describe_transition_options,
     edit_issue_payload,
@@ -4536,3 +4538,129 @@ def test_transition_fields_payload_passes_through_a_field_absent_from_metadata_a
     """
     payload = transition_fields_payload({"id": "31", "name": "Done"}, {"comment": "done"})
     assert payload == {"comment": "done"}
+
+
+# --- Components -------------------------------------------------------------------------------
+
+FC_COMPONENTS = [
+    {"id": "1", "name": "FA103 Loan terms"},
+    {"id": "2", "name": "Platform"},
+]
+
+
+def _components_client(handler) -> JiraClient:
+    return JiraClient(
+        make_config(),
+        http_client=httpx.Client(
+            base_url="https://example.atlassian.net/rest/api/3",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+
+def test_create_issue_payload_sets_components_in_the_jira_shape() -> None:
+    payload = create_issue_payload(
+        project_key="FC",
+        issue_type_name="Task",
+        summary="Ship it",
+        components=["Platform", "FA103 Loan terms"],
+    )
+
+    assert payload["fields"]["components"] == [
+        {"name": "Platform"},
+        {"name": "FA103 Loan terms"},
+    ]
+
+
+def test_edit_issue_payload_omits_components_by_default_and_clears_with_empty_list() -> None:
+    assert "components" not in edit_issue_payload(summary="Updated")["fields"]
+    assert edit_issue_payload(components=[])["fields"]["components"] == []
+
+
+def test_edit_issue_payload_builds_atomic_component_operations() -> None:
+    payload = edit_issue_payload(components_add=["Platform"], components_remove=["Old"])
+
+    assert "fields" not in payload
+    assert payload["update"]["components"] == [
+        {"add": {"name": "Platform"}},
+        {"remove": {"name": "Old"}},
+    ]
+
+
+def test_edit_issue_payload_refuses_set_and_update_of_components() -> None:
+    with pytest.raises(ValueError, match="components"):
+        edit_issue_payload(components=["Platform"], components_add=["Other"])
+
+
+def test_edit_issue_payload_refuses_a_blank_component_operation() -> None:
+    with pytest.raises(ValueError, match="components_remove"):
+        edit_issue_payload(components_remove=[" "])
+
+
+def test_edit_issue_sends_components_in_the_jira_shape() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["json"] = request.read().decode()
+        return httpx.Response(204)
+
+    _components_client(handler).edit_issue("FC-107", components=["Platform"])
+
+    assert seen["method"] == "PUT"
+    assert seen["json"] == '{"fields":{"components":[{"name":"Platform"}]}}'
+
+
+def test_list_project_components_reads_the_project_endpoint() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        return httpx.Response(200, json=FC_COMPONENTS)
+
+    result = _components_client(handler).list_project_components("fc")
+
+    assert seen == ["GET /rest/api/3/project/FC/components"]
+    assert component_names(result) == ["FA103 Loan terms", "Platform"]
+
+
+def test_list_project_components_refuses_a_path_shaped_project_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
+        raise AssertionError("no request expected")
+
+    with pytest.raises(JiraApiError, match="project_key"):
+        _components_client(handler).list_project_components("../issue")
+
+
+def test_require_project_components_accepts_exact_names_from_an_issue_key() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=FC_COMPONENTS)
+
+    names = _components_client(handler).require_project_components("FC-822", ["Platform"])
+
+    assert names == ["Platform"]
+    assert seen == ["/rest/api/3/project/FC/components"]
+
+
+def test_require_project_components_lists_valid_names_for_an_unknown_one() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=FC_COMPONENTS)
+
+    with pytest.raises(JiraUnknownComponentError) as excinfo:
+        _components_client(handler).require_project_components(
+            "FC-822", ["platform", "FA103 Loan terms"]
+        )
+
+    assert excinfo.value.unknown == ["platform"]
+    assert excinfo.value.valid == ["FA103 Loan terms", "Platform"]
+    assert '"Platform"' in str(excinfo.value)
+
+
+def test_require_project_components_skips_the_lookup_for_an_empty_list() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - never reached
+        raise AssertionError("no request expected")
+
+    assert _components_client(handler).require_project_components("FC", []) == []
