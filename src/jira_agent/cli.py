@@ -17,10 +17,15 @@ from jira_agent.audit import (
     committed_verification_warning,
 )
 from jira_agent.client import (
+    DEFAULT_ATTACHMENT_MAX_BYTES,
     DEFAULT_FIELDS,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
+    JiraAttachmentAmbiguousError,
+    JiraAttachmentNotFoundError,
+    JiraAttachmentNotTextError,
+    JiraAttachmentTooLargeError,
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
@@ -31,9 +36,12 @@ from jira_agent.client import (
     TransitionDirectionRefusedError,
     TransitionFieldsMissingError,
     adf_contains_media_id,
+    attachment_error_payload,
+    attachment_summary,
     check_transition_direction,
     component_names,
     create_issue_payload,
+    decode_attachment_text,
     describe_transition_options,
     edit_issue_payload,
     issue_link_payload,
@@ -47,6 +55,7 @@ from jira_agent.client import (
     require_concurrency_token,
     require_matching_jira_numeric_id,
     require_shared_write_scope,
+    resolve_issue_attachment,
     select_transition,
     sprint_add_blast_radius,
     sprint_add_verification_results,
@@ -57,6 +66,7 @@ from jira_agent.client import (
     transition_required_fields_missing,
     transition_target_category,
     validate_agile_issue_batch,
+    validate_attachment_max_bytes,
     validate_attachment_upload_response,
 )
 from jira_agent.config import load_config
@@ -3340,6 +3350,133 @@ def delete_issue_link(
         )
 
 
+@app.command("read-attachment")
+def read_attachment(
+    key: Annotated[str, typer.Argument(help="Jira issue key.")],
+    attachment_id: Annotated[
+        str | None,
+        typer.Option("--attachment-id", help="Attachment id to read."),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        typer.Option("--filename", help="Exact attachment filename to read."),
+    ] = None,
+    select_newest: Annotated[
+        bool,
+        typer.Option(
+            "--select-newest",
+            help="When multiple attachments share --filename, read the newest by numeric id.",
+        ),
+    ] = False,
+    max_bytes: Annotated[
+        int,
+        typer.Option("--max-bytes", help="Maximum attachment size in bytes."),
+    ] = DEFAULT_ATTACHMENT_MAX_BYTES,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            dir_okay=False,
+            help="Write raw attachment bytes to this file instead of printing UTF-8 text.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print structured JSON metadata and content."),
+    ] = False,
+) -> None:
+    """Read one attachment from a Jira issue (read-only).
+
+    Without --output, decodes strict UTF-8 text and prints it verbatim (or as JSON with --json).
+    With --output, writes raw bytes to disk (supporting both text and binary attachments).
+    """
+    config = _config()
+    try:
+        issue_key = normalize_jira_issue_key(key)
+        max_bytes = validate_attachment_max_bytes(max_bytes)
+    except JiraApiError as exc:
+        _exit_api_error(exc, json_mode=json_output)
+
+    with JiraClient(config) as client:
+        try:
+            issue = client.get_issue(issue_key, fields=["attachment"])
+            attachments = (issue.get("fields") or {}).get("attachment") or []
+            if not isinstance(attachments, list):
+                attachments = []
+            selected = resolve_issue_attachment(
+                issue_key,
+                attachments,
+                attachment_id=attachment_id,
+                filename=filename,
+                select_newest=select_newest,
+            )
+            meta = attachment_summary(selected)
+            declared_size = selected.get("size")
+            if isinstance(declared_size, int) and not isinstance(declared_size, bool):
+                if declared_size > max_bytes:
+                    raise JiraAttachmentTooLargeError(
+                        max_bytes=max_bytes,
+                        observed_bytes=declared_size,
+                        attachment_id=meta["id"],
+                        filename=meta.get("filename"),
+                    )
+            downloaded = client.download_attachment(
+                meta["id"],
+                issue_key=issue_key,
+                max_bytes=max_bytes,
+            )
+            if output is not None:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(downloaded["bytes"])
+                payload: dict[str, Any] = {
+                    "ok": True,
+                    "issue": issue_key,
+                    "attachment": meta,
+                    "size_bytes": downloaded["size_bytes"],
+                    "sha256": downloaded["sha256"],
+                    "output_path": str(output),
+                }
+                if json_output:
+                    _emit_json(payload)
+                else:
+                    console.print(
+                        f"Wrote {meta.get('filename')} ({meta['id']}, "
+                        f"{downloaded['size_bytes']} bytes) to {output}."
+                    )
+                return
+
+            decoded = decode_attachment_text(
+                downloaded["bytes"],
+                mime_type=meta.get("mimeType") or downloaded.get("content_type"),
+                filename=meta.get("filename"),
+            )
+        except (
+            JiraAttachmentNotFoundError,
+            JiraAttachmentAmbiguousError,
+            JiraAttachmentTooLargeError,
+            JiraAttachmentNotTextError,
+        ) as exc:
+            _exit_attachment_error(exc, json_mode=json_output)
+        except JiraApiError as exc:
+            _exit_api_error(exc, json_mode=json_output)
+
+    if json_output:
+        _emit_json(
+            {
+                "ok": True,
+                "issue": issue_key,
+                "attachment": meta,
+                "size_bytes": decoded["size_bytes"],
+                "sha256": decoded["sha256"],
+                "encoding": decoded["encoding"],
+                "content": decoded["content"],
+            }
+        )
+        return
+    sys.stdout.write(decoded["content"])
+
+
 @app.command("attach")
 def attach(
     key: Annotated[
@@ -5333,6 +5470,24 @@ def _exit_unknown_component_error(
                 "valid_components": exc.valid,
             }
         )
+    raise typer.Exit(2) from exc
+
+
+def _exit_attachment_error(
+    exc: (
+        JiraAttachmentNotFoundError
+        | JiraAttachmentAmbiguousError
+        | JiraAttachmentTooLargeError
+        | JiraAttachmentNotTextError
+    ),
+    *,
+    json_mode: bool = False,
+) -> None:
+    """Report a structured attachment-read refusal and exit 2."""
+    payload = attachment_error_payload(exc)
+    _print_error("Attachment error:", exc)
+    if json_mode:
+        _emit_json(payload)
     raise typer.Exit(2) from exc
 
 
