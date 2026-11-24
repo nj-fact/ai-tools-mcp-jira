@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import struct
@@ -10,6 +11,11 @@ from typing import Any
 import httpx
 
 from jira_agent.config import DEFAULT_CREDENTIAL_SOURCE, JiraConfig, normalize_project_key
+
+DEFAULT_ATTACHMENT_MAX_BYTES = 1_048_576
+MAX_ATTACHMENT_BYTES_CEILING = 5_242_880
+_ATTACHMENT_MAX_REDIRECTS = 5
+_REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 
 # Jira Cloud exposes two REST families this client reaches: the platform API this class was
 # originally built against, and the Agile API that carries boards, sprints, and backlog moves.
@@ -273,6 +279,289 @@ def validate_attachment_upload_response(
                 details={"attachment_count": len(data)},
             ) from exc
     return data
+
+
+class JiraAttachmentNotFoundError(JiraApiError):
+    """The requested attachment id or filename is not present on the issue."""
+
+    def __init__(
+        self,
+        *,
+        issue_key: str,
+        attachment_id: str | None = None,
+        filename: str | None = None,
+        available: list[dict[str, Any]] | None = None,
+    ) -> None:
+        parts = []
+        if attachment_id is not None:
+            parts.append(f"id={attachment_id}")
+        if filename is not None:
+            parts.append(f"filename={filename!r}")
+        selector = ", ".join(parts) or "requested selector"
+        super().__init__(
+            f"No attachment matching {selector} is present on {issue_key}.",
+            details={
+                "issue": issue_key,
+                "attachment_id": attachment_id,
+                "filename": filename,
+                "available_attachments": available or [],
+            },
+        )
+        self.issue_key = issue_key
+        self.attachment_id = attachment_id
+        self.filename = filename
+        self.available = available or []
+
+
+class JiraAttachmentAmbiguousError(JiraApiError):
+    """Multiple attachments share the requested filename and select_newest was not enabled."""
+
+    def __init__(
+        self,
+        *,
+        issue_key: str,
+        filename: str,
+        matches: list[dict[str, Any]],
+    ) -> None:
+        ids = ", ".join(str(item.get("id")) for item in matches)
+        super().__init__(
+            f"Multiple attachments named {filename!r} exist on {issue_key} (ids: {ids}). "
+            "Pass attachment_id to pin one, or select_newest=true to read the newest.",
+            details={"issue": issue_key, "filename": filename, "matches": matches},
+        )
+        self.issue_key = issue_key
+        self.filename = filename
+        self.matches = matches
+
+
+class JiraAttachmentTooLargeError(JiraApiError):
+    """An attachment exceeds the configured max_bytes safety limit."""
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int,
+        observed_bytes: int | None = None,
+        attachment_id: str | None = None,
+        filename: str | None = None,
+    ) -> None:
+        size_hint = f" ({observed_bytes} bytes)" if observed_bytes is not None else ""
+        super().__init__(
+            f"Attachment{size_hint} exceeds the max_bytes limit of {max_bytes} bytes.",
+            details={
+                "attachment_id": attachment_id,
+                "filename": filename,
+                "max_bytes": max_bytes,
+                "observed_bytes": observed_bytes,
+            },
+        )
+        self.max_bytes = max_bytes
+        self.observed_bytes = observed_bytes
+        self.attachment_id = attachment_id
+        self.filename = filename
+
+
+class JiraAttachmentNotTextError(JiraApiError):
+    """An attachment could not be decoded cleanly as UTF-8 text."""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        size_bytes: int,
+        mime_type: str | None = None,
+        filename: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Attachment is not UTF-8 text ({reason}; mimeType={mime_type!r}, "
+            f"size_bytes={size_bytes}). Use the CLI --output option to download binary files.",
+            details={
+                "reason": reason,
+                "mime_type": mime_type,
+                "size_bytes": size_bytes,
+                "filename": filename,
+            },
+        )
+        self.reason = reason
+        self.size_bytes = size_bytes
+        self.mime_type = mime_type
+        self.filename = filename
+
+
+def validate_attachment_max_bytes(max_bytes: int) -> int:
+    """Validate an attachment download size cap against the hard safety ceiling."""
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool):
+        raise JiraApiError("max_bytes must be an integer.")
+    if max_bytes < 1 or max_bytes > MAX_ATTACHMENT_BYTES_CEILING:
+        raise JiraApiError(
+            f"max_bytes must be between 1 and {MAX_ATTACHMENT_BYTES_CEILING}, got {max_bytes}."
+        )
+    return max_bytes
+
+
+def attachment_summary(attachment: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact, consistent metadata projection for one Jira attachment."""
+    summary: dict[str, Any] = {
+        "id": str(attachment.get("id") or ""),
+        "filename": attachment.get("filename"),
+        "mimeType": attachment.get("mimeType"),
+        "size": attachment.get("size"),
+        "created": attachment.get("created"),
+    }
+    author = attachment.get("author")
+    if isinstance(author, dict) and author.get("displayName"):
+        summary["author"] = author["displayName"]
+    return summary
+
+
+def _attachment_numeric_sort_key(attachment: dict[str, Any]) -> tuple[int, str]:
+    identifier = str(attachment.get("id") or "")
+    return (int(identifier) if identifier.isdigit() else -1, identifier)
+
+
+def resolve_issue_attachment(
+    issue_key: str,
+    attachments: list[dict[str, Any]],
+    *,
+    attachment_id: str | None = None,
+    filename: str | None = None,
+    select_newest: bool = False,
+) -> dict[str, Any]:
+    """Resolve one attachment owned by `issue_key` from its fresh attachment list.
+
+    Shared by both CLI and MCP so selection, duplicate handling, and error payloads stay
+    identical across surfaces. Refuses ambiguous duplicate filenames by default (fail closed)
+    unless `select_newest=True` or `attachment_id` pins one exact entry.
+    """
+    if attachment_id is None and filename is None:
+        raise JiraApiError("Either attachment_id or filename is required.")
+    normalized_id: str | None = None
+    if attachment_id is not None:
+        normalized_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+    if filename is not None:
+        if not filename or filename in {".", ".."} or Path(filename).name != filename:
+            raise JiraApiError(
+                "filename must be a plain attachment filename without path separators: "
+                f"{filename!r}"
+            )
+
+    valid_items = [item for item in attachments if isinstance(item, dict)]
+    matches = valid_items
+    if normalized_id is not None:
+        matches = [item for item in matches if str(item.get("id")) == normalized_id]
+    if filename is not None:
+        matches = [item for item in matches if item.get("filename") == filename]
+
+    if not matches:
+        raise JiraAttachmentNotFoundError(
+            issue_key=issue_key,
+            attachment_id=normalized_id,
+            filename=filename,
+            available=[attachment_summary(item) for item in valid_items],
+        )
+    if len(matches) > 1:
+        ordered = sorted(matches, key=_attachment_numeric_sort_key)
+        if not select_newest:
+            raise JiraAttachmentAmbiguousError(
+                issue_key=issue_key,
+                filename=filename or str(ordered[-1].get("filename") or ""),
+                matches=[attachment_summary(item) for item in ordered],
+            )
+        selected = ordered[-1]
+    else:
+        selected = matches[0]
+
+    normalize_jira_numeric_id(selected.get("id"), name="attachment id")
+    return selected
+
+
+def decode_attachment_text(
+    raw: bytes,
+    *,
+    mime_type: str | None = None,
+    filename: str | None = None,
+) -> dict[str, Any]:
+    """Decode downloaded attachment bytes as strict UTF-8 text and compute SHA-256."""
+    size_bytes = len(raw)
+    if b"\x00" in raw:
+        raise JiraAttachmentNotTextError(
+            reason="contains NUL bytes",
+            size_bytes=size_bytes,
+            mime_type=mime_type,
+            filename=filename,
+        )
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise JiraAttachmentNotTextError(
+            reason=f"invalid UTF-8 at byte {exc.start}",
+            size_bytes=size_bytes,
+            mime_type=mime_type,
+            filename=filename,
+        ) from exc
+    return {
+        "content": content,
+        "encoding": "utf-8",
+        "size_bytes": size_bytes,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def attachment_error_payload(
+    exc: (
+        JiraAttachmentNotFoundError
+        | JiraAttachmentAmbiguousError
+        | JiraAttachmentTooLargeError
+        | JiraAttachmentNotTextError
+    ),
+) -> dict[str, Any]:
+    """Build the shared structured refusal payload for attachment read errors across CLI and MCP."""
+    if isinstance(exc, JiraAttachmentNotFoundError):
+        return {
+            "ok": False,
+            "error_type": "attachment_not_found",
+            "issue": exc.issue_key,
+            "attachment_id": exc.attachment_id,
+            "filename": exc.filename,
+            "available_attachments": exc.available,
+            "message": str(exc),
+        }
+    if isinstance(exc, JiraAttachmentAmbiguousError):
+        return {
+            "ok": False,
+            "error_type": "attachment_ambiguous",
+            "issue": exc.issue_key,
+            "filename": exc.filename,
+            "matches": exc.matches,
+            "message": str(exc),
+        }
+    if isinstance(exc, JiraAttachmentTooLargeError):
+        return {
+            "ok": False,
+            "error_type": "attachment_too_large",
+            "attachment_id": exc.attachment_id,
+            "filename": exc.filename,
+            "max_bytes": exc.max_bytes,
+            "observed_bytes": exc.observed_bytes,
+            "message": str(exc),
+        }
+    return {
+        "ok": False,
+        "error_type": "attachment_not_text",
+        "filename": exc.filename,
+        "mime_type": exc.mime_type,
+        "size_bytes": exc.size_bytes,
+        "reason": exc.reason,
+        "message": str(exc),
+    }
+
+
+def _url_origin(url: httpx.URL) -> tuple[str, str, int | None]:
+    default_ports = {"http": 80, "https": 443}
+    scheme = url.scheme.lower()
+    host = (url.host or "").lower()
+    port = url.port if url.port is not None else default_ports.get(scheme)
+    return (scheme, host, port)
 
 
 def validate_agile_issue_batch(issue_keys: list[str]) -> None:
@@ -1072,6 +1361,114 @@ class JiraClient:
                 details={"location": location},
             )
         return match.group(1)
+
+    def download_attachment(
+        self,
+        attachment_id: str,
+        *,
+        issue_key: str | None = None,
+        max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES,
+    ) -> dict[str, Any]:
+        """Download raw attachment bytes with a strict size cap and safe redirect handling.
+
+        Jira Cloud serves `/attachment/content/{id}` via a cross-origin redirect to a
+        pre-signed media URL. Redirects to the same Jira origin keep authentication; any
+        cross-origin redirect is followed with a fresh unauthenticated HTTP client so Jira
+        credentials are never sent to third-party or CDN hosts.
+        """
+        attachment_id = str(normalize_jira_numeric_id(attachment_id, name="attachment_id"))
+        if issue_key is not None:
+            issue_key = normalize_jira_issue_key(issue_key)
+        max_bytes = validate_attachment_max_bytes(max_bytes)
+
+        jira_http = self._http_client_for(issue_key)
+        jira_origin = _url_origin(jira_http.base_url)
+        current_url: str | httpx.URL = f"/attachment/content/{attachment_id}"
+        use_auth_client = True
+
+        for _hop in range(_ATTACHMENT_MAX_REDIRECTS + 1):
+            headers = {"Accept": "*/*"}
+            unauth_client: httpx.Client | None = None
+            try:
+                if use_auth_client:
+                    active_client = jira_http
+                else:
+                    client_kwargs: dict[str, Any] = {
+                        "timeout": self.config.timeout_seconds,
+                        "headers": {"Accept": "*/*", "User-Agent": "jira-agent/0.1"},
+                    }
+                    if self._transport is not None:
+                        client_kwargs["transport"] = self._transport
+                    unauth_client = httpx.Client(**client_kwargs)
+                    active_client = unauth_client
+
+                with active_client.stream(
+                    "GET",
+                    current_url,
+                    headers=headers,
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in _REDIRECT_STATUS_CODES:
+                        location = response.headers.get("location") or ""
+                        if not location:
+                            raise JiraApiError(
+                                "Jira attachment redirect did not include a Location header",
+                                status_code=response.status_code,
+                            )
+                        target_url = response.url.join(location)
+                        if target_url.scheme.lower() not in {"http", "https"}:
+                            raise JiraApiError(
+                                f"Refusing attachment redirect to unsupported scheme: "
+                                f"{target_url.scheme!r}",
+                                status_code=response.status_code,
+                            )
+                        use_auth_client = _url_origin(target_url) == jira_origin
+                        current_url = target_url
+                        continue
+
+                    if response.status_code >= 400:
+                        response.read()
+                        raise self._api_error(response)
+
+                    content_length_raw = response.headers.get("content-length")
+                    if content_length_raw and content_length_raw.strip().isdigit():
+                        declared = int(content_length_raw.strip())
+                        if declared > max_bytes:
+                            raise JiraAttachmentTooLargeError(
+                                max_bytes=max_bytes,
+                                observed_bytes=declared,
+                                attachment_id=attachment_id,
+                            )
+
+                    buf = bytearray()
+                    for chunk in response.iter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            raise JiraAttachmentTooLargeError(
+                                max_bytes=max_bytes,
+                                observed_bytes=len(buf),
+                                attachment_id=attachment_id,
+                            )
+
+                    raw_bytes = bytes(buf)
+                    return {
+                        "bytes": raw_bytes,
+                        "size_bytes": len(raw_bytes),
+                        "content_type": response.headers.get("content-type"),
+                        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                    }
+            except httpx.HTTPError as exc:
+                raise JiraApiError(
+                    f"Jira request failed before receiving a response: {exc}"
+                ) from exc
+            finally:
+                if unauth_client is not None:
+                    unauth_client.close()
+
+        raise JiraApiError(
+            f"Too many redirects (>{_ATTACHMENT_MAX_REDIRECTS}) while downloading "
+            f"attachment {attachment_id}."
+        )
 
     def get_changelog(
         self,

@@ -7,12 +7,17 @@ from fastmcp import FastMCP
 
 from jira_agent.audit import audit_committed_write, audit_write, committed_verification_warning
 from jira_agent.client import (
+    DEFAULT_ATTACHMENT_MAX_BYTES,
     DEFAULT_FIELDS,
     DEFAULT_SPRINT_FIELD,
     DEFAULT_STORY_POINTS_FIELD,
     AdfPatchInvariantError,
     AdfSectionPatchRefused,
     JiraApiError,
+    JiraAttachmentAmbiguousError,
+    JiraAttachmentNotFoundError,
+    JiraAttachmentNotTextError,
+    JiraAttachmentTooLargeError,
     JiraClient,
     JiraConcurrentEditError,
     JiraMissingConcurrencyTokenError,
@@ -23,9 +28,12 @@ from jira_agent.client import (
     TransitionDirectionRefusedError,
     TransitionFieldsMissingError,
     adf_contains_media_id,
+    attachment_error_payload,
+    attachment_summary,
     check_transition_direction,
     component_names,
     create_issue_payload,
+    decode_attachment_text,
     describe_transition_options,
     edit_issue_payload,
     issue_link_payload,
@@ -39,6 +47,7 @@ from jira_agent.client import (
     require_concurrency_token,
     require_matching_jira_numeric_id,
     require_shared_write_scope,
+    resolve_issue_attachment,
     select_transition,
     sprint_add_blast_radius,
     sprint_add_verification_results,
@@ -48,6 +57,7 @@ from jira_agent.client import (
     transition_fields_payload,
     transition_required_fields_missing,
     validate_agile_issue_batch,
+    validate_attachment_max_bytes,
     validate_attachment_upload_response,
 )
 from jira_agent.config import load_config
@@ -2057,6 +2067,80 @@ def jira_delete_issue_link(
         return _error(exc)
     except ValueError as exc:
         return {"ok": False, "message": str(exc)}
+
+
+@mcp.tool
+def jira_read_attachment(
+    key: str,
+    attachment_id: str | None = None,
+    filename: str | None = None,
+    select_newest: bool = False,
+    max_bytes: int = DEFAULT_ATTACHMENT_MAX_BYTES,
+) -> dict[str, Any]:
+    """Read one UTF-8 text attachment (e.g. YAML, Markdown, JSON) from a Jira issue. Read-only.
+
+    Pass `attachment_id` or `filename` (or both to pin both). Verifies that the attachment
+    belongs to `key` before downloading. Refuses ambiguous duplicate filenames by default
+    (`error_type: "attachment_ambiguous"`) unless `select_newest=true` or `attachment_id` pins
+    one exact entry. Refuses binary or oversized attachments with `attachment_not_text` /
+    `attachment_too_large`.
+    """
+    try:
+        issue_key = normalize_jira_issue_key(key)
+        max_bytes = validate_attachment_max_bytes(max_bytes)
+        with _client() as client:
+            issue = client.get_issue(issue_key, fields=["attachment"])
+            attachments = (issue.get("fields") or {}).get("attachment") or []
+            if not isinstance(attachments, list):
+                attachments = []
+            selected = resolve_issue_attachment(
+                issue_key,
+                attachments,
+                attachment_id=attachment_id,
+                filename=filename,
+                select_newest=select_newest,
+            )
+            meta = attachment_summary(selected)
+            declared_size = selected.get("size")
+            if (
+                isinstance(declared_size, int)
+                and not isinstance(declared_size, bool)
+                and declared_size > max_bytes
+            ):
+                raise JiraAttachmentTooLargeError(
+                    max_bytes=max_bytes,
+                    observed_bytes=declared_size,
+                    attachment_id=meta["id"],
+                    filename=meta.get("filename"),
+                )
+            downloaded = client.download_attachment(
+                meta["id"],
+                issue_key=issue_key,
+                max_bytes=max_bytes,
+            )
+            decoded = decode_attachment_text(
+                downloaded["bytes"],
+                mime_type=meta.get("mimeType") or downloaded.get("content_type"),
+                filename=meta.get("filename"),
+            )
+            return {
+                "ok": True,
+                "issue": issue_key,
+                "attachment": meta,
+                "size_bytes": decoded["size_bytes"],
+                "sha256": decoded["sha256"],
+                "encoding": decoded["encoding"],
+                "content": decoded["content"],
+            }
+    except (
+        JiraAttachmentNotFoundError,
+        JiraAttachmentAmbiguousError,
+        JiraAttachmentTooLargeError,
+        JiraAttachmentNotTextError,
+    ) as exc:
+        return attachment_error_payload(exc)
+    except JiraApiError as exc:
+        return _error(exc)
 
 
 @mcp.tool

@@ -433,3 +433,24 @@ def test_sprint_writes_intentionally_bypass_the_concurrency_guard() -> None:
     client_source = inspect.getsource(client_module.JiraClient.add_issues_to_sprint)
     client_source += inspect.getsource(client_module.JiraClient.move_issues_to_backlog)
     assert "_guarded_issue_put" not in client_source
+
+
+def test_attachment_read_helpers_and_error_types_are_shared_across_surfaces() -> None:
+    """CLI `read-attachment` and MCP `jira_read_attachment` share one resolver, decoder, and
+    error-payload builder so duplicate/missing/oversized/binary refusals never drift apart.
+    """
+    assert cli.resolve_issue_attachment is client_module.resolve_issue_attachment
+    assert mcp_server.resolve_issue_attachment is client_module.resolve_issue_attachment
+    assert cli.decode_attachment_text is client_module.decode_attachment_text
+    assert mcp_server.decode_attachment_text is client_module.decode_attachment_text
+    assert cli.attachment_error_payload is client_module.attachment_error_payload
+    assert mcp_server.attachment_error_payload is client_module.attachment_error_payload
+
+    client_source = inspect.getsource(client_module.attachment_error_payload)
+    for error_type in (
+        "attachment_not_found",
+        "attachment_ambiguous",
+        "attachment_too_large",
+        "attachment_not_text",
+    ):
+        assert f'"{error_type}"' in client_source
